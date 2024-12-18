@@ -1,0 +1,248 @@
+diff --git a/CTFd/api/v1/challenges.py b/CTFd/api/v1/challenges.py
+index 8df52635..5b83b8ad 100644
+--- a/CTFd/api/v1/challenges.py
++++ b/CTFd/api/v1/challenges.py
+@@ -53,6 +53,11 @@ from CTFd.utils.user import (
+     get_current_user_attrs,
+     is_admin,
+ )
++from CTFd.constants.config import (
++    SolvesVisibilityTypes,
++    ScoreVisibilityTypes,
++    AccountVisibilityTypes
++)
+ 
+ challenges_namespace = Namespace(
+     "challenges", description="Endpoint to retrieve Challenges"
+@@ -409,9 +414,22 @@ class Challenge(Resource):
+         else:
+             solve_count, solved_by_user = 0, False
+ 
+-        # Hide solve counts if we are hiding solves/accounts
+-        if scores_visible() is False or accounts_visible() is False:
+-            solve_count = None
++        # Configurations
++        account_visibility = get_config("account_visibility")
++        score_visibility = get_config("score_visibility")
++        solves_visibility = get_config("solves_visibility")
++        # Checking what to return
++        disable_card = False
++        if is_admin() is False:
++            if not (
++                (authed() and account_visibility in [AccountVisibilityTypes.PUBLIC, AccountVisibilityTypes.PRIVATE] and score_visibility in [ScoreVisibilityTypes.PUBLIC, ScoreVisibilityTypes.PRIVATE])
++                or
++                (not authed() and account_visibility == AccountVisibilityTypes.PUBLIC and score_visibility == ScoreVisibilityTypes.PUBLIC)
++            ):
++                if authed() and solves_visibility == SolvesVisibilityTypes.SOLVES_ONLY:
++                    disable_card = True
++                else:
++                    solve_count = None
+ 
+         if authed():
+             # Get current attempts for the user
+@@ -421,6 +439,7 @@ class Challenge(Resource):
+         else:
+             attempts = 0
+ 
++        response["disable_card"] = disable_card
+         response["solves"] = solve_count
+         response["solved_by_me"] = solved_by_user
+         response["attempts"] = attempts
+@@ -702,8 +721,6 @@ class ChallengeAttempt(Resource):
+ @challenges_namespace.route("/<challenge_id>/solves")
+ class ChallengeSolves(Resource):
+     @check_challenge_visibility
+-    @check_account_visibility
+-    @check_score_visibility
+     @during_ctf_time_only
+     @require_verified_emails
+     def get(self, challenge_id):
+@@ -723,7 +740,26 @@ class ChallengeSolves(Resource):
+             elif is_admin() is True:
+                 freeze = False
+ 
+-        response = get_solves_for_challenge_id(challenge_id=challenge_id, freeze=freeze)
++        # Configurations
++        solves_visibility = get_config("solves_visibility")
++        score_visibility = get_config("score_visibility")
++        account_visibility = get_config("account_visibility")
++        # Getting all the solves
++        solves = get_solves_for_challenge_id(challenge_id, freeze=freeze)
++        print(solves)
++        # Admins can see all solves
++        if (is_admin() is True):
++            response = solves
++            return {"success": True, "data": response}
++        # Users
++        if (
++            (not authed() and score_visibility == ScoreVisibilityTypes.PUBLIC and account_visibility == AccountVisibilityTypes.PUBLIC)
++            or
++            (authed() and account_visibility in [AccountVisibilityTypes.PUBLIC, AccountVisibilityTypes.PRIVATE] and score_visibility in [ScoreVisibilityTypes.PUBLIC, ScoreVisibilityTypes.PRIVATE])
++        ):
++            response = solves
++        else:
++            abort(403)
+ 
+         return {"success": True, "data": response}
+ 
+diff --git a/CTFd/constants/config.py b/CTFd/constants/config.py
+index aaabb6c2..ebc0151f 100644
+--- a/CTFd/constants/config.py
++++ b/CTFd/constants/config.py
+@@ -9,6 +9,7 @@ from CTFd.utils import get_config
+ class ConfigTypes(str, RawEnum):
+     CHALLENGE_VISIBILITY = "challenge_visibility"
+     SCORE_VISIBILITY = "score_visibility"
++    SOLVE_VISIBILITY = "solves_visibility"
+     ACCOUNT_VISIBILITY = "account_visibility"
+     REGISTRATION_VISIBILITY = "registration_visibility"
+ 
+@@ -26,6 +27,12 @@ class ChallengeVisibilityTypes(str, RawEnum):
+     ADMINS = "admins"
+ 
+ 
++@JinjaEnum
++class SolvesVisibilityTypes(str, RawEnum):
++    STANDARD = "standard"
++    SOLVES_ONLY = "solves_only"
++
++
+ @JinjaEnum
+ class ScoreVisibilityTypes(str, RawEnum):
+     PUBLIC = "public"
+diff --git a/CTFd/forms/config.py b/CTFd/forms/config.py
+index 0a84fddb..2ced6018 100644
+--- a/CTFd/forms/config.py
++++ b/CTFd/forms/config.py
+@@ -5,6 +5,7 @@ from wtforms.widgets.html5 import NumberInput
+ from CTFd.constants.config import (
+     AccountVisibilityTypes,
+     ChallengeVisibilityTypes,
++    SolvesVisibilityTypes,
+     RegistrationVisibilityTypes,
+     ScoreVisibilityTypes,
+ )
+@@ -176,6 +177,15 @@ class VisibilitySettingsForm(BaseForm):
+         ],
+         default=RegistrationVisibilityTypes.PUBLIC,
+     )
++    solves_visibility = SelectField(
++        "Solves Visibility",
++        description="Control whether solves are detailed with the time of solve and the solver (Standard), only show the number of solvers (Solves Only), or Hidden",
++        choices=[
++            (SolvesVisibilityTypes.STANDARD, "Standard"),
++            (SolvesVisibilityTypes.SOLVES_ONLY, "Solves Only"),
++        ],
++        default=SolvesVisibilityTypes.STANDARD,
++    )
+ 
+ 
+ class LocalizationForm(BaseForm):
+diff --git a/CTFd/forms/setup.py b/CTFd/forms/setup.py
+index f35e413c..64cc4d3d 100644
+--- a/CTFd/forms/setup.py
++++ b/CTFd/forms/setup.py
+@@ -16,6 +16,7 @@ from wtforms.widgets.html5 import NumberInput
+ from CTFd.constants.config import (
+     AccountVisibilityTypes,
+     ChallengeVisibilityTypes,
++    SolvesVisibilityTypes,
+     RegistrationVisibilityTypes,
+     ScoreVisibilityTypes,
+ )
+@@ -107,6 +108,15 @@ class SetupForm(BaseForm):
+         ],
+         default=ChallengeVisibilityTypes.PRIVATE,
+     )
++    solves_visibility = SelectField(
++        "Solves Visibility",
++        description="Control the visibility of solves",
++        choices=[
++            (SolvesVisibilityTypes.STANDARD, "Standard"),
++            (SolvesVisibilityTypes.SOLVES_ONLY, "Solves Only"),
++        ],
++        default=SolvesVisibilityTypes.STANDARD,
++    )
+     account_visibility = SelectField(
+         "Account Visibility",
+         description="Control whether accounts (users & teams) are shown to everyone, only to authenticated users, or only to admins",
+diff --git a/CTFd/themes/admin/templates/configs/visibility.html b/CTFd/themes/admin/templates/configs/visibility.html
+index 6c0054ed..fcf406eb 100644
+--- a/CTFd/themes/admin/templates/configs/visibility.html
++++ b/CTFd/themes/admin/templates/configs/visibility.html
+@@ -2,7 +2,8 @@
+ 	{% 
+ 		with form = Forms.config.VisibilitySettingsForm(
+ 			challenge_visibility=challenge_visibility, 
+-			account_visibility=account_visibility, 
++			account_visibility=account_visibility,
++			solves_visibility=solves_visibility,
+ 			score_visibility=score_visibility, 
+ 			registration_visibility=registration_visibility
+ 		) 
+@@ -37,6 +38,14 @@
+ 			</small>
+ 		</div>
+ 
++		<div class="form-group">
++			{{ form.solves_visibility.label }}
++			{{ form.solves_visibility(class="form-control custom-select") }}
++			<small class="form-text text-muted">
++				{{ form.solves_visibility.description }}
++			</small>
++		</div>
++
+ 		<div class="form-group">
+ 			{{ form.registration_visibility.label }}
+ 			{{ form.registration_visibility(class="form-control custom-select") }}
+diff --git a/CTFd/themes/core-beta/templates/setup.html b/CTFd/themes/core-beta/templates/setup.html
+index f4dbe0a7..3ebc72d7 100644
+--- a/CTFd/themes/core-beta/templates/setup.html
++++ b/CTFd/themes/core-beta/templates/setup.html
+@@ -170,6 +170,14 @@
+ 								{{ form.score_visibility(class="form-control custom-select") }}
+ 							</div>
+ 
++							<div class="col-md-3 mb-3">
++								<b>
++									{{ form.solves_visibility.label }}
++									<i class="far fa-question float-end text-muted" data-bs-toggle="tooltip" data-bs-title="{{ form.solves_visibility.description }}"></i>
++								</b>
++								{{ form.solves_visibility(class="form-control custom-select") }}
++							</div>
++
+ 							<div class="col-md-3 mb-3">
+ 								<b>
+ 									{{ form.registration_visibility.label }}
+diff --git a/CTFd/views.py b/CTFd/views.py
+index 882231cb..4ea22ff0 100644
+--- a/CTFd/views.py
++++ b/CTFd/views.py
+@@ -20,6 +20,7 @@ from CTFd.constants.config import (
+     AccountVisibilityTypes,
+     ChallengeVisibilityTypes,
+     ConfigTypes,
++    SolvesVisibilityTypes,
+     RegistrationVisibilityTypes,
+     ScoreVisibilityTypes,
+ )
+@@ -96,6 +97,11 @@ def setup():
+                     "account_visibility", default=AccountVisibilityTypes.PUBLIC
+                 )
+             )
++            solves_visibility = SolvesVisibilityTypes(
++                request.form.get(
++                    "solves_visibility", default=SolvesVisibilityTypes.STANDARD
++                )
++            )
+             score_visibility = ScoreVisibilityTypes(
+                 request.form.get(
+                     "score_visibility", default=ScoreVisibilityTypes.PUBLIC
+@@ -226,6 +232,7 @@ def setup():
+             # Visibility
+             set_config(ConfigTypes.CHALLENGE_VISIBILITY, challenge_visibility)
+             set_config(ConfigTypes.REGISTRATION_VISIBILITY, registration_visibility)
++            set_config(ConfigTypes.SOLVE_VISIBILITY, solves_visibility)
+             set_config(ConfigTypes.SCORE_VISIBILITY, score_visibility)
+             set_config(ConfigTypes.ACCOUNT_VISIBILITY, account_visibility)
+ 
