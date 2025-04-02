@@ -17,6 +17,8 @@ else
         echo "Patch applied successfully."
     else
         echo "Patch cannot be applied cleanly. Please resolve conflicts manually."
+        ERROR_OUTPUT=$(git apply --check "$PATCH_FILE" 2>&1) || true
+        echo "$ERROR_OUTPUT"
         exit 1
     fi
 fi
