@@ -3,7 +3,7 @@
 set -e
 
 CTFD_DIR="CTFd"
-PATCH_FILE="../Solves_only.patch"
+PATCH_FILE="../solves_only.patch"
 
 cd "$CTFD_DIR"
 
