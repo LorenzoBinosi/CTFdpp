@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container">
+    <h1>Your Token</h1>
+    {% if token %}
+        <p>Your token is: <code>{{ token }}</code></p>
+    {% else %}
+        <p>No token found. Please contact the administrator.</p>
+    {% endif %}
+</div>
+{% endblock %}
