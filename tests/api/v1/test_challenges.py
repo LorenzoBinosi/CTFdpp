@@ -1095,7 +1095,7 @@ def test_api_challenge_attempt_post_duplicate_solve_race_condition():
 
         # Mock BaseChallenge.solve raising ChallengeSolveException - it's hard to trigger this race condition in tests
         # The exception should be handled and API should return an already_solved status
-        with patch("CTFd.plugins.challenges.BaseChallenge.solve") as mock_solve:
+        with patch("CTFd.challenges.base.BaseChallenge.solve") as mock_solve:
             exception = ChallengeSolveException("Duplicate solve")
             exception.__cause__ = IntegrityError(
                 "INSERT test...", {}, Exception("UNIQUE constraint failed")

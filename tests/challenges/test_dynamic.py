@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from CTFd.models import Challenges
-from CTFd.plugins.dynamic_challenges import DynamicChallenge, DynamicValueChallenge
+from CTFd.challenges.dynamic import DynamicChallenge, DynamicValueChallenge
 from CTFd.utils.security.signing import hmac
 from tests.helpers import (
     FakeRequest,

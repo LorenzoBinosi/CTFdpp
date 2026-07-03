@@ -13,7 +13,7 @@ from CTFd.models import (
     db,
     get_class_by_tablename,
 )
-from CTFd.plugins.challenges import get_chal_class
+from CTFd.challenges import get_chal_class
 from CTFd.schemas.challenges import ChallengeSchema
 from CTFd.schemas.teams import TeamSchema
 from CTFd.schemas.users import UserSchema

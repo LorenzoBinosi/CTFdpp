@@ -99,11 +99,6 @@
 							{% if user.bracket_id %}
 								<span class="badge badge-secondary">{{ user.bracket.name }}</span>
 							{% endif %}
-							{% if user.oauth_id %}
-								<a href="https://majorleaguecyber.org/u/{{ user.name }}">
-									<span class="badge badge-primary">Official</span>
-								</a>
-							{% endif %}
 							{% if user.website %}
 								<a href="{{ user.website }}" target="_blank" class="badge badge-info" rel="noopener">
 									<i class="btn-fa fas fa-external-link-alt" data-toggle="tooltip" data-placement="top"

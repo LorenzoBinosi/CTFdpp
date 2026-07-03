@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 
 from CTFd.exceptions.challenges import ChallengeSolveException
 from CTFd.models import Solves
-from CTFd.plugins.challenges import BaseChallenge
+from CTFd.challenges import BaseChallenge
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

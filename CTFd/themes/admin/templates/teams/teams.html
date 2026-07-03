@@ -96,11 +96,6 @@
 							{% if team.bracket_id %}
 								<span class="badge badge-secondary">{{ team.bracket.name }}</span>
 							{% endif %}
-							{% if team.oauth_id %}
-								<a href="https://majorleaguecyber.org/t/{{ team.name }}">
-									<span class="badge badge-primary">Official</span>
-								</a>
-							{% endif %}
 							{% if team.website %}
 								<a href="{{ team.website }}" target="_blank" class="badge badge-info" rel="noopener">
 									<i class="btn-fa fas fa-external-link-alt" data-toggle="tooltip" data-placement="top"

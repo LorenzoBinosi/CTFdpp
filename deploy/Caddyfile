@@ -1,0 +1,23 @@
+# CTFd reverse proxy.
+#
+# SITE_ADDRESS controls the listen address / TLS behaviour:
+#   - a domain (e.g. ctf.example.com) -> automatic HTTPS via Let's Encrypt
+#   - "localhost" (default)           -> HTTPS with an internal Caddy cert
+#   - ":80"                           -> plain HTTP (used for local testing)
+{$SITE_ADDRESS:localhost} {
+	# Allow large challenge file uploads.
+	request_body {
+		max_size 4GB
+	}
+
+	# Server-Sent Events for notifications must not be buffered.
+	handle /events* {
+		reverse_proxy ctfd:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy ctfd:8000
+	}
+}

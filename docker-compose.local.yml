@@ -1,0 +1,11 @@
+# Local-testing override for docker-compose.yml.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up
+#
+# Caddy serves plain HTTP (no TLS) so CTFd is reachable at http://127.0.0.1:80
+services:
+  caddy:
+    environment:
+      # ":80" tells Caddy to serve plain HTTP on port 80 (no automatic HTTPS).
+      - SITE_ADDRESS=:80

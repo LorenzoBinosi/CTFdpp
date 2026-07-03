@@ -31,7 +31,7 @@ from CTFd.models import (
     Tracking,
     db,
 )
-from CTFd.plugins.challenges import CHALLENGE_CLASSES, get_chal_class
+from CTFd.challenges import CHALLENGE_CLASSES, get_chal_class
 from CTFd.schemas.challenges import ChallengeSchema
 from CTFd.schemas.flags import FlagSchema
 from CTFd.schemas.hints import HintSchema

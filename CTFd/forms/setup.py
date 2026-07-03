@@ -134,7 +134,6 @@ class SetupForm(BaseForm):
         choices=[
             (RegistrationVisibilityTypes.PUBLIC, "Public"),
             (RegistrationVisibilityTypes.PRIVATE, "Private"),
-            (RegistrationVisibilityTypes.MLC, "MajorLeagueCyber Only"),
         ],
         default=RegistrationVisibilityTypes.PUBLIC,
     )

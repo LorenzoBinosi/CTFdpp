@@ -3,7 +3,6 @@ from collections import namedtuple
 # TODO: CTFd 4.0. Consider changing to a dataclass
 UserAttrsFields = [
     "id",
-    "oauth_id",
     "name",
     "email",
     "type",

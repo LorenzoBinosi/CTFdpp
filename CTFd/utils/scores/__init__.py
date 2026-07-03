@@ -83,7 +83,6 @@ def get_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Model.id.label("account_id"),
-                Model.oauth_id.label("oauth_id"),
                 Model.name.label("name"),
                 Model.bracket_id.label("bracket_id"),
                 Brackets.name.label("bracket_name"),
@@ -104,7 +103,6 @@ def get_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Model.id.label("account_id"),
-                Model.oauth_id.label("oauth_id"),
                 Model.name.label("name"),
                 Model.bracket_id.label("bracket_id"),
                 Brackets.name.label("bracket_name"),
@@ -183,7 +181,6 @@ def get_team_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Teams.id.label("team_id"),
-                Teams.oauth_id.label("oauth_id"),
                 Teams.name.label("name"),
                 Teams.bracket_id.label("bracket_id"),
                 Brackets.name.label("bracket_name"),
@@ -204,7 +201,6 @@ def get_team_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Teams.id.label("team_id"),
-                Teams.oauth_id.label("oauth_id"),
                 Teams.name.label("name"),
                 Teams.bracket_id.label("bracket_id"),
                 Brackets.name.label("bracket_name"),
@@ -282,7 +278,6 @@ def get_user_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Users.id.label("user_id"),
-                Users.oauth_id.label("oauth_id"),
                 Users.name.label("name"),
                 Users.team_id.label("team_id"),
                 Users.bracket_id.label("bracket_id"),
@@ -304,7 +299,6 @@ def get_user_standings(count=None, bracket_id=None, admin=False, fields=None):
         standings_query = (
             db.session.query(
                 Users.id.label("user_id"),
-                Users.oauth_id.label("oauth_id"),
                 Users.name.label("name"),
                 Users.team_id.label("team_id"),
                 Users.bracket_id.label("bracket_id"),

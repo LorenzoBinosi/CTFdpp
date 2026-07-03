@@ -18,7 +18,6 @@ from werkzeug.wsgi import get_host
 import CTFd.utils.config
 from CTFd import utils
 from CTFd.constants.themes import ADMIN_THEME, DEFAULT_THEME
-from CTFd.plugins import init_plugins
 from CTFd.utils.crypto import sha256
 from CTFd.utils.initialization import (
     init_cli,
@@ -30,11 +29,9 @@ from CTFd.utils.initialization import (
 )
 from CTFd.utils.migrations import create_database, migrations, stamp_latest_revision
 from CTFd.utils.sessions import CachingSessionInterface
-from CTFd.utils.updates import update_check
 from CTFd.utils.user import get_locale
 
-__version__ = "3.8.6"
-__channel__ = "oss"
+__version__ = "1.0.0"
 
 
 class CTFdRequest(Request):
@@ -216,16 +213,23 @@ def create_app(config="CTFd.config.Config"):
         for theme_name in CTFd.utils.config.get_themes():
             prefix_loader_dict[theme_name] = ThemeLoader(theme_name=theme_name)
         loaders.append(jinja2.PrefixLoader(prefix_loader_dict))
-        # Plugin templates are also accessed via prefix but we just point a
-        # normal `FileSystemLoader` at the plugin tree rather than validating
-        # each plugin here (that happens later in `init_plugins()`). We
-        # deliberately don't add this to `prefix_loader_dict` defined above
-        # because to do so would break template loading from a theme called
-        # `prefix` (even though that'd be weird).
-        plugin_loader = jinja2.FileSystemLoader(
-            searchpath=os.path.join(app.root_path, "plugins"), followlinks=True
+        # The built-in challenge & flag type editor/view templates (e.g.
+        # "challenges/assets/standard/view.html") are rendered server-side, so
+        # expose the CTFd.challenges and CTFd.flags package directories to Jinja.
+        loaders.append(
+            jinja2.PrefixLoader(
+                {
+                    "challenges": jinja2.FileSystemLoader(
+                        searchpath=os.path.join(app.root_path, "challenges"),
+                        followlinks=True,
+                    ),
+                    "flags": jinja2.FileSystemLoader(
+                        searchpath=os.path.join(app.root_path, "flags"),
+                        followlinks=True,
+                    ),
+                }
+            )
         )
-        loaders.append(jinja2.PrefixLoader({"plugins": plugin_loader}))
         # Use a choice loader to find the first match from our list of loaders
         app.jinja_loader = jinja2.ChoiceLoader(loaders)
 
@@ -240,6 +244,13 @@ def create_app(config="CTFd.config.Config"):
             Tracking,
             db,
         )
+
+        # Import the built-in challenge & flag types so their models (in
+        # particular the dynamic challenge polymorphic model) are registered
+        # with SQLAlchemy before create_all()/migrations run. Aliased imports
+        # avoid rebinding the module-global ``CTFd`` name inside this function.
+        import CTFd.challenges as _challenges  # noqa: F401
+        import CTFd.flags as _flags  # noqa: F401
 
         url = create_database()
 
@@ -285,7 +296,6 @@ def create_app(config="CTFd.config.Config"):
 
         app.db = db
         app.VERSION = __version__
-        app.CHANNEL = __channel__
 
         reverse_proxy = app.config.get("REVERSE_PROXY")
         if reverse_proxy:
@@ -314,8 +324,6 @@ def create_app(config="CTFd.config.Config"):
         if not utils.get_config("ctf_theme"):
             utils.set_config("ctf_theme", DEFAULT_THEME)
 
-        update_check(force=True)
-
         init_request_processors(app)
         init_template_filters(app)
         init_template_globals(app)
@@ -324,9 +332,10 @@ def create_app(config="CTFd.config.Config"):
         from CTFd.admin import admin
         from CTFd.api import api
         from CTFd.auth import auth
-        from CTFd.challenges import challenges
+        from CTFd.challenges.views import challenges
         from CTFd.errors import render_error
         from CTFd.events import events
+        from CTFd.flags.views import flags
         from CTFd.scoreboard import scoreboard
         from CTFd.share import social
         from CTFd.teams import teams
@@ -337,6 +346,7 @@ def create_app(config="CTFd.config.Config"):
         app.register_blueprint(teams)
         app.register_blueprint(users)
         app.register_blueprint(challenges)
+        app.register_blueprint(flags)
         app.register_blueprint(scoreboard)
         app.register_blueprint(auth)
         app.register_blueprint(api)
@@ -350,7 +360,6 @@ def create_app(config="CTFd.config.Config"):
 
         init_logs(app)
         init_events(app)
-        init_plugins(app)
         init_cli(app)
 
         return app

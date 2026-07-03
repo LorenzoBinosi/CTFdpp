@@ -37,7 +37,6 @@ class ScoreboardList(Resource):
                     [
                         Users.id,
                         Users.name,
-                        Users.oauth_id,
                         Users.team_id,
                         Users.hidden,
                         Users.banned,
@@ -54,7 +53,6 @@ class ScoreboardList(Resource):
                 if u.hidden is False and u.banned is False:
                     membership[u.team_id][u.id] = {
                         "id": u.id,
-                        "oauth_id": u.oauth_id,
                         "name": u.name,
                         "score": 0,
                         "bracket_id": u.bracket_id,
@@ -72,7 +70,6 @@ class ScoreboardList(Resource):
                 "account_id": x.account_id,
                 "account_url": generate_account_url(account_id=x.account_id),
                 "account_type": account_type,
-                "oauth_id": x.oauth_id,
                 "name": x.name,
                 "score": int(x.score),
                 "bracket_id": x.bracket_id,

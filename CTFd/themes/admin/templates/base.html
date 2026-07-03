@@ -26,21 +26,12 @@
 		}
 	</script>
 	{% block stylesheets %} {% endblock %}
-	{% for stylesheet in get_registered_admin_stylesheets() %}
-		{% if stylesheet.startswith('http') %}
-			<link rel="stylesheet" type="text/css" href="{{ stylesheet }}">
-		{% elif request.script_root %}
-			<link rel="stylesheet" type="text/css" href="{{ request.script_root }}/{{ stylesheet }}">
-		{% else %}
-			<link rel="stylesheet" type="text/css" href="{{ stylesheet }}">
-		{% endif %}
-	{% endfor %}
 </head>
 
 <body>
 	<nav class="navbar navbar-expand-md navbar-dark bg-dark fixed-top">
 		<div class="container">
-			<a href="{{ url_for('views.static_html', route='/') }}" class="navbar-brand">CTFd</a>
+			<a href="{{ url_for('views.static_html', route='/') }}" class="navbar-brand">CTFd++</a>
 			<button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#base-navbars"
 					aria-controls="base-navbars" aria-expanded="false" aria-label="Toggle navigation">
 				<span class="navbar-toggler-icon"></span>
@@ -73,38 +64,6 @@
 						</div>
 					</li>
 					<li class="nav-item"><a class="nav-link" href="{{ url_for('admin.config') }}">Config</a></li>
-
-					{% set plugin_menu = get_admin_plugin_menu_bar() %}
-					{% set plugins = get_menubar_plugins() %}
-					{% if plugin_menu or plugins %}
-						<li class="nav-item">
-							<a class="nav-link d-none d-md-block d-lg-block">|</a>
-						</li>
-
-						{% for menu in plugin_menu %}
-							{% if request.script_root %}
-								{% set route = '/' + request.script_root + '/' + menu.route %}
-							{% else %}
-								{% set route = menu.route %}
-							{% endif %}
-							<li class="nav-item">
-								<a class="nav-link" href="{{ route }}" {% if menu.link_target %}target="{{ menu.link_target }}"{% endif %}>
-									{{ menu.title }}
-								</a>
-							</li>
-						{% endfor %}
-
-						{% if plugins %}
-						<li class="nav-item dropdown">
-							<a href="#" class="nav-link dropdown-toggle" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Plugins <span class="caret"></span></a>
-							<ul class="dropdown-menu">
-									{% for plugin in plugins %}
-											<a class="dropdown-item" href="{{ request.script_root }}{{ plugin.route }}">{{ plugin.name }}</a>
-									{% endfor %}
-							</ul>
-						</li>
-						{% endif %}
-					{% endif %}
 				</ul>
 				<ul class="nav navbar-nav navbar-right">
 					<li class="nav-item">
@@ -118,26 +77,15 @@
 	</nav>
 
 	<main role="main">
-		{% if get_config('version_latest') %}
-		<div class="container-fluid bg-warning text-center py-3">
-			<div class="row">
-				<div class="col-md-12">
-					<a class="btn btn-warning" href="{{ get_config('version_latest') }}">
-						A new CTFd version is available!
-					</a>
-				</div>
-			</div>
-		</div>
-		{% endif %}
 		{% block content %}
 		{% endblock %}
 	</main>
 
 	<footer class="footer pt-2">
 		<div class="container text-center">
-			<a href="https://ctfd.io" class="text-secondary">
+			<a href="{{ url_for('views.static_html', route='/') }}" class="text-secondary">
 				<small class="text-muted">
-					Powered by CTFd
+					Powered by CTFd++
 				</small>
 			</a>
 			<span>
@@ -151,16 +99,6 @@
 	{% endblock %}
 
 	{% block scripts %} {% endblock %}
-
-	{% for script in get_registered_admin_scripts() %}
-		{% if script.startswith('http') %}
-			<script defer src="{{ script }}"></script>
-		{% elif request.script_root %}
-			<script defer src="{{ request.script_root }}/{{ script }}"></script>
-		{% else %}
-			<script defer src="{{ script }}"></script>
-		{% endif %}
-	{% endfor %}
 </body>
 
 </html>

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from CTFd.models import Challenges
-from CTFd.plugins.challenges import CTFdStandardChallenge
+from CTFd.challenges.standard import CTFdStandardChallenge
 from CTFd.utils.security.signing import hmac
 from tests.helpers import (
     FakeRequest,

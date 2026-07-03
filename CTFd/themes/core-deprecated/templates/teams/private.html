@@ -144,11 +144,6 @@
 	<div class="jumbotron">
 		<div class="container">
 			<h1 id="team-id" team-id="{{ team.id }}">{{ team.name }}</h1>
-			{% if team.oauth_id %}
-				<a href="https://majorleaguecyber.org/t/{{ team.name }}">
-					<h3><span class="badge badge-primary">Official</span></h3>
-				</a>
-			{% endif %}
 			{% if team.affiliation %}
 				<h3 class="d-inline-block">
 					<span class="badge badge-primary">{{ team.affiliation }}</span>

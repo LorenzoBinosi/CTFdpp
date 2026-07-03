@@ -30,47 +30,51 @@ def test_missing_challenge_type():
         chal_count = Challenges.query.count()
         assert chal_count == 1
 
-        # Delete the dynamic challenge type
-        from CTFd.plugins.challenges import CHALLENGE_CLASSES
+        # Delete the dynamic challenge type. The built-in types are registered
+        # once at import time, so we must restore the entry afterwards to avoid
+        # leaking the deletion into other tests.
+        from CTFd.challenges import CHALLENGE_CLASSES
 
-        del CHALLENGE_CLASSES["dynamic"]
+        saved_dynamic = CHALLENGE_CLASSES.pop("dynamic")
+        try:
+            r = client.get("/admin/challenges")
+            assert r.status_code == 200
+            assert b"dynamic" in r.data
 
-        r = client.get("/admin/challenges")
-        assert r.status_code == 200
-        assert b"dynamic" in r.data
+            r = client.get("/admin/challenges/1")
+            assert r.status_code == 500
+            assert b"The underlying challenge type (dynamic) is not installed" in r.data
 
-        r = client.get("/admin/challenges/1")
-        assert r.status_code == 500
-        assert b"The underlying challenge type (dynamic) is not installed" in r.data
+            challenge_data = {
+                "name": "name",
+                "category": "category",
+                "description": "description",
+                "value": 100,
+                "state": "visible",
+                "type": "standard",
+            }
+            r = client.post("/api/v1/challenges", json=challenge_data)
 
-        challenge_data = {
-            "name": "name",
-            "category": "category",
-            "description": "description",
-            "value": 100,
-            "state": "visible",
-            "type": "standard",
-        }
-        r = client.post("/api/v1/challenges", json=challenge_data)
+            r = client.get("/challenges")
+            assert r.status_code == 200
 
-        r = client.get("/challenges")
-        assert r.status_code == 200
+            # We should still see the one visible standard challenge
+            r = client.get("/api/v1/challenges")
+            assert r.status_code == 200
+            assert len(r.json["data"]) == 1
+            assert r.json["data"][0]["type"] == "standard"
 
-        # We should still see the one visible standard challenge
-        r = client.get("/api/v1/challenges")
-        assert r.status_code == 200
-        assert len(r.json["data"]) == 1
-        assert r.json["data"][0]["type"] == "standard"
+            # We cannot load the broken challenge
+            r = client.get("/api/v1/challenges/1")
+            assert r.status_code == 500
+            assert (
+                "The underlying challenge type (dynamic) is not installed"
+                in r.json["message"]
+            )
 
-        # We cannot load the broken challenge
-        r = client.get("/api/v1/challenges/1")
-        assert r.status_code == 500
-        assert (
-            "The underlying challenge type (dynamic) is not installed"
-            in r.json["message"]
-        )
-
-        # We can load other challenges
-        r = client.get("/api/v1/challenges/2")
-        assert r.status_code == 200
+            # We can load other challenges
+            r = client.get("/api/v1/challenges/2")
+            assert r.status_code == 200
+        finally:
+            CHALLENGE_CLASSES["dynamic"] = saved_dynamic
     destroy_ctfd(app)

@@ -17,7 +17,6 @@ from CTFd.utils.config import (
     ctf_logo,
     ctf_name,
     ctf_theme,
-    integrations,
     is_setup,
 )
 from CTFd.utils.config.pages import get_pages
@@ -25,14 +24,6 @@ from CTFd.utils.dates import isoformat, unix_time, unix_time_millis, unix_time_t
 from CTFd.utils.events import EventManager, RedisEventManager
 from CTFd.utils.humanize.words import pluralize
 from CTFd.utils.modes import generate_account_url, get_mode_as_word
-from CTFd.utils.plugins import (
-    get_configurable_plugins,
-    get_menubar_plugins,
-    get_registered_admin_scripts,
-    get_registered_admin_stylesheets,
-    get_registered_scripts,
-    get_registered_stylesheets,
-)
 from CTFd.utils.security.auth import login_user, logout_user, lookup_user_token
 from CTFd.utils.security.csrf import generate_nonce
 from CTFd.utils.security.email import (
@@ -91,16 +82,6 @@ def init_template_globals(app):
     app.jinja_env.globals.update(get_ctf_name=ctf_name)
     app.jinja_env.globals.update(get_ctf_logo=ctf_logo)
     app.jinja_env.globals.update(get_ctf_theme=ctf_theme)
-    app.jinja_env.globals.update(get_menubar_plugins=get_menubar_plugins)
-    app.jinja_env.globals.update(get_configurable_plugins=get_configurable_plugins)
-    app.jinja_env.globals.update(get_registered_scripts=get_registered_scripts)
-    app.jinja_env.globals.update(get_registered_stylesheets=get_registered_stylesheets)
-    app.jinja_env.globals.update(
-        get_registered_admin_scripts=get_registered_admin_scripts
-    )
-    app.jinja_env.globals.update(
-        get_registered_admin_stylesheets=get_registered_admin_stylesheets
-    )
     app.jinja_env.globals.update(get_config=get_config)
     app.jinja_env.globals.update(generate_account_url=generate_account_url)
     app.jinja_env.globals.update(get_countries=get_countries)
@@ -112,7 +93,6 @@ def init_template_globals(app):
     app.jinja_env.globals.update(registration_visible=registration_visible)
     app.jinja_env.globals.update(scores_visible=scores_visible)
     app.jinja_env.globals.update(get_mode_as_word=get_mode_as_word)
-    app.jinja_env.globals.update(integrations=integrations)
     app.jinja_env.globals.update(authed=authed)
     app.jinja_env.globals.update(is_admin=is_admin)
     app.jinja_env.globals.update(get_current_user_attrs=get_current_user_attrs)
@@ -228,7 +208,6 @@ def init_request_processors(app):
         if is_setup() is False:
             if request.endpoint in (
                 "views.setup",
-                "views.integrations",
                 "views.themes",
                 "views.themes_beta",
                 "views.files",
@@ -366,12 +345,8 @@ def init_request_processors(app):
     def csrf():
         # TODO: CTFd 4.0 Consider reorganizing this function to only run on non safe methods
         # Early exit: no CSRF for functions explicitly marked as bypassing CSRF
-        try:
-            func = app.view_functions[request.endpoint]
-        except KeyError:
+        if request.endpoint not in app.view_functions:
             abort(404)
-        if hasattr(func, "_bypass_csrf"):
-            return
         # No CSRF for theme files using safe methods
         safe_methods = (
             "GET",

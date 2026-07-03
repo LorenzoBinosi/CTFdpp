@@ -127,32 +127,6 @@
 						<i class="fa fa-share-nodes action-icon"></i>Social Sharing
 					</a>
 				</li>
-				<li class="nav-item">
-					<a class="nav-link rounded-0 py-1s" href="#mlc" role="tab" data-toggle="tab">
-						<i class="fa fa-network-wired action-icon"></i>MajorLeagueCyber
-					</a>
-				</li>
-				
-				<!-- Plugins -->
-				{% set plugins = get_configurable_plugins() %}
-				{% if plugins %}
-					<small class="section-title">Plugins</small>
-					{% for plugin in plugins %}
-						{% if plugin.config %}
-							<li class="nav-item">
-								<a class="nav-link rounded-0 py-1" href="#plugin_{{loop.index}}" role="tab" data-toggle="tab">
-									<i class="fa-solid fa-puzzle-piece action-icon"></i>{{ plugin.name }}
-								</a>
-							</li>
-						{% elif plugin.route %}
-							<li class="nav-item">
-								<a class="nav-link rounded-0 py-1" href="{{ plugin.route }}" target="_blank">
-									<i class="fa-solid fa-puzzle-piece action-icon"></i>{{ plugin.name }} <i class="fa-solid fa-arrow-up-right-from-square fa-xs"></i>
-								</a>
-							</li>
-						{% endif %}
-					{% endfor %}
-				{% endif %}
 
 				<!-- Reset -->
 				<small class="section-title">Danger zone</small>
@@ -232,19 +206,8 @@
 
 				{% include "admin/configs/social.html" %}
 
-				{% include "admin/configs/mlc.html" %}
-
 				<!-- Plugins -->
 				
-				{% if plugins %}
-					{% for plugin in plugins %}
-						{% if plugin.config %}
-							<div role="tabpanel" class="tab-pane config-section" id="plugin_{{loop.index}}">
-								{% include plugin.config %}
-							</div>
-						{% endif %}
-					{% endfor %}
-				{% endif %}
 				<!-- Danger zone -->
 				<!-- reset.html is top-level so no need to include -->
 			</div>

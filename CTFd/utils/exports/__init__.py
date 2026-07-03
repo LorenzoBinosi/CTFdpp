@@ -20,9 +20,6 @@ from CTFd import __version__ as CTFD_VERSION
 from CTFd.cache import cache
 from CTFd.constants.themes import DEFAULT_THEME
 from CTFd.models import db, get_class_by_tablename
-from CTFd.plugins import get_plugin_names
-from CTFd.plugins.migrations import current as plugin_current
-from CTFd.plugins.migrations import upgrade as plugin_upgrade
 from CTFd.utils import get_app_config, get_config, set_config, string_types
 from CTFd.utils.config import get_themes
 from CTFd.utils.dates import unix_time
@@ -39,11 +36,6 @@ from CTFd.utils.uploads import get_uploader
 
 
 def export_ctf(ignore_overrides=False):
-    if not ignore_overrides:
-        custom_export_ctf = app.overridden_functions.get("export_ctf")
-        if custom_export_ctf:
-            return custom_export_ctf()
-
     # TODO: For some unknown reason dataset is only able to see alembic_version during tests.
     # Even using a real sqlite database. This makes this test impossible to pass in sqlite.
     db = dataset.connect(get_app_config("SQLALCHEMY_DATABASE_URI"))
@@ -119,10 +111,6 @@ def set_import_end_time(value, timeout=604800, skip_print=False):
 
 
 def import_ctf(backup, erase=True, ignore_overrides=False):
-    if not ignore_overrides:
-        custom_import_ctf = app.overridden_functions.get("import_ctf")
-        if custom_import_ctf:
-            return custom_import_ctf(backup, erase=erase)
 
     # Reset import cache keys and don't print these values
     set_import_error(value=None, skip_print=True)
@@ -428,22 +416,8 @@ def import_ctf(backup, erase=True, ignore_overrides=False):
     set_import_status("inserting tables")
     insertion(first)
 
-    # Create tables created by plugins
-    # Run plugin migrations
-    set_import_status("inserting plugins")
-    plugins = get_plugin_names()
-    for plugin in plugins:
-        set_import_status(f"inserting plugin {plugin}")
-        revision = plugin_current(plugin_name=plugin)
-        plugin_upgrade(plugin_name=plugin, revision=revision, lower=None)
-
-    # Insert data for plugin tables
+    # Insert data from remaining tables
     insertion(members)
-
-    # Bring plugin tables up to head revision
-    plugins = get_plugin_names()
-    for plugin in plugins:
-        plugin_upgrade(plugin_name=plugin)
 
     # Extracting files
     set_import_status("uploading files")

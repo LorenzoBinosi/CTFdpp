@@ -5,9 +5,7 @@ import string
 import uuid
 from collections import namedtuple
 from contextlib import contextmanager
-from unittest.mock import Mock, patch
 
-import requests
 from flask.testing import FlaskClient
 from freezegun import freeze_time
 from sqlalchemy.engine.url import make_url
@@ -256,63 +254,6 @@ def login_as_user(app, name="user", password="password", raise_for_error=True):
                     assert sess["nonce"]
                     assert sess["hash"]
             return client
-
-
-def login_with_mlc(
-    app,
-    name="user",
-    scope="profile%20team",
-    email="user@examplectf.com",
-    oauth_id=1337,
-    team_name="TestTeam",
-    team_oauth_id=1234,
-    raise_for_error=True,
-):
-    with app.test_client() as client, patch.object(
-        requests, "get"
-    ) as fake_get_request, patch.object(requests, "post") as fake_post_request:
-        client.get("/login")
-        with client.session_transaction() as sess:
-            nonce = sess["nonce"]
-
-            redirect_url = "{endpoint}?response_type=code&client_id={client_id}&scope={scope}&state={state}".format(
-                endpoint=app.config["OAUTH_AUTHORIZATION_ENDPOINT"],
-                client_id=app.config["OAUTH_CLIENT_ID"],
-                scope=scope,
-                state=nonce,
-            )
-
-        r = client.get("/oauth", follow_redirects=False)
-        assert r.location == redirect_url
-
-        fake_post_response = Mock()
-        fake_post_request.return_value = fake_post_response
-        fake_post_response.status_code = 200
-        fake_post_response.json = lambda: {"access_token": "fake_mlc_access_token"}
-
-        fake_get_response = Mock()
-        fake_get_request.return_value = fake_get_response
-        fake_get_response.status_code = 200
-        fake_get_response.json = lambda: {
-            "id": oauth_id,
-            "name": name,
-            "email": email,
-            "team": {"id": team_oauth_id, "name": team_name},
-        }
-
-        client.get(
-            "/redirect?code={code}&state={state}".format(
-                code="mlc_test_code", state=nonce
-            ),
-            follow_redirects=False,
-        )
-
-        if raise_for_error:
-            with client.session_transaction() as sess:
-                assert sess["id"]
-                assert sess["nonce"]
-                assert sess["hash"]
-        return client
 
 
 def get_scores(user):

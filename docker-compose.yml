@@ -37,13 +37,20 @@ services:
       - .data/CTFd/uploads:/var/uploads
     command: chown -R 1001:1001 /var/uploads /var/log/CTFd
 
-  nginx:
-    image: nginx:stable
+  caddy:
+    image: caddy:2
     restart: always
+    environment:
+      # Set to your domain (e.g. ctf.example.com) for automatic HTTPS in
+      # deployment. Defaults to "localhost" (Caddy serves an internal cert).
+      - SITE_ADDRESS=${SITE_ADDRESS:-localhost}
     volumes:
-      - ./conf/nginx/http.conf:/etc/nginx/nginx.conf
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - .data/caddy/data:/data
+      - .data/caddy/config:/config
     ports:
-      - 80:80
+      - "80:80"
+      - "443:443"
     depends_on:
       - ctfd
 
