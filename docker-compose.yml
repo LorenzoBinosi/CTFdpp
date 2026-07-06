@@ -14,12 +14,10 @@ services:
       - ERROR_LOG=-
       - REVERSE_PROXY=true
     volumes:
-      - .data/CTFd/logs:/var/log/CTFd
-      - .data/CTFd/uploads:/var/uploads
+      - logs:/var/log/CTFd
+      - uploads:/var/uploads
       - .:/opt/CTFd:ro
     depends_on:
-      permissions:
-        condition: service_completed_successfully
       db:
         condition: service_started
       cache:
@@ -27,15 +25,6 @@ services:
     networks:
         default:
         internal:
-
-  # TODO: CTFd 4.0 Migrate to named volumes. Users will likely need to manually migrate existing files
-  permissions:
-    image: alpine:3.23
-    user: root
-    volumes:
-      - .data/CTFd/logs:/var/log/CTFd
-      - .data/CTFd/uploads:/var/uploads
-    command: chown -R 1001:1001 /var/uploads /var/log/CTFd
 
   caddy:
     image: caddy:2
@@ -82,3 +71,7 @@ networks:
     default:
     internal:
         internal: true
+
+volumes:
+    uploads:
+    logs:
