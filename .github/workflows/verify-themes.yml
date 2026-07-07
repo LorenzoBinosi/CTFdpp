@@ -6,12 +6,12 @@ on:
     branches:
       - master
     paths:
-      - 'CTFd/themes/**'
+      - 'CTFdpp/themes/**'
   pull_request:
     branches:
       - master
     paths:
-      - 'CTFd/themes/**'
+      - 'CTFdpp/themes/**'
 
 jobs:
   build:
@@ -31,7 +31,7 @@ jobs:
             pwd
             yarn install --non-interactive
             yarn verify 
-        working-directory: ./CTFd/themes/admin
+        working-directory: ./CTFdpp/themes/admin
 
       # TODO: Replace in 4.0 with deprecation of previous core theme
       - name: Verify core theme
@@ -39,4 +39,4 @@ jobs:
             pwd
             yarn install --non-interactive
             yarn verify
-        working-directory: ./CTFd/themes/core
+        working-directory: ./CTFdpp/themes/core

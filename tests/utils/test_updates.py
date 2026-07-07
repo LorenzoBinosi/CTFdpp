@@ -2,8 +2,8 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from CTFd.utils import get_config, set_config
-from CTFd.utils.updates import update_check
+from CTFdpp.utils import get_config, set_config
+from CTFdpp.utils.updates import update_check
 from tests.helpers import create_ctfd, destroy_ctfd, login_as_user
 
 

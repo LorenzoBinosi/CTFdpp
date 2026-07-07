@@ -1,7 +1,7 @@
 import re
 from urllib.parse import urlparse, urlunparse
 
-from CTFd.utils import set_config
+from CTFdpp.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

@@ -1,5 +1,5 @@
 ---
-name: CTFd SQLite CI
+name: CTFd++ SQLite CI
 
 on:
   push:
@@ -42,8 +42,4 @@ jobs:
             AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             TESTING_DATABASE_URL: 'sqlite://'
 
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml
 

@@ -1,4 +1,4 @@
-# CTFd reverse proxy.
+# CTFd++ reverse proxy.
 #
 # SITE_ADDRESS controls the listen address / TLS behaviour:
 #   - a domain (e.g. ctf.example.com) -> automatic HTTPS via Let's Encrypt
@@ -12,12 +12,12 @@
 
 	# Server-Sent Events for notifications must not be buffered.
 	handle /events* {
-		reverse_proxy ctfd:8000 {
+		reverse_proxy ctfdpp:8000 {
 			flush_interval -1
 		}
 	}
 
 	handle {
-		reverse_proxy ctfd:8000
+		reverse_proxy ctfdpp:8000
 	}
 }

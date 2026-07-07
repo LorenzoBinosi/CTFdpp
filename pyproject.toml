@@ -1,0 +1,16 @@
+# CTFd++ tooling configuration.
+#
+# Consolidates the previous root config files (.isort.cfg, setup.cfg) into a
+# single pyproject.toml. isort auto-discovers this file at the repo root.
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+line_length = 88
+skip = ["migrations"]
+
+[tool.coverage.run]
+source = ["CTFdpp"]

@@ -3,8 +3,8 @@
 
 from freezegun import freeze_time
 
-from CTFd.models import Unlocks, Users, db
-from CTFd.utils import set_config, text_type
+from CTFdpp.models import Unlocks, Users, db
+from CTFdpp.utils import set_config, text_type
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

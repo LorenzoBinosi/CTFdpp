@@ -38,17 +38,12 @@ This fork removes the MajorLeagueCyber integration and the update/telemetry chec
 
 ## Install
 
-1. Install dependencies: `pip install -r requirements/requirements.txt`
-   1. You can also use the `prepare.sh` script to install system dependencies using apt.
-2. Modify [CTFd/config.ini](https://github.com/CTFd/CTFd/blob/master/CTFd/config.ini) to your liking.
-3. Use `python serve.py` or `flask run` in a terminal to drop into debug mode.
+CTFd++ is built and run with [Docker Compose](https://docs.docker.com/compose/) —
+the only supported deployment method. A [Caddy](https://caddyserver.com/) reverse
+proxy is included by default and handles TLS automatically.
 
-You can use the auto-generated Docker images with the following command:
-
-`docker run -p 8000:8000 -it ctfd/ctfd`
-
-Or you can use Docker Compose from the source repository. A [Caddy](https://caddyserver.com/)
-reverse proxy is included by default and handles TLS automatically.
+Configuration lives in [CTFdpp/config.ini](CTFdpp/config.ini) and can be overridden
+with environment variables (see [docker-compose.yml](docker-compose.yml)).
 
 **Deployment** (Caddy obtains a certificate for `SITE_ADDRESS`):
 

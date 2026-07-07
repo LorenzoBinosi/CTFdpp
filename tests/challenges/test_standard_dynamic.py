@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import Challenges
-from CTFd.challenges.standard import CTFdStandardChallenge
-from CTFd.utils.security.signing import hmac
+from CTFdpp.models import Challenges
+from CTFdpp.challenges.standard import CTFdStandardChallenge
+from CTFdpp.utils.security.signing import hmac
 from tests.helpers import (
     FakeRequest,
     create_ctfd,
@@ -594,7 +594,7 @@ def test_standard_dynamic_challenge_creation_requires_all_parameters():
     """Test that creating a dynamic challenge without initial, minimum, and decay raises an error"""
     app = create_ctfd()
     with app.app_context():
-        from CTFd.exceptions.challenges import ChallengeCreateException
+        from CTFdpp.exceptions.challenges import ChallengeCreateException
 
         # Test missing initial parameter for linear function
         challenge_data_missing_initial = {

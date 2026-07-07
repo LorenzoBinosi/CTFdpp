@@ -1,9 +1,9 @@
 import csv
 import io
 
-from CTFd.models import Challenges, Flags, Hints, Teams, Users
-from CTFd.utils import set_config
-from CTFd.utils.crypto import verify_password
+from CTFdpp.models import Challenges, Flags, Hints, Teams, Users
+from CTFdpp.utils import set_config
+from CTFdpp.utils.crypto import verify_password
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

@@ -3,10 +3,10 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from CTFd.models import Users
-from CTFd.utils import get_config, set_config
-from CTFd.utils.crypto import verify_password
-from CTFd.utils.email import (
+from CTFdpp.models import Users
+from CTFdpp.utils import get_config, set_config
+from CTFdpp.utils.crypto import verify_password
+from CTFdpp.utils.email import (
     check_email_is_blacklisted,
     check_email_is_whitelisted,
     forgot_password,
@@ -115,7 +115,7 @@ def test_sendmail_with_mailgun_from_config_file(fake_post_request):
             "to": ["user@user.com"],
             "text": "this is a test",
             "from": "CTFd <noreply@examplectf.com>",
-            "subject": "Message from CTFd",
+            "subject": "Message from CTFdpp",
         }
 
         assert fake_response.status_code == 200
@@ -156,7 +156,7 @@ def test_sendmail_with_mailgun_from_db_config(fake_post_request):
             "to": ["user@user.com"],
             "text": "this is a test",
             "from": "CTFd <noreply@examplectf.com>",
-            "subject": "Message from CTFd",
+            "subject": "Message from CTFdpp",
         }
 
         assert fake_response.status_code == 200

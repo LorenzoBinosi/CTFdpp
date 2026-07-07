@@ -1,6 +1,6 @@
 from flask.cli import FlaskGroup
 
-from CTFd import create_app
+from CTFdpp import create_app
 
 app = create_app()
 

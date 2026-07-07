@@ -1,5 +1,5 @@
 ---
-name: CTFd MariaDB CI
+name: CTFd++ MariaDB CI
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
         image: mariadb:10.11
         env:
           MYSQL_ROOT_PASSWORD: password
-          MYSQL_DATABASE: ctfd
+          MYSQL_DATABASE: ctfdpp
         ports:
           - 3306
       redis:
@@ -51,9 +51,5 @@ jobs:
         env:
             AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
             AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-            TESTING_DATABASE_URL: mysql+pymysql://root:password@localhost:${{ job.services.mariadb.ports[3306] }}/ctfd
+            TESTING_DATABASE_URL: mysql+pymysql://root:password@localhost:${{ job.services.mariadb.ports[3306] }}/ctfdpp
 
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml

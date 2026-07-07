@@ -29,7 +29,7 @@ def test_ctfd_setup_verification():
 
             with client.session_transaction() as sess:
                 data = {
-                    "ctf_name": "CTFd",
+                    "ctf_name": "CTFd++",
                     "ctf_description": "CTF description",
                     "name": "test",
                     "email": "test@examplectf.com",

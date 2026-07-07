@@ -10,8 +10,8 @@ from jinja2.exceptions import TemplateNotFound
 from jinja2.sandbox import SecurityError
 from werkzeug.test import Client
 
-from CTFd.config import TestingConfig
-from CTFd.utils import get_config, set_config
+from CTFdpp.config import TestingConfig
+from CTFdpp.utils import get_config, set_config
 from tests.helpers import create_ctfd, destroy_ctfd, gen_user, login_as_user
 
 
@@ -95,7 +95,7 @@ def test_that_ctfd_can_be_deployed_in_subdir():
             r = client.get("/setup")
             with client.session_transaction() as sess:
                 data = {
-                    "ctf_name": "CTFd",
+                    "ctf_name": "CTFd++",
                     "ctf_description": "CTF description",
                     "name": "admin",
                     "email": "admin@examplectf.com",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import Fields, TeamFieldEntries, Teams, UserFieldEntries, Users
+from CTFdpp.models import Fields, TeamFieldEntries, Teams, UserFieldEntries, Users
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

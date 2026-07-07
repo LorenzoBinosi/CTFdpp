@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import Users, db
-from CTFd.utils.crypto import verify_password
+from CTFdpp.models import Users, db
+from CTFdpp.utils.crypto import verify_password
 from tests.helpers import create_ctfd, destroy_ctfd, login_as_user, register_user
 
 

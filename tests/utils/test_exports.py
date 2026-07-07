@@ -4,10 +4,10 @@ import json
 import os
 import zipfile
 
-from CTFd.constants.themes import DEFAULT_THEME
-from CTFd.models import Challenges, Flags, Teams, Users
-from CTFd.utils import get_config, text_type
-from CTFd.utils.exports import export_ctf, import_ctf
+from CTFdpp.constants.themes import DEFAULT_THEME
+from CTFdpp.models import Challenges, Flags, Teams, Users
+from CTFdpp.utils import get_config, text_type
+from CTFdpp.utils.exports import export_ctf, import_ctf
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

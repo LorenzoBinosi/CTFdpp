@@ -2,7 +2,7 @@
 
 import string
 
-from CTFd.utils.encoding import base64decode, base64encode, hexdecode, hexencode
+from CTFdpp.utils.encoding import base64decode, base64encode, hexdecode, hexencode
 
 
 def test_hexencode():

@@ -3,9 +3,9 @@
 
 import datetime
 
-from CTFd.models import Tokens, Users
-from CTFd.schemas.tokens import TokenSchema
-from CTFd.utils.security.auth import generate_user_token
+from CTFdpp.models import Tokens, Users
+from CTFdpp.schemas.tokens import TokenSchema
+from CTFdpp.utils.security.auth import generate_user_token
 from tests.helpers import create_ctfd, destroy_ctfd, gen_user, login_as_user
 
 

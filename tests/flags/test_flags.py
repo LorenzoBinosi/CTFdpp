@@ -1,4 +1,4 @@
-from CTFd.flags import CTFdRegexFlag
+from CTFdpp.flags import CTFdRegexFlag
 
 
 def test_valid_regex_match_case_sensitive():

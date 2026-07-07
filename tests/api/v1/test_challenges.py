@@ -5,9 +5,9 @@ from unittest.mock import patch
 from freezegun import freeze_time
 from sqlalchemy.exc import IntegrityError
 
-from CTFd.exceptions.challenges import ChallengeSolveException
-from CTFd.models import Challenges, Flags, Hints, Solves, Tags, Tracking, Users
-from CTFd.utils import set_config
+from CTFdpp.exceptions.challenges import ChallengeSolveException
+from CTFdpp.models import Challenges, Flags, Hints, Solves, Tags, Tracking, Users
+from CTFdpp.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,
@@ -1095,7 +1095,7 @@ def test_api_challenge_attempt_post_duplicate_solve_race_condition():
 
         # Mock BaseChallenge.solve raising ChallengeSolveException - it's hard to trigger this race condition in tests
         # The exception should be handled and API should return an already_solved status
-        with patch("CTFd.challenges.base.BaseChallenge.solve") as mock_solve:
+        with patch("CTFdpp.challenges.base.BaseChallenge.solve") as mock_solve:
             exception = ChallengeSolveException("Duplicate solve")
             exception.__cause__ = IntegrityError(
                 "INSERT test...", {}, Exception("UNIQUE constraint failed")

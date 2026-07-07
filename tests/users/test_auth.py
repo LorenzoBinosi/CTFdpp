@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 from freezegun import freeze_time
 
-from CTFd.models import Users, db
-from CTFd.utils import get_config, set_config
-from CTFd.utils.crypto import verify_password
+from CTFdpp.models import Users, db
+from CTFdpp.utils import get_config, set_config
+from CTFdpp.utils.crypto import verify_password
 from tests.helpers import create_ctfd, destroy_ctfd, login_as_user, register_user
 
 

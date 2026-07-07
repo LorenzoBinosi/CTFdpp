@@ -1,4 +1,4 @@
-from CTFd.models import Brackets, Users
+from CTFdpp.models import Brackets, Users
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

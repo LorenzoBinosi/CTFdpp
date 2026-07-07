@@ -1,5 +1,5 @@
 ---
-name: CTFd Postgres CI
+name: CTFd++ Postgres CI
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
           - 5432:5432
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: ctfd
+          POSTGRES_DB: ctfdpp
           POSTGRES_PASSWORD: password
         # Set health checks to wait until postgres has started
         options: >-
@@ -58,10 +58,6 @@ jobs:
         env:
             AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
             AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-            TESTING_DATABASE_URL: postgres://postgres:password@localhost:${{ job.services.postgres.ports[5432] }}/ctfd
+            TESTING_DATABASE_URL: postgres://postgres:password@localhost:${{ job.services.postgres.ports[5432] }}/ctfdpp
 
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml
 

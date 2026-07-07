@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.utils import set_config
-from CTFd.utils.scores import get_standings
+from CTFdpp.utils import set_config
+from CTFdpp.utils.scores import get_standings
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.cache import clear_ratings
-from CTFd.models import Ratings
-from CTFd.utils import set_config
+from CTFdpp.cache import clear_ratings
+from CTFdpp.models import Ratings
+from CTFdpp.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

@@ -1,6 +1,6 @@
 from collections import namedtuple
 
-from CTFd.utils.security.sanitize import sanitize_html
+from CTFdpp.utils.security.sanitize import sanitize_html
 
 Case = namedtuple("Case", ["input", "expected"])
 

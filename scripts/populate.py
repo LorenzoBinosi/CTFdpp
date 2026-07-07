@@ -5,10 +5,16 @@ import datetime
 import hashlib
 import random
 import argparse
+import os
+import sys
 
-from CTFd import create_app
-from CTFd.cache import clear_challenges, clear_config, clear_standings, clear_pages
-from CTFd.models import (
+# This script lives in scripts/, so add the repo root to sys.path to import
+# CTFd regardless of the working directory used to launch it.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from CTFdpp import create_app
+from CTFdpp.cache import clear_challenges, clear_config, clear_standings, clear_pages
+from CTFdpp.models import (
     Users,
     Teams,
     Challenges,

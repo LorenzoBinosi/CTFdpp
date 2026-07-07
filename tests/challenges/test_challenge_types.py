@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import Challenges
+from CTFdpp.models import Challenges
 from tests.helpers import create_ctfd, destroy_ctfd, login_as_user, register_user
 
 
@@ -33,7 +33,7 @@ def test_missing_challenge_type():
         # Delete the dynamic challenge type. The built-in types are registered
         # once at import time, so we must restore the entry afterwards to avoid
         # leaking the deletion into other tests.
-        from CTFd.challenges import CHALLENGE_CLASSES
+        from CTFdpp.challenges import CHALLENGE_CLASSES
 
         saved_dynamic = CHALLENGE_CLASSES.pop("dynamic")
         try:

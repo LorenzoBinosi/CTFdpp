@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from CTFd.models import Teams, Users
-from CTFd.utils import get_config, set_config
+from CTFdpp.models import Teams, Users
+from CTFdpp.utils import get_config, set_config
 from tests.helpers import create_ctfd, destroy_ctfd, gen_team, login_as_user
 
 
@@ -37,7 +37,7 @@ def test_api_configs_get_non_admin():
             """Can a user delete /api/v1/configs/<config_key> if not admin"""
             r = client.delete("/api/v1/configs/ctf_name", json="")
             assert r.status_code == 403
-            assert get_config("ctf_name") == "CTFd"
+            assert get_config("ctf_name") == "CTFd++"
     destroy_ctfd(app)
 
 

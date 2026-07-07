@@ -3,11 +3,11 @@
 
 from redis.exceptions import ConnectionError
 
-from CTFd.cache import clear_all_user_sessions, clear_user_session
-from CTFd.config import TestingConfig
-from CTFd.models import Users
-from CTFd.utils.security.auth import login_user
-from CTFd.utils.user import get_current_user, is_admin
+from CTFdpp.cache import clear_all_user_sessions, clear_user_session
+from CTFdpp.config import TestingConfig
+from CTFdpp.models import Users
+from CTFdpp.utils.security.auth import login_user
+from CTFdpp.utils.user import get_current_user, is_admin
 from tests.helpers import create_ctfd, destroy_ctfd, register_user
 
 
@@ -72,7 +72,7 @@ def test_clear_all_user_sessions():
 def test_cache_subclass_commands():
     app = create_ctfd()
     with app.app_context():
-        from CTFd.cache import cache
+        from CTFdpp.cache import cache
 
         cache.inc("testing_inc")
         resp = cache.inc("testing_inc")
@@ -97,7 +97,7 @@ def test_redis_cache_subclass_commands():
         print("Failed to connect to redis. Skipping test.")
     else:
         with app.app_context():
-            from CTFd.cache import cache
+            from CTFdpp.cache import cache
 
             cache.inc("testing_inc")
             resp = cache.inc("testing_inc")

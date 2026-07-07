@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 
 from freezegun import freeze_time
 
-from CTFd.models import Challenges, Fails, Ratelimiteds, Solves
-from CTFd.utils import set_config, text_type
+from CTFdpp.models import Challenges, Fails, Ratelimiteds, Solves
+from CTFdpp.utils import set_config, text_type
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

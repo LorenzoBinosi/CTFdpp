@@ -90,8 +90,8 @@ def test_session_with_duplicate_session_id():
         ]
         uuid_mock = Mock(side_effect=TEST_UUIDS)
 
-        with patch(target="CTFd.utils.sessions.uuid4", new=uuid_mock):
+        with patch(target="CTFdpp.utils.sessions.uuid4", new=uuid_mock):
             login_as_user(app)
-        with patch(target="CTFd.utils.sessions.uuid4", new=uuid_mock):
+        with patch(target="CTFdpp.utils.sessions.uuid4", new=uuid_mock):
             login_as_user(app, name="user1")
     destroy_ctfd(app)

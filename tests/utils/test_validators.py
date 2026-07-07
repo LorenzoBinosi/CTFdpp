@@ -1,6 +1,6 @@
 from marshmallow import ValidationError
 
-from CTFd.utils.validators import is_safe_url, validate_country_code, validate_email
+from CTFdpp.utils.validators import is_safe_url, validate_country_code, validate_email
 from tests.helpers import create_ctfd, destroy_ctfd
 
 

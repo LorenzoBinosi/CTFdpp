@@ -1,4 +1,4 @@
-from CTFd.models import (
+from CTFdpp.models import (
     Challenges,
     Comments,
     Files,

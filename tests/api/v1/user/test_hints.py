@@ -3,8 +3,8 @@
 
 from freezegun import freeze_time
 
-from CTFd.models import Hints
-from CTFd.utils import set_config
+from CTFdpp.models import Hints
+from CTFdpp.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

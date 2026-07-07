@@ -12,11 +12,11 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy_utils import drop_database
 from werkzeug.datastructures import Headers
 
-from CTFd import create_app
-from CTFd.cache import cache, clear_challenges, clear_ratings, clear_standings
-from CTFd.config import TestingConfig
-from CTFd.constants.themes import DEFAULT_THEME
-from CTFd.models import (
+from CTFdpp import create_app
+from CTFdpp.cache import cache, clear_challenges, clear_ratings, clear_standings
+from CTFdpp.config import TestingConfig
+from CTFdpp.constants.themes import DEFAULT_THEME
+from CTFdpp.models import (
     Awards,
     Brackets,
     ChallengeComments,
@@ -46,7 +46,7 @@ from CTFd.models import (
     UserComments,
     Users,
 )
-from CTFd.utils import set_config
+from CTFdpp.utils import set_config
 from tests.constants.time import FreezeTimes
 
 text_type = str
@@ -121,7 +121,7 @@ class ctftime:
 
 
 def create_ctfd(
-    ctf_name="CTFd",
+    ctf_name="CTFd++",
     ctf_description="CTF description",
     name="admin",
     email="admin@examplectf.com",
@@ -166,7 +166,7 @@ def create_ctfd(
 
 def setup_ctfd(
     app,
-    ctf_name="CTFd",
+    ctf_name="CTFd++",
     ctf_description="CTF description",
     name="admin",
     email="admin@examplectf.com",

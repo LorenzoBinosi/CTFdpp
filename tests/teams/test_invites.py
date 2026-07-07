@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 from freezegun import freeze_time
 
-from CTFd.exceptions import TeamTokenExpiredException, TeamTokenInvalidException
-from CTFd.models import Teams, Users
-from CTFd.utils import set_config
+from CTFdpp.exceptions import TeamTokenExpiredException, TeamTokenInvalidException
+from CTFdpp.models import Teams, Users
+from CTFdpp.utils import set_config
 from tests.helpers import create_ctfd, destroy_ctfd, gen_team, gen_user, login_as_user
 
 

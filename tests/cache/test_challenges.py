@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import Users
+from CTFdpp.models import Users
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,
@@ -60,7 +60,7 @@ def test_deleting_challenge_clears_cache_solves():
             data = req.get_json()["data"]
             challenge = data[0]
             assert challenge["solves"] == 1
-            from CTFd.utils.challenges import (  # noqa: I001
+            from CTFdpp.utils.challenges import (  # noqa: I001
                 get_solve_counts_for_challenges,
                 get_solves_for_challenge_id,
             )
@@ -100,7 +100,7 @@ def test_deleting_solve_clears_cache():
             data = req.get_json()["data"]
             challenge = data[0]
             assert challenge["solves"] == 1
-            from CTFd.utils.challenges import (  # noqa: I001
+            from CTFdpp.utils.challenges import (  # noqa: I001
                 get_solve_counts_for_challenges,
                 get_solves_for_challenge_id,
             )

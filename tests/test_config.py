@@ -3,10 +3,10 @@
 
 from werkzeug.exceptions import SecurityError
 
-from CTFd.config import TestingConfig
-from CTFd.models import Configs, Users, db
-from CTFd.utils import get_config
-from CTFd.utils.crypto import verify_password
+from CTFdpp.config import TestingConfig
+from CTFdpp.models import Configs, Users, db
+from CTFdpp.utils import get_config
+from CTFdpp.utils.crypto import verify_password
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

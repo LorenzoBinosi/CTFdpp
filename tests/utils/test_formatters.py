@@ -1,4 +1,4 @@
-from CTFd.utils.formatters import safe_format
+from CTFdpp.utils.formatters import safe_format
 
 
 def test_safe_format():

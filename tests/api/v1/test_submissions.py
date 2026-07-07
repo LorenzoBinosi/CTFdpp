@@ -3,7 +3,7 @@
 
 import datetime
 
-from CTFd.models import Discards, Fails, Partials, Solves
+from CTFdpp.models import Discards, Fails, Partials, Solves
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

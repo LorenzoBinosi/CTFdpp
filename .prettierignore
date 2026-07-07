@@ -1,8 +1,8 @@
-CTFd/themes/**/vendor/
-CTFd/themes/core-deprecated/
-CTFd/themes/core/static/
-CTFd/themes/core-beta/**/*
-CTFd/themes/admin/static/**/*
+CTFdpp/themes/**/vendor/
+CTFdpp/themes/core-deprecated/
+CTFdpp/themes/core/static/
+CTFdpp/themes/core-beta/**/*
+CTFdpp/themes/admin/static/**/*
 *.html
 *.njk
 *.png

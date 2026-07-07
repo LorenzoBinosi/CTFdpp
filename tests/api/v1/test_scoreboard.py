@@ -3,9 +3,9 @@
 
 from flask import jsonify
 
-from CTFd.cache import clear_standings
-from CTFd.models import Users
-from CTFd.utils.scoreboard import get_scoreboard_detail
+from CTFdpp.cache import clear_standings
+from CTFdpp.models import Users
+from CTFdpp.utils.scoreboard import get_scoreboard_detail
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,
@@ -36,7 +36,7 @@ def test_scoreboard_is_cached():
         gen_solve(app.db, user_id=2, challenge_id=chal_id)
 
         # Initial get_scoreboard_detail cache key version
-        saved = app.cache.get("CTFd.utils.scoreboard.get_scoreboard_detail_memver")
+        saved = app.cache.get("CTFdpp.utils.scoreboard.get_scoreboard_detail_memver")
 
         with login_as_user(app, "user1") as client:
             # Check basic scoreboard data
@@ -47,18 +47,18 @@ def test_scoreboard_is_cached():
             # Check detailed scoreboard data
             orig = jsonify(get_scoreboard_detail.uncached(count=10)).get_json()
             assert (
-                app.cache.get("CTFd.utils.scoreboard.get_scoreboard_detail_memver")
+                app.cache.get("CTFdpp.utils.scoreboard.get_scoreboard_detail_memver")
                 == saved
             )
             cached = client.get("/api/v1/scoreboard/top/10").get_json()
             assert cached["data"] == orig
-            assert app.cache.get("CTFd.utils.scoreboard.get_scoreboard_detail_memver")
+            assert app.cache.get("CTFdpp.utils.scoreboard.get_scoreboard_detail_memver")
 
             # Empty standings and check that the cached data is gone
             clear_standings()
             assert app.cache.get("view/api.scoreboard_scoreboard_list") is None
             # Clearing an entire function bumps flask-cachings version identify instead of setting it to null
-            new = app.cache.get("CTFd.utils.scoreboard.get_scoreboard_detail_memver")
+            new = app.cache.get("CTFdpp.utils.scoreboard.get_scoreboard_detail_memver")
             assert new != saved
     destroy_ctfd(app)
 

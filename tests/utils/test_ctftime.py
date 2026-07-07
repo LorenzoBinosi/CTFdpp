@@ -3,8 +3,8 @@ from datetime import timezone as TimeZone
 
 import pytest
 
-from CTFd.models import Solves
-from CTFd.utils.dates import (
+from CTFdpp.models import Solves
+from CTFdpp.utils.dates import (
     ctf_ended,
     ctf_started,
     isoformat,
@@ -12,7 +12,7 @@ from CTFd.utils.dates import (
     unix_time_millis,
     unix_time_to_utc,
 )
-from CTFd.utils.modes import TEAMS_MODE
+from CTFdpp.utils.modes import TEAMS_MODE
 from tests.helpers import (
     create_ctfd,
     ctftime,

@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 from redis.exceptions import ConnectionError
 
-from CTFd.config import TestingConfig
-from CTFd.utils.events import EventManager, RedisEventManager, ServerSentEvent
+from CTFdpp.config import TestingConfig
+from CTFdpp.utils.events import EventManager, RedisEventManager, ServerSentEvent
 from tests.helpers import create_ctfd, destroy_ctfd, login_as_user, register_user
 
 

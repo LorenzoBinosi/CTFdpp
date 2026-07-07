@@ -1,5 +1,5 @@
-from CTFd.models import Teams
-from CTFd.utils.scores import get_standings, get_team_standings
+from CTFdpp.models import Teams
+from CTFdpp.utils.scores import get_standings, get_team_standings
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

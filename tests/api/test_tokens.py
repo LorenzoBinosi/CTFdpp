@@ -2,9 +2,9 @@ import datetime
 import os
 from io import BytesIO
 
-from CTFd.exceptions import UserNotFoundException, UserTokenExpiredException
-from CTFd.models import Files, Tokens, Users
-from CTFd.utils.security.auth import generate_user_token, lookup_user_token
+from CTFdpp.exceptions import UserNotFoundException, UserTokenExpiredException
+from CTFdpp.models import Files, Tokens, Users
+from CTFdpp.utils.security.auth import generate_user_token, lookup_user_token
 from tests.helpers import create_ctfd, destroy_ctfd, gen_token, gen_user
 
 

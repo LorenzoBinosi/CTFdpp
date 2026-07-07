@@ -1,4 +1,4 @@
-from CTFd.models import Teams, Users
+from CTFdpp.models import Teams, Users
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,

@@ -18,7 +18,7 @@ if args.disable_gevent:
     monkey.patch_all()
 
 # Import not at top of file to allow gevent to monkey patch uninterrupted
-from CTFd import create_app
+from CTFdpp import create_app
 
 app = create_app()
 
