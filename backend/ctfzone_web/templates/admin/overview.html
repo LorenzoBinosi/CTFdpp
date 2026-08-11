@@ -1,0 +1,41 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Monitor the event and jump to the controls that need attention.</p>{% endblock %}
+{% block actions %}<a class="button button-small" href="{{ url_for('web.admin_challenge_new') }}">+ New challenge</a>{% endblock %}
+{% block admin_content %}
+  <section class="admin-stats" aria-label="Platform totals">
+    <a class="admin-stat-card" href="{{ url_for('web.admin_challenges') }}"><span>Challenges</span><strong>{{ stats.challenges }}</strong><small>published and hidden</small></a>
+    <a class="admin-stat-card" href="{{ url_for('web.admin_users') }}"><span>Users</span><strong>{{ stats.users }}</strong><small>registered operators</small></a>
+    <a class="admin-stat-card" href="{{ url_for('web.admin_teams') }}"><span>Teams</span><strong>{{ stats.teams }}</strong><small>competition groups</small></a>
+    <a class="admin-stat-card" href="{{ url_for('web.admin_runtime') }}"><span>Instances</span><strong>{{ stats.instances }}</strong><small>managed runtime records</small></a>
+  </section>
+
+  <section class="admin-panel">
+    <header class="admin-panel-heading">
+      <div><span class="eyebrow">LIVE ACTIVITY</span><h2>Recent submissions</h2></div>
+      <a class="quiet-button" href="{{ url_for('web.admin_submissions') }}">View all →</a>
+    </header>
+    <div class="admin-table-wrap">
+      <table class="admin-table">
+        <thead><tr><th>ID</th><th>Challenge</th><th>User</th><th>Result</th><th>Time</th></tr></thead>
+        <tbody>
+          {% for submission in recent_submissions %}
+            <tr>
+              <td class="mono">#{{ submission.id }}</td>
+              <td>{{ submission.challenge_name or submission.challenge_id or '—' }}</td>
+              <td>{{ submission.user_name or submission.user_id or '—' }}</td>
+              <td><span class="status-pill {{ 'good' if submission.submission_type == 'correct' else 'bad' if submission.submission_type == 'incorrect' else '' }}">{{ submission.submission_type or 'unknown' }}</span></td>
+              <td class="muted mono">{{ submission.date or '—' }}</td>
+            </tr>
+          {% else %}
+            <tr><td class="admin-empty-row" colspan="5">No submissions have been recorded yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="admin-quick-grid">
+    <a class="admin-quick-card" href="{{ url_for('web.admin_config') }}"><strong>Configure the event</strong><span>Site identity, visibility, registration, scoring and timing.</span><small>Open configuration →</small></a>
+    <a class="admin-quick-card" href="{{ url_for('web.admin_runtime') }}"><strong>Review runtime health</strong><span>Private challenge setting, remote servers and user instances.</span><small>Open managed instances →</small></a>
+  </section>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Team · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="content-shell team-shell">
+    <header class="page-heading"><div><span class="eyebrow">YOUR CREW</span><h1>Team</h1><p>Coordinate your operators and review the team identity used for scoring.</p></div></header>
+    {% if not bootstrap.authenticated %}
+      <div class="feature-card centered"><svg class="feature-icon"><use href="#icon-user"></use></svg><h2>Sign in to view your team</h2><p>Your team roster and shared score are private.</p><a class="button" href="{{ url_for('web.login', next=url_for('web.team')) }}">Log in</a></div>
+    {% elif team %}
+      <div class="team-grid">
+        <article class="feature-card team-identity">
+          <span class="eyebrow">ACTIVE TEAM</span>
+          <h2>{{ team.name }}</h2>
+          {% if team.affiliation %}<p>{{ team.affiliation }}</p>{% endif %}
+          <dl><div><dt>Score</dt><dd>{{ team.score or 0 }}</dd></div><div><dt>Rank</dt><dd>{{ team.place or '—' }}</dd></div></dl>
+        </article>
+        <article class="feature-card">
+          <span class="eyebrow">ROSTER</span>
+          <div class="member-list">
+            {% for member in team.members or [] %}
+              <div><span class="avatar">{{ (member.name or '?')[0] | upper }}</span><strong>{{ member.name }}</strong><small>{{ member.score or 0 }} pts</small></div>
+            {% else %}
+              <p class="muted">Roster details are not available yet.</p>
+            {% endfor %}
+          </div>
+        </article>
+      </div>
+    {% else %}
+      <div class="feature-card centered"><span class="empty-glyph">+</span><h2>No team assigned</h2><p>Join or create a team when the event is configured for team play.</p></div>
+    {% endif %}
+  </section>
+{% endblock %}

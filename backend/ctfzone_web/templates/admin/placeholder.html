@@ -1,0 +1,14 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>This legacy administration address is recognized, but it does not have a dedicated CTFZone screen yet.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel admin-placeholder">
+    <span class="empty-glyph">…</span>
+    <span class="eyebrow">COMPATIBILITY ROUTE</span>
+    <h2>{{ admin_title }}</h2>
+    <p><code>/admin/{{ legacy_path }}</code> is not part of the lightweight administration surface. No data was changed.</p>
+    <div>
+      <a class="button" href="{{ url_for('web.admin_overview') }}">Open overview</a>
+      <a class="secondary-button" href="{{ url_for('web.challenges') }}">View portal</a>
+    </div>
+  </section>
+{% endblock %}

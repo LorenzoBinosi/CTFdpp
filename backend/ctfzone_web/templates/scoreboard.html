@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Scoreboard · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="content-shell scoreboard-shell">
+    <header class="page-heading">
+      <div><span class="eyebrow">LIVE STANDINGS</span><h1>Scoreboard</h1><p>Ranked by score, then by the time of the last scoring event.</p></div>
+      <div class="scoreboard-pulse"><span class="status-dot"></span> LIVE</div>
+    </header>
+    <div class="table-card">
+      <div class="table-toolbar">
+        <div class="search-field"><svg><use href="#icon-search"></use></svg><input type="search" placeholder="Find a participant…" data-score-search></div>
+        <span>{{ standings | length }} ranked</span>
+      </div>
+      {% if api_error %}
+        <div class="empty-state compact"><span class="empty-glyph">!</span><h2>Standings unavailable</h2></div>
+      {% elif standings %}
+        <div class="standings" data-score-rows>
+          {% for standing in standings %}
+            <a class="standing-row {{ 'podium' if loop.index <= 3 }}" href="{{ standing.account_url or '#' }}" data-score-name="{{ standing.name | lower }}">
+              <span class="rank">{{ standing.pos or loop.index }}</span>
+              <span class="rank-mark">{% if loop.index == 1 %}◆{% elif loop.index == 2 %}◇{% elif loop.index == 3 %}△{% else %}·{% endif %}</span>
+              <strong>{{ standing.name }}</strong>
+              {% if standing.bracket_name %}<small>{{ standing.bracket_name }}</small>{% endif %}
+              <span class="score">{{ standing.score }} <small>pts</small></span>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state compact"><span class="empty-glyph">0</span><h2>No scores yet</h2><p>The first solve will open the board.</p></div>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}
+{% block scripts %}<script type="module" src="{{ url_for('static', filename='js/scoreboard.js') }}"></script>{% endblock %}

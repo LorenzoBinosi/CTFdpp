@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Narrow, rootless remote execution boundary for CTFZone challenge workloads."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+
+INSTANCE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+IMAGE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[0-9a-f]{64}$")
+ALLOWED_OPERATIONS = {
+    "ensure-instance",
+    "inspect-instance",
+    "stop-instance",
+    "update-deadline",
+}
+MAX_REQUEST_BYTES = 1_048_576
+
+
+class HelperError(RuntimeError):
+    pass
+
+
+def load_config() -> dict[str, str]:
+    config = {
+        "CTFZONE_CONTAINER_ENGINE": "podman",
+        "CTFZONE_NETWORK": "ctfzone-challenges",
+        "CTFZONE_PUBLISH_IP": "0.0.0.0",
+        "CTFZONE_STATE_DIRECTORY": str(
+            pathlib.Path.home() / ".local/state/ctfzone-runtime"
+        ),
+        "CTFZONE_SYSTEMD_SCOPE": "user",
+        "CTFZONE_PUBLIC_HOSTNAME": "",
+        "CTFZONE_READ_ONLY": "true",
+    }
+    config_path = pathlib.Path(
+        os.environ.get("CTFZONE_HELPER_CONFIG", "/etc/ctfzone/runtime-helper.env")
+    )
+    if config_path.exists():
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, separator, value = line.partition("=")
+            if not separator or not re.fullmatch(r"CTFZONE_[A-Z0-9_]+", key):
+                raise HelperError("runtime helper configuration is invalid")
+            config[key] = value.strip()
+    for key in tuple(config):
+        if key in os.environ:
+            config[key] = os.environ[key]
+    if config["CTFZONE_CONTAINER_ENGINE"] not in {"podman", "docker"}:
+        raise HelperError("container engine must be podman or docker")
+    if config["CTFZONE_SYSTEMD_SCOPE"] not in {"user", "system"}:
+        raise HelperError("systemd scope must be user or system")
+    return config
+
+
+CONFIG = load_config()
+STATE_DIRECTORY = pathlib.Path(CONFIG["CTFZONE_STATE_DIRECTORY"])
+INSTANCES_DIRECTORY = STATE_DIRECTORY / "instances"
+
+
+def run(
+    arguments: list[str],
+    *,
+    check: bool = True,
+    input_bytes: bytes | None = None,
+    timeout: int = 45,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = os.environ.copy()
+    if CONFIG["CTFZONE_SYSTEMD_SCOPE"] == "user":
+        environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    completed = subprocess.run(
+        arguments,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=timeout,
+        env=environment,
+    )
+    if check and completed.returncode != 0:
+        diagnostic = completed.stderr.decode("utf-8", "replace").strip()
+        raise HelperError(diagnostic[:1000] or f"command failed: {arguments[0]}")
+    return completed
+
+
+def engine(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return run([CONFIG["CTFZONE_CONTAINER_ENGINE"], *arguments], check=check)
+
+
+def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    command = ["systemctl"]
+    if CONFIG["CTFZONE_SYSTEMD_SCOPE"] == "user":
+        command.append("--user")
+    return run([*command, *arguments], check=check)
+
+
+def systemd_run(*arguments: str) -> None:
+    command = ["systemd-run"]
+    if CONFIG["CTFZONE_SYSTEMD_SCOPE"] == "user":
+        command.append("--user")
+    run([*command, *arguments])
+
+
+def read_request() -> dict[str, Any]:
+    encoded = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise HelperError("request exceeds the helper size limit")
+    try:
+        request = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HelperError("request is not valid JSON") from error
+    if not isinstance(request, dict):
+        raise HelperError("request must be a JSON object")
+    return request
+
+
+def instance_id(request: dict[str, Any]) -> str:
+    value = request.get("instance_id")
+    if not isinstance(value, str) or not INSTANCE_RE.fullmatch(value):
+        raise HelperError("instance_id is invalid")
+    return value
+
+
+def generation(request: dict[str, Any]) -> int:
+    value = request.get("generation")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise HelperError("generation is invalid")
+    return value
+
+
+def parse_deadline(value: Any) -> dt.datetime:
+    if not isinstance(value, str):
+        raise HelperError("expires_at is required")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise HelperError("expires_at is invalid") from error
+    if parsed.tzinfo is None:
+        raise HelperError("expires_at must include a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def state_path(identifier: str) -> pathlib.Path:
+    return INSTANCES_DIRECTORY / f"{identifier}.json"
+
+
+def read_state(identifier: str) -> dict[str, Any] | None:
+    path = state_path(identifier)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise HelperError("instance state is unreadable") from error
+    if not isinstance(data, dict) or data.get("instance_id") != identifier:
+        raise HelperError("instance state is corrupt")
+    return data
+
+
+def write_state(identifier: str, state: dict[str, Any]) -> None:
+    INSTANCES_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{identifier}.", dir=INSTANCES_DIRECTORY
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, state_path(identifier))
+        directory_fd = os.open(INSTANCES_DIRECTORY, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def remove_state(identifier: str) -> None:
+    state_path(identifier).unlink(missing_ok=True)
+
+
+def container_name(identifier: str) -> str:
+    return f"ctfzone-{identifier}"
+
+
+def timer_base(identifier: str) -> str:
+    return f"ctfzone-expire-{identifier.replace('-', '')}"
+
+
+def cancel_timer(identifier: str) -> None:
+    base = timer_base(identifier)
+    systemctl("stop", f"{base}.timer", f"{base}.service", check=False)
+    systemctl("reset-failed", f"{base}.service", check=False)
+
+
+def schedule_timer(identifier: str, expected_generation: int, expires_at: dt.datetime) -> None:
+    cancel_timer(identifier)
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        expire_instance(identifier, expected_generation)
+        return
+    calendar = expires_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    helper_path = str(pathlib.Path(__file__).resolve())
+    systemd_run(
+        f"--unit={timer_base(identifier)}",
+        f"--on-calendar={calendar}",
+        "--timer-property=AccuracySec=1s",
+        "--property=Type=oneshot",
+        "--property=Restart=on-failure",
+        "--property=RestartSec=30s",
+        "--property=StartLimitIntervalSec=0",
+        "--collect",
+        helper_path,
+        "expire-instance",
+        identifier,
+        str(expected_generation),
+    )
+
+
+def inspect_raw(identifier: str) -> dict[str, Any] | None:
+    completed = engine("inspect", container_name(identifier), check=False)
+    if completed.returncode != 0:
+        diagnostic = completed.stderr.decode("utf-8", "replace").lower()
+        if any(
+            marker in diagnostic
+            for marker in ("no such", "not found", "does not exist", "no container")
+        ):
+            return None
+        raise HelperError(diagnostic[:1000] or "container inspection failed")
+    try:
+        document = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HelperError("container engine returned invalid inspect data") from error
+    if not isinstance(document, list) or not document or not isinstance(document[0], dict):
+        raise HelperError("container engine returned unexpected inspect data")
+    return document[0]
+
+
+def inspect_result(identifier: str) -> dict[str, Any]:
+    inspection = inspect_raw(identifier)
+    state = read_state(identifier)
+    if inspection is None:
+        return {"absent": True}
+    labels = inspection.get("Config", {}).get("Labels", {}) or {}
+    if labels.get("ctfzone.instance_id") != identifier:
+        raise HelperError("container identity label does not match")
+    network_settings = inspection.get("NetworkSettings", {}) or {}
+    networks = network_settings.get("Networks", {}) or {}
+    remote_ip = next(
+        (
+            network.get("IPAddress")
+            for network in networks.values()
+            if isinstance(network, dict) and network.get("IPAddress")
+        ),
+        None,
+    )
+    deployment = (state or {}).get("deployment", {})
+    container_port = deployment.get("container_port")
+    bindings = (network_settings.get("Ports", {}) or {}).get(
+        f"{container_port}/tcp", []
+    )
+    binding = bindings[0] if isinstance(bindings, list) and bindings else {}
+    published_ip = binding.get("HostIp")
+    published_port = binding.get("HostPort")
+    protocol = deployment.get("protocol", "tcp")
+    public_hostname = CONFIG["CTFZONE_PUBLIC_HOSTNAME"] or None
+    endpoint_url = None
+    if protocol in {"http", "https"} and published_port:
+        endpoint_host = public_hostname or published_ip
+        if endpoint_host and endpoint_host not in {"0.0.0.0", "::"}:
+            endpoint_url = f"{protocol}://{endpoint_host}:{published_port}"
+    return {
+        "container_id": inspection.get("Id"),
+        "remote_ip": remote_ip,
+        "container_port": container_port,
+        "published_ip": published_ip,
+        "published_port": int(published_port) if published_port else None,
+        "protocol": protocol,
+        "public_hostname": public_hostname,
+        "endpoint_url": endpoint_url,
+        "effective_expires_at": (state or {}).get("expires_at"),
+        "absent": False,
+    }
+
+
+def validate_deployment(request: dict[str, Any]) -> dict[str, Any]:
+    deployment = request.get("deployment")
+    if not isinstance(deployment, dict):
+        raise HelperError("deployment is required")
+    image = deployment.get("image_digest")
+    if not isinstance(image, str) or not IMAGE_RE.fullmatch(image):
+        raise HelperError("image must be pinned to a sha256 digest")
+    port = deployment.get("container_port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise HelperError("container_port is invalid")
+    protocol = deployment.get("protocol", "tcp")
+    if protocol not in {"tcp", "http", "https"}:
+        raise HelperError("protocol is invalid")
+    for key in ("memory_limit_bytes", "storage_limit_bytes", "pid_limit"):
+        value = deployment.get(key)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            raise HelperError(f"{key} is invalid")
+    cpu_limit = deployment.get("cpu_limit")
+    if cpu_limit is not None:
+        try:
+            parsed_cpu = float(cpu_limit)
+        except (TypeError, ValueError) as error:
+            raise HelperError("cpu_limit is invalid") from error
+        if not 0.01 <= parsed_cpu <= 256:
+            raise HelperError("cpu_limit is invalid")
+    healthcheck = deployment.get("healthcheck", {})
+    if not isinstance(healthcheck, dict):
+        raise HelperError("healthcheck is invalid")
+    if healthcheck:
+        permitted = {
+            "command",
+            "interval_seconds",
+            "timeout_seconds",
+            "retries",
+            "startup_timeout_seconds",
+        }
+        if not set(healthcheck).issubset(permitted):
+            raise HelperError("healthcheck contains unsupported fields")
+        command = healthcheck.get("command")
+        if command is not None and (
+            not isinstance(command, str) or not command or len(command) > 1000
+        ):
+            raise HelperError("healthcheck command is invalid")
+        for key in (
+            "interval_seconds",
+            "timeout_seconds",
+            "retries",
+            "startup_timeout_seconds",
+        ):
+            value = healthcheck.get(key)
+            if value is not None and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 1 <= value <= 300
+            ):
+                raise HelperError(f"healthcheck {key} is invalid")
+    return deployment
+
+
+def ensure_network() -> None:
+    network = CONFIG["CTFZONE_NETWORK"]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", network):
+        raise HelperError("challenge network name is invalid")
+    if engine("network", "inspect", network, check=False).returncode != 0:
+        engine("network", "create", network)
+
+
+def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
+    identifier = instance_id(request)
+    requested_generation = generation(request)
+    expires_at = parse_deadline(request.get("expires_at"))
+    deployment = validate_deployment(request)
+    existing = inspect_raw(identifier)
+    if existing is None:
+        ensure_network()
+        arguments = [
+            "run",
+            "--detach",
+            "--name",
+            container_name(identifier),
+            "--label",
+            f"ctfzone.instance_id={identifier}",
+            "--label",
+            f"ctfzone.owner_user_id={request.get('owner_user_id')}",
+            "--label",
+            f"ctfzone.challenge_id={request.get('challenge_id')}",
+            "--restart=no",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--network",
+            CONFIG["CTFZONE_NETWORK"],
+            "--publish",
+            f"{CONFIG['CTFZONE_PUBLISH_IP']}::{deployment['container_port']}/tcp",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=64m",
+        ]
+        if CONFIG["CTFZONE_READ_ONLY"].lower() in {"1", "true", "yes", "on"}:
+            arguments.append("--read-only")
+        if deployment.get("cpu_limit") is not None:
+            arguments.extend(["--cpus", str(deployment["cpu_limit"])])
+        if deployment.get("memory_limit_bytes") is not None:
+            arguments.extend(["--memory", str(deployment["memory_limit_bytes"])])
+        if deployment.get("pid_limit") is not None:
+            arguments.extend(["--pids-limit", str(deployment["pid_limit"])])
+        if deployment.get("storage_limit_bytes") is not None:
+            arguments.extend(
+                ["--storage-opt", f"size={deployment['storage_limit_bytes']}"]
+            )
+        healthcheck = deployment.get("healthcheck", {})
+        health_command = healthcheck.get("command")
+        if health_command:
+            arguments.extend(["--health-cmd", health_command])
+            if healthcheck.get("interval_seconds"):
+                arguments.extend(
+                    ["--health-interval", f"{int(healthcheck['interval_seconds'])}s"]
+                )
+            if healthcheck.get("timeout_seconds"):
+                arguments.extend(
+                    ["--health-timeout", f"{int(healthcheck['timeout_seconds'])}s"]
+                )
+            if healthcheck.get("retries"):
+                arguments.extend(["--health-retries", str(int(healthcheck["retries"]))])
+        arguments.append(deployment["image_digest"])
+        engine(*arguments)
+    else:
+        labels = existing.get("Config", {}).get("Labels", {}) or {}
+        if labels.get("ctfzone.instance_id") != identifier:
+            raise HelperError("existing container has an invalid identity label")
+    state = {
+        "instance_id": identifier,
+        "generation": requested_generation,
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "deployment": deployment,
+    }
+    write_state(identifier, state)
+    schedule_timer(identifier, requested_generation, expires_at)
+    return inspect_result(identifier)
+
+
+def stop_instance(request: dict[str, Any]) -> dict[str, Any]:
+    identifier = instance_id(request)
+    cancel_timer(identifier)
+    engine("rm", "--force", container_name(identifier), check=False)
+    if inspect_raw(identifier) is not None:
+        raise HelperError("container still exists after forced removal")
+    remove_state(identifier)
+    return {"absent": True}
+
+
+def update_deadline(request: dict[str, Any]) -> dict[str, Any]:
+    identifier = instance_id(request)
+    requested_generation = generation(request)
+    expires_at = parse_deadline(request.get("expires_at"))
+    state = read_state(identifier)
+    if state is None or inspect_raw(identifier) is None:
+        raise HelperError("cannot extend an absent instance")
+    state["generation"] = requested_generation
+    state["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
+    write_state(identifier, state)
+    schedule_timer(identifier, requested_generation, expires_at)
+    return {"effective_expires_at": state["expires_at"], "absent": False}
+
+
+def expire_instance(identifier: str, expected_generation: int) -> None:
+    if not INSTANCE_RE.fullmatch(identifier) or expected_generation <= 0:
+        raise HelperError("timer invocation is invalid")
+    state = read_state(identifier)
+    if state is None or state.get("generation") != expected_generation:
+        return
+    expires_at = parse_deadline(state.get("expires_at"))
+    if expires_at > dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1):
+        schedule_timer(identifier, expected_generation, expires_at)
+        return
+    engine("rm", "--force", container_name(identifier), check=False)
+    if inspect_raw(identifier) is None:
+        remove_state(identifier)
+
+
+def dispatch_ssh_original_command() -> str:
+    original = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        arguments = shlex.split(original)
+    except ValueError as error:
+        raise HelperError("SSH command is invalid") from error
+    if len(arguments) != 2 or pathlib.Path(arguments[0]).name != pathlib.Path(__file__).name:
+        raise HelperError("SSH command is not allowed")
+    if arguments[1] not in ALLOWED_OPERATIONS:
+        raise HelperError("SSH operation is not allowed")
+    return arguments[1]
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        raise HelperError("an operation is required")
+    operation = sys.argv[1]
+    if operation == "ssh-dispatch":
+        operation = dispatch_ssh_original_command()
+    if operation == "expire-instance":
+        if len(sys.argv) != 4:
+            raise HelperError("timer invocation is invalid")
+        try:
+            expected_generation = int(sys.argv[3])
+        except ValueError as error:
+            raise HelperError("timer generation is invalid") from error
+        expire_instance(sys.argv[2], expected_generation)
+        return 0
+    if operation not in ALLOWED_OPERATIONS or len(sys.argv) != 2:
+        raise HelperError("operation is not allowed")
+    request = read_request()
+    if operation == "ensure-instance":
+        result = ensure_instance(request)
+    elif operation == "inspect-instance":
+        result = inspect_result(instance_id(request))
+    elif operation == "stop-instance":
+        result = stop_instance(request)
+    else:
+        result = update_deadline(request)
+    json.dump(result, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (HelperError, subprocess.TimeoutExpired) as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1) from None

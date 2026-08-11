@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0b0f14">
+    <meta name="csrf-token" content="{{ csrf_token | default('') }}">
+    <title>{% block title %}{{ admin_title }} · {{ site.name }} administration{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  </head>
+  <body class="admin-body" data-authenticated="true">
+    <header class="admin-topbar">
+      <button class="admin-menu-button" type="button" aria-label="Toggle administration navigation" aria-expanded="false" data-admin-menu>☰</button>
+      <a class="brand admin-brand" href="{{ url_for('web.admin_overview') }}" aria-label="{{ site.name }} administration">
+        <span class="brand-primary">CTF</span><span class="brand-secondary">ZONE</span><span class="admin-brand-label">ADMIN</span>
+      </a>
+      <div class="admin-topbar-context">
+        <span class="status-dot"></span>
+        <span>control plane</span>
+      </div>
+      <div class="admin-account">
+        <span>{{ user.name }}</span>
+        <a class="quiet-button" href="{{ url_for('web.challenges') }}">View portal</a>
+        <form action="{{ url_for('web.logout') }}" method="post">
+          <button class="quiet-button" type="submit">Log out</button>
+        </form>
+      </div>
+    </header>
+
+    <div class="admin-layout">
+      <aside class="admin-sidebar" data-admin-sidebar>
+        <nav aria-label="Administration navigation">
+          <p class="admin-nav-label">Workspace</p>
+          <a class="{{ 'active' if admin_module == 'overview' }}" href="{{ url_for('web.admin_overview') }}"><span aria-hidden="true">⌂</span>Overview</a>
+          <a class="{{ 'active' if admin_module == 'challenges' }}" href="{{ url_for('web.admin_challenges') }}"><span aria-hidden="true">◆</span>Challenges</a>
+
+          <p class="admin-nav-label">Platform</p>
+          <a class="{{ 'active' if admin_module == 'config' }}" href="{{ url_for('web.admin_config') }}"><span aria-hidden="true">⚙</span>Configuration</a>
+          <a class="{{ 'active' if admin_module == 'runtime' }}" href="{{ url_for('web.admin_runtime') }}"><span aria-hidden="true">▣</span>Managed instances</a>
+
+          <p class="admin-nav-label">Activity</p>
+          <a class="{{ 'active' if admin_module == 'users' }}" href="{{ url_for('web.admin_users') }}"><span aria-hidden="true">◎</span>Users</a>
+          <a class="{{ 'active' if admin_module == 'teams' }}" href="{{ url_for('web.admin_teams') }}"><span aria-hidden="true">◉</span>Teams</a>
+          <a class="{{ 'active' if admin_module == 'submissions' }}" href="{{ url_for('web.admin_submissions') }}"><span aria-hidden="true">✓</span>Submissions</a>
+          <a class="{{ 'active' if admin_module == 'sessions' }}" href="{{ url_for('web.admin_sessions') }}"><span aria-hidden="true">◌</span>Sessions</a>
+        </nav>
+        <div class="admin-sidebar-foot">
+          <span class="status-dot"></span>
+          <span>API connected through BFF</span>
+        </div>
+      </aside>
+      <button class="admin-sidebar-backdrop" type="button" aria-label="Close administration navigation" data-admin-backdrop></button>
+
+      <main class="admin-main" id="main-content">
+        <header class="admin-page-heading">
+          <div>
+            <span class="eyebrow">ADMINISTRATION</span>
+            <h1>{{ admin_title }}</h1>
+            {% block description %}{% endblock %}
+          </div>
+          <div class="admin-heading-actions">{% block actions %}{% endblock %}</div>
+        </header>
+        {% if module_error %}
+          <div class="admin-alert danger" role="status">This module could not load all data from the API. Existing controls remain available; try refreshing before making changes.</div>
+        {% endif %}
+        {% block admin_content %}{% endblock %}
+      </main>
+    </div>
+
+    <div class="toast-region" aria-live="polite" aria-atomic="true" data-toast-region></div>
+    <script type="module" src="{{ url_for('static', filename='js/admin.js') }}"></script>
+  </body>
+</html>

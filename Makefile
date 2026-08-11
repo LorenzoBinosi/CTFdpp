@@ -1,32 +1,27 @@
-lint:
-	ruff check --select E,F,W,B,C4,I --ignore E402,E501,E712,B904,B905,I001 --exclude=CTFdpp/uploads CTFdpp/ migrations/ tests/
-	isort --profile=black --check-only --skip=CTFdpp/uploads --skip-glob **/node_modules CTFdpp/ tests/
-	yarn --cwd CTFdpp/themes/admin lint
-	black --check --diff --exclude=CTFdpp/uploads --exclude=node_modules .
-	prettier --check 'CTFdpp/themes/*/assets/**/*'
-	prettier --check '**/*.md'
+.PHONY: build check down logs local up
 
-format:
-	isort --profile=black --skip=CTFdpp/uploads --skip-glob **/node_modules CTFdpp/ tests/
-	black --exclude=CTFdpp/uploads --exclude=node_modules .
-	prettier --write 'CTFdpp/themes/**/assets/**/*'
-	prettier --write '**/*.md'
+build:
+	docker compose -f compose.yml build
 
-test:
-	pytest -rf --cov=CTFdpp --cov-context=test --cov-report=xml \
-		--ignore-glob="**/node_modules/" \
-		--ignore=node_modules/ \
-		-W ignore::sqlalchemy.exc.SADeprecationWarning \
-		-W ignore::sqlalchemy.exc.SAWarning \
-		-n auto
-	bandit -r CTFdpp -x CTFdpp/uploads --skip B105,B322
-	pipdeptree
+check:
+	cargo fmt --all --check
+	cargo check --workspace --all-targets --offline
+	cargo test --workspace --all-targets --offline
+	cargo clippy --workspace --all-targets --offline -- -D warnings
+	python3 -m compileall -q backend/ctfzone_web
+	cd backend && python3 -m unittest discover -s tests -v
+	python3 -m py_compile remote-helper/ctfzone-runtime-helper
+	sh -n remote-helper/install.sh
+	POSTGRES_PASSWORD=compose-check-only SECRET_KEY=compose-check-only SETUP_TOKEN=compose-check-only docker compose -f compose.yml config --quiet
 
-coverage:
-	coverage html --show-contexts
+down:
+	docker compose -f compose.yml down
 
-serve:
-	python serve.py
+logs:
+	docker compose -f compose.yml logs -f
 
-shell:
-	python manage.py shell
+local:
+	docker compose -f compose.yml -f compose.local.yml up --build
+
+up:
+	docker compose -f compose.yml up --build -d

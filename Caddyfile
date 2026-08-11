@@ -1,0 +1,26 @@
+{$SITE_ADDRESS:localhost} {
+	request_body {
+		# Match the Rust API's 512 MiB file ceiling plus multipart overhead.
+		max_size 513MiB
+	}
+
+	encode zstd gzip
+
+	# Rust exposes the stable machine API. The browser UI uses the Python BFF's
+	# /bff boundary, while integrations may call /api/v1 directly.
+	@api path /api/v1 /api/v1/*
+	handle @api {
+		reverse_proxy api:8080
+	}
+
+	# Uploaded content is authorized and streamed by the Rust API.
+	handle /files* {
+		reverse_proxy api:8080
+	}
+
+	# Python owns every human-facing route, including authentication forms and
+	# their server-to-server calls into the Rust API.
+	handle {
+		reverse_proxy backend:8000
+	}
+}

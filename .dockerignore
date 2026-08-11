@@ -1,17 +1,20 @@
-CTFdpp/logs/*.log
-CTFdpp/static/uploads
-CTFdpp/uploads
-CTFdpp/*.db
-CTFdpp/uploads/**/*
-.ctfdpp_secret_key
-.data
 .git
-.dockerignore
 .github
-.gitignore
-.prettierignore
-**/node_modules
-**/*.pyc
-**/__pycache__
-.venv*
-venv*
+.agents
+.codex
+.data
+.env
+target
+
+# Rust application images copy only Cargo metadata and services/. Keeping the
+# remaining workspace out of the build context avoids sending local secrets or
+# unrelated browser/database assets to the daemon.
+backend
+db
+docs
+remote-helper
+secrets
+Caddyfile
+Makefile
+README.md
+compose*.yml

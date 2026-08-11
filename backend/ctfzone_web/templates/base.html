@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0b0f14">
+    <meta name="csrf-token" content="{{ csrf_token | default('') }}">
+    <title>{% block title %}{{ site.name }}{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  </head>
+  <body class="page-{{ page | default('default') }}" data-authenticated="{{ 'true' if bootstrap.authenticated else 'false' }}">
+    <svg class="svg-sprite" aria-hidden="true">
+      <symbol id="icon-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.4 4.5 6.4 4.5 9S15 17.6 12 21M12 3C9 6.4 7.5 9.4 7.5 12S9 17.6 12 21"/></symbol>
+      <symbol id="icon-skull" viewBox="0 0 24 24"><path d="M5 11a7 7 0 1 1 14 0v4l-2 2v3h-3v-2h-4v2H7v-3l-2-2z"/><circle cx="9" cy="11" r="1"/><circle cx="15" cy="11" r="1"/><path d="m12 13-1 2h2z"/></symbol>
+      <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+      <symbol id="icon-bug" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="13" rx="5"/><path d="M9 7a3 3 0 0 1 6 0M4 13h3m10 0h3M5 8l3 2m11-2-3 2M5 18l3-2m11 2-3-2M12 10v10"/></symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></symbol>
+      <symbol id="icon-puzzle" viewBox="0 0 24 24"><path d="M4 5h6a2 2 0 1 1 4 0h6v6a2 2 0 1 0 0 4v5h-6a2 2 0 1 1-4 0H4v-5a2 2 0 1 0 0-4z"/></symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6"/><rect x="14" y="4" width="6" height="6"/><rect x="4" y="14" width="6" height="6"/><rect x="14" y="14" width="6" height="6"/></symbol>
+      <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2"/></symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 9a7 7 0 0 1 11.6-2L20 9M4 15l2.3 2a7 7 0 0 0 11.6-2"/></symbol>
+      <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+      <symbol id="icon-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+      <symbol id="icon-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+      <symbol id="icon-trophy" viewBox="0 0 24 24"><path d="M8 4h8v5a4 4 0 0 1-8 0zM9 20h6M12 13v7M8 6H4v2a4 4 0 0 0 4 4m8-6h4v2a4 4 0 0 1-4 4"/></symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 21h14"/></symbol>
+      <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    </svg>
+
+    <header class="topbar">
+      <a class="brand" href="{{ url_for('web.challenges') }}" aria-label="{{ site.name }} home">
+        <span class="brand-primary">CTF</span><span class="brand-secondary">ZONE</span><span class="brand-cursor">_</span>
+      </a>
+      <button class="nav-toggle icon-button" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>
+        <svg><use href="#icon-menu"></use></svg>
+      </button>
+      <nav class="main-nav" aria-label="Primary navigation" data-main-nav>
+        <a class="{{ 'active' if page == 'challenges' }}" href="{{ url_for('web.challenges') }}">Challenges</a>
+        <a class="{{ 'active' if page == 'scoreboard' }}" href="{{ url_for('web.scoreboard') }}">Scoreboard</a>
+        <a class="{{ 'active' if page == 'team' }}" href="{{ url_for('web.team') }}">Team</a>
+        <a class="{{ 'active' if page == 'rules' }}" href="{{ url_for('web.rules') }}">Rules</a>
+      </nav>
+      <div class="account-nav">
+        {% if bootstrap.authenticated and user %}
+          <a class="account-summary" href="{{ url_for('web.profile_alias') }}">
+            <svg><use href="#icon-user"></use></svg>
+            <span>{{ user.name }}</span>
+            {% if user.score is defined %}<strong>{{ user.score }} pts</strong>{% endif %}
+          </a>
+          {% if user.type == 'admin' %}<a class="quiet-button" href="{{ url_for('web.admin_overview') }}">Admin</a>{% endif %}
+          <form action="{{ url_for('web.logout') }}" method="post">
+            <button class="quiet-button" type="submit">Log out</button>
+          </form>
+        {% else %}
+          <a class="quiet-button" href="{{ url_for('web.login') }}">Log in</a>
+          {% if site.registration_visibility != 'private' %}
+            <a class="button button-small" href="{{ url_for('web.register') }}">Join</a>
+          {% endif %}
+        {% endif %}
+      </div>
+    </header>
+
+    {% if bootstrap.setup_required %}
+      <a class="system-banner warning" href="{{ url_for('web.setup') }}">This installation needs its first administrator. Complete setup →</a>
+    {% elif not bootstrap.available %}
+      <div class="system-banner danger" role="status">The API is temporarily unavailable. Some data may be missing.</div>
+    {% elif site.paused %}
+      <div class="system-banner warning" role="status">The event is paused. Browsing remains available, but submissions may be disabled.</div>
+    {% endif %}
+
+    <main id="main-content" class="main-content">
+      {% block content %}{% endblock %}
+    </main>
+
+    <div class="toast-region" aria-live="polite" aria-atomic="true" data-toast-region></div>
+    <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

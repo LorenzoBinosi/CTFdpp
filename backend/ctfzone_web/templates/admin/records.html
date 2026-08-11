@@ -1,0 +1,33 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Read-only operational view. Mutating account and event records remains available through the Rust API.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel">
+    <div class="admin-list-toolbar">
+      <label class="admin-search"><span aria-hidden="true">⌕</span><input type="search" placeholder="Filter {{ admin_title | lower }}…" aria-label="Filter {{ admin_title | lower }}" data-admin-table-search></label>
+      <span class="muted mono">{{ records | length }} loaded</span>
+    </div>
+    <div class="admin-table-wrap">
+      <table class="admin-table" data-admin-table>
+        <thead><tr>{% for key, label in columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for record in records %}
+            <tr>
+              {% for key, label in columns %}
+                {% set value = record.get(key) %}
+                <td class="{{ 'mono muted' if key in ['id', 'date', 'provided'] }}">
+                  {% if value is sameas true %}<span class="status-pill good">yes</span>
+                  {% elif value is sameas false %}<span class="status-pill">no</span>
+                  {% elif value is none or value == '' %}—
+                  {% elif key in ['submission_type', 'type', 'state'] %}<span class="status-pill {{ 'good' if value in ['correct', 'active', 'admin'] else 'bad' if value in ['incorrect', 'banned', 'disabled'] else '' }}">{{ value }}</span>
+                  {% else %}{{ value }}{% endif %}
+                </td>
+              {% endfor %}
+            </tr>
+          {% else %}
+            <tr><td class="admin-empty-row" colspan="{{ columns | length }}">No {{ admin_title | lower }} were returned by the API.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

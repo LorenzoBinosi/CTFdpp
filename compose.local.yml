@@ -1,0 +1,7 @@
+services:
+  caddy:
+    environment:
+      SITE_ADDRESS: :80
+  api:
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost}

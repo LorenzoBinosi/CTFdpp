@@ -1,0 +1,35 @@
+[workspace]
+members = ["services/api", "services/controller"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+encoding_rs = "0.8"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "pool", "smtp-transport", "tokio1-rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["chrono", "derive", "json", "postgres", "runtime-tokio-rustls", "uuid"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

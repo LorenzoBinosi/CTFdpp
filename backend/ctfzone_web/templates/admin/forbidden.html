@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Administration · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="content-shell admin-denied-shell">
+    <div class="feature-card centered">
+      <span class="empty-glyph">!</span>
+      <span class="eyebrow">RESTRICTED AREA</span>
+      <h1>Administrator access required</h1>
+      <p>{{ message }}</p>
+      <a class="button" href="{{ url_for('web.challenges') }}">Return to challenges</a>
+    </div>
+  </section>
+{% endblock %}

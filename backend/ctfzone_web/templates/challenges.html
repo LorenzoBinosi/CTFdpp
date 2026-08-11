@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Challenges · {{ site.name }}{% endblock %}
+{% block content %}
+  <div class="challenge-mobile-toolbar">
+    <button class="quiet-button" type="button" data-filter-drawer-toggle>
+      <svg><use href="#icon-menu"></use></svg> Filters
+    </button>
+    <span><strong data-visible-count>{{ challenges | length }}</strong> challenges</span>
+  </div>
+
+  <div class="challenge-workspace" data-challenge-board>
+    <aside class="filter-sidebar" data-filter-drawer>
+      <div class="search-field">
+        <svg><use href="#icon-search"></use></svg>
+        <input type="search" placeholder="Search challenges…" aria-label="Search challenges" data-challenge-search>
+        <kbd>/</kbd>
+      </div>
+
+      <nav class="category-nav" aria-label="Challenge categories">
+        <button class="category-link active" type="button" data-category="all">
+          <svg><use href="#icon-grid"></use></svg>
+          <span>All</span><strong>{{ challenges | length }}</strong>
+        </button>
+        {% for category in categories %}
+          <button class="category-link" type="button" data-category="{{ category.name | lower }}">
+            <svg><use href="#icon-{{ category.icon }}"></use></svg>
+            <span>{{ category.name }}</span><strong>{{ category.count }}</strong>
+          </button>
+        {% endfor %}
+      </nav>
+
+      <div class="filter-section">
+        <span class="eyebrow">FILTERS</span>
+        <div class="filter-chips">
+          <button type="button" data-filter-toggle="unsolved">unsolved</button>
+          <button type="button" data-filter-toggle="instance">instance</button>
+          <button type="button" data-filter-toggle="easy">easy</button>
+        </div>
+      </div>
+
+      <div class="sidebar-status">
+        <span class="status-dot"></span>
+        <span>{{ 'AUTHENTICATED' if bootstrap.authenticated else 'PUBLIC VIEW' }}</span>
+      </div>
+    </aside>
+
+    <section class="challenge-list-pane" aria-label="Challenges">
+      <div class="list-heading">
+        <span>CHALLENGE</span>
+        <span>CAT</span>
+      </div>
+      {% if api_error %}
+        <div class="empty-state compact">
+          <span class="empty-glyph">!</span>
+          <h2>Challenge feed unavailable</h2>
+          <p>The API did not answer in time. Try again shortly.</p>
+        </div>
+      {% elif not challenges %}
+        <div class="empty-state compact">
+          <span class="empty-glyph">∅</span>
+          <h2>No challenges yet</h2>
+          <p>Published challenges will appear here.</p>
+        </div>
+      {% else %}
+        <div class="challenge-rows" data-challenge-rows>
+          {% for challenge in challenges %}
+            <a
+              class="challenge-row {{ 'solved' if challenge.solved_by_me }} {{ 'selected' if challenge.id == selected_id }}"
+              href="{{ url_for('web.challenges', challenge=challenge.id) }}"
+              data-challenge-id="{{ challenge.id }}"
+              data-name="{{ challenge.name | lower }}"
+              data-category="{{ challenge.category_key }}"
+              data-tags="{{ challenge.tag_keys }}"
+              data-solved="{{ 'true' if challenge.solved_by_me else 'false' }}"
+              data-instance="{{ 'true' if challenge.runtime_available else 'false' }}"
+            >
+              <span class="challenge-icon {{ challenge.category_icon }}">
+                <svg><use href="#icon-{{ challenge.category_icon }}"></use></svg>
+              </span>
+              <span class="challenge-row-main">
+                <strong>{{ challenge.name }}</strong>
+                <small>{{ challenge.value }} pts · {{ challenge.solves if challenge.solves is not none else '—' }} solves</small>
+              </span>
+              {% if challenge.difficulty %}<span class="difficulty difficulty-{{ challenge.difficulty | lower }}">{{ challenge.difficulty }}</span>{% endif %}
+              <span class="challenge-category">{{ challenge.category }}</span>
+              <svg class="row-chevron"><use href="#icon-chevron"></use></svg>
+            </a>
+          {% endfor %}
+        </div>
+        <div class="empty-state compact filtered-empty" hidden data-filter-empty>
+          <span class="empty-glyph">∅</span>
+          <h2>No matching challenges</h2>
+          <p>Try a broader search or clear a filter.</p>
+        </div>
+      {% endif %}
+    </section>
+
+    <aside class="challenge-detail-pane {{ 'open' if selected }}" data-challenge-panel aria-live="polite">
+      {% with challenge=selected %}{% include "partials/challenge_panel.html" %}{% endwith %}
+    </aside>
+    <button class="panel-backdrop" type="button" aria-label="Close challenge" data-panel-backdrop></button>
+  </div>
+{% endblock %}
+{% block scripts %}
+  <script type="module" src="{{ url_for('static', filename='js/challenges.js') }}"></script>
+{% endblock %}

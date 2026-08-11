@@ -1,0 +1,55 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>{{ 'Define a new challenge and its first static flag.' if form_mode == 'create' else 'Update the core fields exposed by the CTFZone API.' }}</p>{% endblock %}
+{% block actions %}<a class="secondary-button button-small" href="{{ url_for('web.admin_challenges') }}">← Back to challenges</a>{% endblock %}
+{% block admin_content %}
+  {% if module_error %}
+    <section class="admin-panel admin-empty-card"><h2>Challenge unavailable</h2><p>The challenge could not be loaded. Return to the list and try again.</p></section>
+  {% else %}
+    <form class="admin-form" data-challenge-form data-mode="{{ form_mode }}"{% if challenge %} data-challenge-id="{{ challenge.id }}"{% endif %}>
+      <section class="admin-panel admin-form-section">
+        <header><span class="eyebrow">IDENTITY</span><h2>Core details</h2><p>The title, category and description presented to players.</p></header>
+        <div class="admin-field-grid two">
+          <label class="admin-field"><span>Name</span><input name="name" required maxlength="128" value="{{ challenge.name if challenge else '' }}" placeholder="Grandma's Cookies"></label>
+          <label class="admin-field"><span>Category</span><input name="category" required maxlength="80" value="{{ challenge.category if challenge else '' }}" placeholder="web"></label>
+        </div>
+        <label class="admin-field"><span>Description <small>Markdown</small></span><textarea name="description" rows="9" required placeholder="Explain the goal without giving away the solution…">{{ challenge.description if challenge else '' }}</textarea></label>
+        <label class="admin-field"><span>Connection information <small>Optional</small></span><input name="connection_info" value="{{ challenge.connection_info if challenge and challenge.connection_info else '' }}" placeholder="nc host.example 31337"></label>
+      </section>
+
+      <section class="admin-panel admin-form-section">
+        <header><span class="eyebrow">SCORING &amp; VISIBILITY</span><h2>Competition behavior</h2></header>
+        <div class="admin-field-grid three">
+          <label class="admin-field"><span>Type{% if challenge %} <small>Fixed after creation</small>{% endif %}</span><select name="type" data-challenge-type {{ 'disabled' if challenge }}><option value="standard" {{ 'selected' if not challenge or challenge.type != 'dynamic' }}>Standard</option><option value="dynamic" {{ 'selected' if challenge and challenge.type == 'dynamic' }}>Dynamic</option></select></label>
+          <label class="admin-field"><span>Value</span><input name="value" type="number" min="0" required value="{{ challenge.value if challenge and challenge.value is not none else 500 }}"></label>
+          <label class="admin-field"><span>State</span><select name="state"><option value="visible" {{ 'selected' if not challenge or challenge.state == 'visible' }}>Visible</option><option value="hidden" {{ 'selected' if challenge and challenge.state == 'hidden' }}>Hidden</option></select></label>
+        </div>
+        <div class="admin-dynamic-fields" data-dynamic-fields>
+          <div class="admin-field-grid four">
+            <label class="admin-field"><span>Curve</span><select name="function"><option value="logarithmic" {{ 'selected' if not challenge or challenge.function != 'linear' }}>Logarithmic</option><option value="linear" {{ 'selected' if challenge and challenge.function == 'linear' }}>Linear</option></select></label>
+            <label class="admin-field"><span>Initial</span><input name="initial" type="number" min="0" value="{{ challenge.initial if challenge and challenge.initial is not none else 500 }}"></label>
+            <label class="admin-field"><span>Minimum</span><input name="minimum" type="number" min="0" value="{{ challenge.minimum if challenge and challenge.minimum is not none else 100 }}"></label>
+            <label class="admin-field"><span>Decay</span><input name="decay" type="number" min="1" value="{{ challenge.decay if challenge and challenge.decay is not none else 50 }}"></label>
+          </div>
+        </div>
+        <div class="admin-field-grid two">
+          <label class="admin-field"><span>Maximum attempts <small>Blank = unlimited</small></span><input name="max_attempts" type="number" min="0" value="{{ challenge.max_attempts if challenge and challenge.max_attempts is not none else '' }}"></label>
+          <label class="admin-field"><span>Position</span><input name="position" type="number" min="0" value="{{ challenge.position if challenge and challenge.position is not none else 0 }}"></label>
+        </div>
+      </section>
+
+      {% if form_mode == 'create' %}
+        <section class="admin-panel admin-form-section">
+          <header><span class="eyebrow">OPTIONAL</span><h2>Initial static flag</h2><p>You can add a flag now or manage challenge resources through the API later.</p></header>
+          <label class="admin-field"><span>Flag</span><input name="flag" autocomplete="off" spellcheck="false" placeholder="CTFZone{…}"></label>
+        </section>
+      {% endif %}
+
+      <div class="admin-form-actions">
+        {% if form_mode == 'edit' %}<button class="danger-button" type="button" data-delete-challenge>Delete challenge</button>{% endif %}
+        <span></span>
+        <a class="quiet-button" href="{{ url_for('web.admin_challenges') }}">Cancel</a>
+        <button class="button" type="submit">{{ 'Create challenge' if form_mode == 'create' else 'Save changes' }}</button>
+      </div>
+    </form>
+  {% endif %}
+{% endblock %}

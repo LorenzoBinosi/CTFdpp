@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Log in · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="auth-shell">
+    <div class="auth-copy">
+      <span class="eyebrow">WELCOME BACK</span>
+      <h1>Enter the zone.</h1>
+      <p>Sign in to submit flags, launch private challenge instances, and track your position.</p>
+    </div>
+    <div class="auth-card">
+      <div class="panel-heading">
+        <span class="status-dot"></span>
+        <span>PARTICIPANT LOGIN</span>
+      </div>
+      {% if error %}<div class="form-message error" role="alert">{{ error }}</div>{% endif %}
+      {% if request.args.get('setup') == 'complete' %}<div class="form-message success">Setup complete. You can sign in now.</div>{% endif %}
+      <form action="{{ url_for('web.login', next=next) }}" method="post" class="stack-form">
+        <label for="name">Username or email</label>
+        <input id="name" name="name" type="text" autocomplete="username" required autofocus>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button class="button button-wide" type="submit">Log in</button>
+      </form>
+      {% if site.registration_visibility != 'private' %}
+        <p class="auth-footnote">New here? <a href="{{ url_for('web.register') }}">Create an account</a>.</p>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

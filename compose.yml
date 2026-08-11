@@ -1,0 +1,162 @@
+name: ctfzone
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - nc
+        - -z
+        - -w
+        - "2"
+        - 127.0.0.1
+        - "2019"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - edge
+      - web
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ACCESS_LOG: "-"
+      API_BASE_URL: http://api:8080
+      API_TIMEOUT_SECONDS: ${BACKEND_API_TIMEOUT_SECONDS:-5}
+      ERROR_LOG: "-"
+      MAX_PROXY_BODY_BYTES: ${MAX_PROXY_BODY_BYTES:-16777216}
+      THREADS: ${BACKEND_THREADS:-4}
+      WORKERS: ${BACKEND_WORKERS:-2}
+    expose:
+      - "8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - web
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      CTFZONE_API_BIND: 0.0.0.0:8080
+      DATABASE_MAX_CONNECTIONS: ${API_DATABASE_MAX_CONNECTIONS:-10}
+      DATABASE_URL: postgres://${POSTGRES_USER:-ctfzone}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-ctfzone}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://localhost}
+      RUST_LOG: ${RUST_LOG:-ctfzone_api=info,tower_http=info}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      SETUP_TOKEN: ${SETUP_TOKEN:?Set SETUP_TOKEN in .env}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-session}
+      SESSION_LIFETIME_SECONDS: ${SESSION_LIFETIME_SECONDS:-604800}
+      UPLOAD_FOLDER: /var/lib/ctfzone/uploads
+    expose:
+      - "8080"
+    volumes:
+      - api_uploads:/var/lib/ctfzone/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - web
+      - data
+      - egress
+
+  controller:
+    build:
+      context: .
+      dockerfile: services/controller/Dockerfile
+    restart: unless-stopped
+    environment:
+      CTFZONE_CONTROLLER_BIND: 0.0.0.0:8090
+      DATABASE_URL: postgres://${POSTGRES_USER:-ctfzone}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-ctfzone}
+      JOURNAL_PATH: /var/lib/ctfzone-controller/operations.jsonl
+      MAX_COMMAND_ATTEMPTS: ${MAX_COMMAND_ATTEMPTS:-8}
+      RECONCILIATION_INTERVAL_SECONDS: ${RECONCILIATION_INTERVAL_SECONDS:-300}
+      REMOTE_DRIVER: ${CONTROLLER_REMOTE_DRIVER:-ssh}
+      REMOTE_OPERATION_TIMEOUT_SECONDS: ${REMOTE_OPERATION_TIMEOUT_SECONDS:-60}
+      SSH_IDENTITY_FILE: /etc/ctfzone/ssh/id_ed25519
+      SSH_KNOWN_HOSTS_FILE: /etc/ctfzone/ssh/known_hosts
+      STALE_CLAIM_AFTER_SECONDS: ${STALE_CLAIM_AFTER_SECONDS:-300}
+    expose:
+      - "8090"
+    volumes:
+      - controller_journal:/var/lib/ctfzone-controller
+      - ./secrets:/etc/ctfzone/ssh:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - data
+      - egress
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ctfzone}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:-ctfzone}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" &&
+          psql -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -Atqc
+          "SELECT 1 FROM ctfzone.release_metadata
+          WHERE key='schema_version' AND value='1.0.0'
+          AND EXISTS (
+              SELECT 1 FROM ctfzone.release_metadata
+              WHERE key='install_complete' AND value='1.0.0'
+          )
+          AND to_regclass('ctfzone.users') IS NOT NULL
+          AND to_regclass('ctfzone.challenges') IS NOT NULL
+          AND to_regclass('ctfzone.runtime_instances') IS NOT NULL"
+          | grep -qx 1
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - data
+
+networks:
+  edge:
+  web:
+    internal: true
+  data:
+    internal: true
+  egress:
+
+volumes:
+  api_uploads:
+  caddy_config:
+  caddy_data:
+  controller_journal:
+  postgres_data:

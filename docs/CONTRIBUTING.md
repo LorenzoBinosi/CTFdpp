@@ -1,21 +1,119 @@
-## How to contribute to CTFd
+# Contributing to CTFZone
 
-#### **Did you find a bug?**
+Thank you for improving CTFZone. Keep changes focused, explain the operational
+impact, and include verification proportional to the risk.
 
-- **Do not open up a GitHub issue if the bug is a security vulnerability in CTFd**. Instead [email the details to us at support@ctfd.io](mailto:support@ctfd.io).
+Security vulnerabilities must not be reported in a public issue. Follow
+[`SECURITY.md`](SECURITY.md) instead.
 
-- **Ensure the bug was not already reported** by searching on GitHub under [Issues](https://github.com/CTFd/CTFd/issues).
+## Architecture boundaries
 
-- If you're unable to find an open issue addressing the problem, [open a new one](https://github.com/CTFd/CTFd/issues/new). Be sure to fill out the issue template with a **title and clear description**, and as much relevant information as possible (e.g. deployment setup, browser version, etc).
+Contributions must preserve these ownership rules:
 
-#### **Did you write a patch that fixes a bug or implements a new feature?**
+- Caddy is the public edge and owns TLS and route dispatch.
+- The Python backend is a replaceable page renderer and browser-facing BFF. It
+  must not connect to PostgreSQL or acquire platform business logic.
+- The Rust API owns authentication, authorization, platform behavior, scoring,
+  administration, files, and runtime intent.
+- The Rust controller owns asynchronous runtime execution, recovery, deadlines,
+  and remote-host reconciliation. Notifications are wake-up hints; durable work
+  remains in PostgreSQL.
+- PostgreSQL is the single authoritative store for portal and runtime state.
 
-- Open a new pull request with the patch.
+Browser actions should use the same-origin BFF boundary. External integrations
+may use the public Rust API directly and must satisfy its authentication, CSRF,
+and origin rules.
 
-- Ensure the PR description clearly describes the problem and solution. Include the relevant issue number if applicable.
+## Development setup
 
-- Ensure all status checks pass. PR's with test failures will not be merged. PR's with insufficient coverage may be merged depending on the situation.
+Run development commands from the repository root.
 
-#### **Did you fix whitespace, format code, or make a purely cosmetic patch?**
+```console
+cp .env.example .env
+docker compose -f compose.yml -f compose.local.yml up --build
+```
 
-Changes that are cosmetic in nature and do not add anything substantial to the stability, functionality, or testability of CTFd will generally not be accepted.
+Replace every example secret in `.env`. Use
+`CONTROLLER_REMOTE_DRIVER=mock` unless you intentionally provisioned the
+restricted SSH helper and test hosts.
+
+For host-side checks, install Python 3.12 and Rust 1.85 or newer, then prepare
+the BFF dependencies and Rust cache:
+
+```console
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --requirement backend/requirements.txt
+cargo fetch --locked
+make check
+```
+
+`make check` runs Rust formatting, compilation, tests, strict Clippy, the Python
+BFF tests, remote-helper syntax checks, and Compose validation.
+
+## Testing individual components
+
+Run the Rust workspace checks from the repository root:
+
+```console
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+Run BFF tests from `backend/`:
+
+```console
+python -m pip install --requirement requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Validate both deployment variants from the repository root:
+
+```console
+POSTGRES_PASSWORD=compose-check-only SECRET_KEY=compose-check-only SETUP_TOKEN=compose-check-only docker compose -f compose.yml config --quiet
+POSTGRES_PASSWORD=compose-check-only SECRET_KEY=compose-check-only SETUP_TOKEN=compose-check-only docker compose -f compose.yml -f compose.local.yml config --quiet
+```
+
+Never point tests at a production database or real challenge host.
+
+## Pull requests
+
+Before opening a pull request:
+
+1. Rebase or merge the current target branch and resolve unrelated changes.
+2. Add tests for behavior changes and failure recovery, not only the happy path.
+3. Run the relevant component checks and record the exact commands in the pull
+   request.
+4. Update configuration examples and documentation when behavior or operational
+   requirements change.
+5. Confirm that no flags, passwords, setup tokens, session cookies, API tokens,
+   private keys, host inventories, packet captures, or participant data are in
+   the diff.
+
+Keep pull requests scoped to one coherent outcome. Pure refactors should not
+silently change API contracts, schema invariants, controller state transitions,
+or security boundaries.
+
+## Database and runtime changes
+
+CTFZone 1.0 currently targets fresh installations. Keep `db/init/`
+deterministic and ensure a new PostgreSQL volume reaches the finalized 1.0.0
+schema before the API becomes ready. Do not introduce a second runtime database
+or direct BFF database access.
+
+Changes to runtime commands or instance states must document:
+
+- who writes the desired state;
+- how the controller claims and retries the work;
+- how duplicate delivery remains idempotent;
+- what happens across API, controller, database, and remote-host outages;
+- how absolute expiry is enforced if the control plane is unavailable.
+
+## Reporting ordinary bugs
+
+Search existing issues first. A useful report includes the version or commit,
+deployment method, affected component, expected and observed behavior, minimal
+reproduction, and sanitized logs. Use the repository issue template and remove
+all secrets and participant data before posting.
