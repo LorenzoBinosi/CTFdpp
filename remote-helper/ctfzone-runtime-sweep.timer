@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover missing CTFZone runtime expiry timers
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+RandomizedDelaySec=10s
+Persistent=true
+Unit=ctfzone-runtime-sweep.service
+
+[Install]
+WantedBy=timers.target

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
@@ -19,6 +19,9 @@ use crate::{
     routes::Success,
 };
 
+// Admin mutations use the shared configuration lock before the capacity,
+// membership, setup, and row locks below. Keeping that global order prevents
+// user-mode transitions from racing account or membership changes.
 #[derive(Deserialize, Default)]
 pub(super) struct UserListQuery {
     affiliation: Option<String>,
@@ -108,11 +111,15 @@ struct UserRecord {
 struct UserListRecord {
     id: i32,
     name: Option<String>,
+    email: Option<String>,
+    user_type: String,
     website: Option<String>,
     affiliation: Option<String>,
     country: Option<String>,
     bracket_id: Option<i32>,
     team_id: Option<i32>,
+    hidden: bool,
+    verified: bool,
     total_count: i64,
 }
 
@@ -123,6 +130,16 @@ struct FieldEntry {
     name: Option<String>,
     description: Option<String>,
     #[serde(rename = "type")]
+    field_type: Option<String>,
+}
+
+#[derive(FromRow)]
+struct UserFieldEntry {
+    user_id: i32,
+    field_id: i32,
+    value: Option<Value>,
+    name: Option<String>,
+    description: Option<String>,
     field_type: Option<String>,
 }
 
@@ -154,11 +171,15 @@ pub(super) async fn list(
         SELECT
             id,
             name,
+            email,
+            COALESCE(type, 'user') AS user_type,
             website,
             affiliation,
             country,
             bracket_id,
             team_id,
+            COALESCE(hidden, false) AS hidden,
+            COALESCE(verified, false) AS verified,
             COUNT(*) OVER() AS total_count
         FROM ctfzone.users
         WHERE TRUE
@@ -220,10 +241,21 @@ pub(super) async fn list(
     } else {
         (total + per_page - 1) / per_page
     };
+    let user_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+    let mut fields_by_user = fields_for_users(
+        &state,
+        &user_ids,
+        if admin_view {
+            UserView::Admin
+        } else {
+            UserView::Public
+        },
+    )
+    .await?;
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
-        let fields = fields_for_user(&state, row.id, UserView::Public).await?;
-        data.push(json!({
+        let fields = fields_by_user.remove(&row.id).unwrap_or_default();
+        let mut item = json!({
             "website": row.website,
             "name": row.name,
             "country": row.country,
@@ -232,7 +264,14 @@ pub(super) async fn list(
             "id": row.id,
             "fields": fields,
             "team_id": row.team_id,
-        }));
+        });
+        if admin_view {
+            item["email"] = json!(row.email);
+            item["type"] = json!(row.user_type);
+            item["hidden"] = json!(row.hidden);
+            item["verified"] = json!(row.verified);
+        }
+        data.push(item);
     }
 
     Ok(Json(json!({
@@ -263,13 +302,20 @@ pub(super) async fn create(
     }
     let user_type = request.user_type.as_deref().unwrap_or("user");
     validate_user_type(user_type)?;
+    reject_manual_verification(request.verified)?;
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::team_accounts::lock_configuration_shared(&mut transaction).await?;
     let password = hash_password(&mut transaction, &request.password)
         .await
         .map_err(ApiError::database)?;
     reject_duplicate_identity(&mut transaction, None, &name, &email).await?;
     validate_user_bracket(&mut transaction, request.bracket_id).await?;
+    if !request.hidden.unwrap_or(false) && !request.banned.unwrap_or(false) {
+        // Admin creation bypasses the configured cap, but participates in the
+        // same capacity lock so a concurrent public registration recounts it.
+        crate::browser_auth::lock_registration_capacity(&mut transaction).await?;
+    }
 
     let record = sqlx::query_as::<_, UserRecord>(
         r#"
@@ -300,11 +346,13 @@ pub(super) async fn create(
     .bind(request.bracket_id)
     .bind(request.hidden.unwrap_or(false))
     .bind(request.banned.unwrap_or(false))
-    .bind(request.verified.unwrap_or(false))
+    .bind(false)
     .bind(request.change_password.unwrap_or(false))
     .fetch_one(&mut *transaction)
     .await
-    .map_err(ApiError::database)?;
+    .map_err(|error| {
+        ApiError::conflict_or_database(error, "The user name or email is already in use")
+    })?;
 
     if user_type == "user" {
         add_allowlist_email(
@@ -367,6 +415,7 @@ pub(super) async fn update_self(
     user: CurrentUser,
     Json(mut request): Json<PatchUser>,
 ) -> Result<Response, ApiError> {
+    reject_manual_verification(request.verified)?;
     request.user_type = None;
     request.hidden = None;
     request.banned = None;
@@ -387,20 +436,26 @@ pub(super) async fn delete(
     }
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::team_accounts::lock_configuration_shared(&mut transaction).await?;
+    crate::browser_auth::lock_registration_capacity(&mut transaction).await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
     crate::setup::guard_admin_delete(&mut transaction, user_id).await?;
-    let email =
-        sqlx::query_scalar::<_, Option<String>>("SELECT email FROM ctfzone.users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(ApiError::database)?
-            .flatten();
+    let email = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT email FROM ctfzone.users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .flatten();
     if let Some(email) = email {
-        sqlx::query("DELETE FROM ctfzone.registration_email_allowlist WHERE email = lower($1)")
-            .bind(email)
-            .execute(&mut *transaction)
-            .await
-            .map_err(ApiError::database)?;
+        sqlx::query(
+            "DELETE FROM ctfzone.registration_email_allowlist WHERE lower(email) = lower($1)",
+        )
+        .bind(email)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
     }
 
     for table in [
@@ -437,17 +492,42 @@ async fn update(
     state: &AppState,
     actor: &CurrentUser,
     user_id: i32,
-    request: PatchUser,
+    mut request: PatchUser,
     admin: bool,
 ) -> Result<Response, ApiError> {
-    let previous = load_user(state, user_id).await?;
     let name = request.name.as_deref().map(validate_name).transpose()?;
     let email = request.email.as_deref().map(validate_email).transpose()?;
     if let Some(user_type) = request.user_type.as_deref() {
         validate_user_type(user_type)?;
     }
-
+    reject_manual_verification(request.verified)?;
+    let name_changes_enabled = if admin {
+        true
+    } else {
+        config_bool(state, "name_changes", true).await?
+    };
+    let minimum_password_length = if admin {
+        0
+    } else {
+        config_i64(state, "password_min_length", 0).await?
+    };
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    if admin {
+        super::team_accounts::lock_configuration_shared(&mut transaction).await?;
+    }
+    if admin
+        && (request.user_type.is_some() || request.hidden.is_some() || request.banned.is_some())
+    {
+        crate::browser_auth::lock_registration_capacity(&mut transaction).await?;
+    }
+    if request.team_id.is_some() || (admin && request.user_type.is_some()) {
+        if !admin {
+            return Err(ApiError::forbidden(
+                "Team membership can only be changed by an administrator",
+            ));
+        }
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
     if admin {
         crate::setup::guard_admin_update(
             &mut transaction,
@@ -457,13 +537,41 @@ async fn update(
         )
         .await?;
     }
+    let previous = load_user_for_update(&mut transaction, user_id).await?;
+    let intended_type = request
+        .user_type
+        .as_deref()
+        .or(previous.user_type.as_deref())
+        .unwrap_or("user");
+    if intended_type != "user" {
+        if request.team_id.flatten().is_some() {
+            return Err(ApiError::bad_request(
+                "Administrator accounts cannot be assigned to a team",
+            ));
+        }
+        if previous.team_id.is_some() {
+            request.team_id = Some(None);
+        }
+    }
+    if request.team_id.is_some() && request.team_id.flatten() != previous.team_id {
+        if let Some(previous_team_id) = previous.team_id {
+            sqlx::query("SELECT id FROM ctfzone.teams WHERE id=$1 FOR UPDATE")
+                .bind(previous_team_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+            sqlx::query("UPDATE ctfzone.teams SET captain_id=NULL WHERE id=$1 AND captain_id=$2")
+                .bind(previous_team_id)
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        }
+    }
 
     if !admin {
-        if name.as_deref() != previous.name.as_deref() && name.is_some() {
-            let enabled = config_bool(state, "name_changes", true).await?;
-            if !enabled {
-                return Err(ApiError::forbidden("Name changes are disabled"));
-            }
+        if name.as_deref() != previous.name.as_deref() && name.is_some() && !name_changes_enabled {
+            return Err(ApiError::forbidden("Name changes are disabled"));
         }
         if email.as_deref() != previous.email.as_deref() || request.password.is_some() {
             let confirm = request
@@ -479,10 +587,9 @@ async fn update(
             }
         }
         if let Some(password) = request.password.as_deref() {
-            let minimum = config_i64(state, "password_min_length", 0).await?;
-            if password.chars().count() < minimum as usize {
+            if password.chars().count() < minimum_password_length as usize {
                 return Err(ApiError::bad_request(format!(
-                    "Password must be at least {minimum} characters"
+                    "Password must be at least {minimum_password_length} characters"
                 )));
             }
         }
@@ -507,6 +614,10 @@ async fn update(
         .clone()
         .or_else(|| previous.email.clone())
         .unwrap_or_default();
+    let role_changed = previous.user_type.as_deref().unwrap_or("user") != new_type;
+    let email_changed = email
+        .as_deref()
+        .is_some_and(|email| previous.email.as_deref() != Some(email));
 
     reject_duplicate_identity(
         &mut transaction,
@@ -525,6 +636,17 @@ async fn update(
         }
         validate_user_bracket(&mut transaction, bracket_id).await?;
     }
+    if let Some(Some(team_id)) = request.team_id {
+        let exists =
+            sqlx::query_scalar::<_, i32>("SELECT id FROM ctfzone.teams WHERE id=$1 FOR UPDATE")
+                .bind(team_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        if exists.is_none() {
+            return Err(ApiError::bad_request("Please provide a valid team id"));
+        }
+    }
 
     let record = sqlx::query_as::<_, UserRecord>(
         r#"
@@ -542,11 +664,11 @@ async fn update(
             hidden = COALESCE($16, hidden),
             banned = COALESCE($17, banned),
             verified = CASE
-                WHEN $3::text IS NOT NULL AND $3::text <> email AND $22 THEN false
-                ELSE COALESCE($18, verified)
+                WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM email THEN false
+                ELSE verified
             END,
-            change_password = COALESCE($19, change_password),
-            team_id = CASE WHEN $20 THEN $21 ELSE team_id END
+            change_password = COALESCE($18, change_password),
+            team_id = CASE WHEN $19 THEN $20 ELSE team_id END
         WHERE id = $1
         RETURNING
             id, name, email, password, type AS user_type, secret, website,
@@ -571,14 +693,14 @@ async fn update(
     .bind(request.bracket_id.flatten())
     .bind(request.hidden)
     .bind(request.banned)
-    .bind(request.verified)
     .bind(request.change_password)
     .bind(request.team_id.is_some())
     .bind(request.team_id.flatten())
-    .bind(config_bool(state, "verify_emails", false).await?)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(ApiError::database)?
+    .map_err(|error| {
+        ApiError::conflict_or_database(error, "The user name or email is already in use")
+    })?
     .ok_or_else(|| ApiError::not_found("User not found"))?;
 
     sync_allowlist(
@@ -592,7 +714,23 @@ async fn update(
     if let Some(fields) = request.fields {
         update_fields(&mut transaction, user_id, &fields, admin).await?;
     }
-    if password_changed || (!previous.banned.unwrap_or(false) && record.banned.unwrap_or(false)) {
+    if email_changed {
+        sqlx::query(
+            r#"
+            UPDATE ctfzone.email_verification_tokens
+            SET invalidated_at=now()
+            WHERE user_id=$1 AND used_at IS NULL AND invalidated_at IS NULL
+            "#,
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    }
+    if role_changed
+        || password_changed
+        || (!previous.banned.unwrap_or(false) && record.banned.unwrap_or(false))
+    {
         sqlx::query(
             r#"
             UPDATE ctfzone.user_sessions
@@ -607,6 +745,13 @@ async fn update(
         .await
         .map_err(ApiError::database)?;
     }
+    if role_changed {
+        sqlx::query("DELETE FROM ctfzone.tokens WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+    }
     transaction.commit().await.map_err(ApiError::database)?;
 
     let view = if admin {
@@ -614,10 +759,33 @@ async fn update(
     } else {
         UserView::SelfView
     };
-    Ok(Json(Success::new(
-        serialize_user(state, record, view, false).await?,
-    ))
-    .into_response())
+    let mut response = serialize_user(state, record, view, false).await?;
+    if admin {
+        response["credentials_revoked"] = json!(role_changed);
+    }
+    Ok(Json(Success::new(response)).into_response())
+}
+
+async fn load_user_for_update(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: i32,
+) -> Result<UserRecord, ApiError> {
+    sqlx::query_as::<_, UserRecord>(
+        r#"
+        SELECT
+            id, name, email, password, type AS user_type, secret, website,
+            affiliation, country, bracket_id, hidden, banned, verified, language,
+            change_password, team_id, created
+        FROM ctfzone.users
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("User not found"))
 }
 
 async fn load_user(state: &AppState, user_id: i32) -> Result<UserRecord, ApiError> {
@@ -732,6 +900,49 @@ async fn fields_for_user(
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)
+}
+
+async fn fields_for_users(
+    state: &AppState,
+    user_ids: &[i32],
+    view: UserView,
+) -> Result<HashMap<i32, Vec<FieldEntry>>, ApiError> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, UserFieldEntry>(
+        r#"
+        SELECT field_entries.user_id,field_entries.field_id,field_entries.value,
+               fields.name,fields.description,fields.field_type
+        FROM ctfzone.field_entries
+        JOIN ctfzone.fields ON fields.id=field_entries.field_id
+        WHERE field_entries.user_id=ANY($1)
+          AND ($2='admin'
+            OR ($2='self' AND (COALESCE(fields.editable,false) OR COALESCE(fields.public,false)))
+            OR ($2='public' AND COALESCE(fields.public,false)))
+        ORDER BY field_entries.user_id,field_entries.id
+        "#,
+    )
+    .bind(user_ids)
+    .bind(match view {
+        UserView::Public => "public",
+        UserView::SelfView => "self",
+        UserView::Admin => "admin",
+    })
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::database)?;
+    let mut grouped = HashMap::<i32, Vec<FieldEntry>>::new();
+    for row in rows {
+        grouped.entry(row.user_id).or_default().push(FieldEntry {
+            field_id: row.field_id,
+            value: row.value,
+            name: row.name,
+            description: row.description,
+            field_type: row.field_type,
+        });
+    }
+    Ok(grouped)
 }
 
 async fn update_fields(
@@ -855,7 +1066,7 @@ async fn add_allowlist_email(
         r#"
         INSERT INTO ctfzone.registration_email_allowlist (email, created)
         VALUES (lower($1), CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-        ON CONFLICT (email) DO NOTHING
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(email)
@@ -872,17 +1083,57 @@ async fn sync_allowlist(
     previous_type: &str,
     current_type: &str,
 ) -> Result<(), ApiError> {
-    if previous_type == "user" {
-        sqlx::query("DELETE FROM ctfzone.registration_email_allowlist WHERE email = lower($1)")
-            .bind(previous_email)
-            .execute(&mut **transaction)
-            .await
-            .map_err(ApiError::database)?;
-    }
-    if current_type == "user" {
-        add_allowlist_email(transaction, current_email).await?;
+    match allowlist_sync_plan(previous_email, current_email, previous_type, current_type) {
+        AllowlistSyncPlan::None => {}
+        AllowlistSyncPlan::Remove => {
+            remove_allowlist_email(transaction, previous_email).await?;
+        }
+        AllowlistSyncPlan::Add => {
+            add_allowlist_email(transaction, current_email).await?;
+        }
+        AllowlistSyncPlan::MoveIfReserved => {
+            if remove_allowlist_email(transaction, previous_email).await? {
+                add_allowlist_email(transaction, current_email).await?;
+            }
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AllowlistSyncPlan {
+    None,
+    Remove,
+    Add,
+    MoveIfReserved,
+}
+
+fn allowlist_sync_plan(
+    previous_email: &str,
+    current_email: &str,
+    previous_type: &str,
+    current_type: &str,
+) -> AllowlistSyncPlan {
+    match (previous_type == "user", current_type == "user") {
+        (true, true) if !previous_email.eq_ignore_ascii_case(current_email) => {
+            AllowlistSyncPlan::MoveIfReserved
+        }
+        (true, false) => AllowlistSyncPlan::Remove,
+        (false, true) => AllowlistSyncPlan::Add,
+        _ => AllowlistSyncPlan::None,
+    }
+}
+
+async fn remove_allowlist_email(
+    transaction: &mut Transaction<'_, Postgres>,
+    email: &str,
+) -> Result<bool, ApiError> {
+    sqlx::query("DELETE FROM ctfzone.registration_email_allowlist WHERE lower(email) = lower($1)")
+        .bind(email)
+        .execute(&mut **transaction)
+        .await
+        .map(|result| result.rows_affected() > 0)
+        .map_err(ApiError::database)
 }
 
 async fn require_account_visibility(
@@ -1018,6 +1269,16 @@ fn validate_user_type(value: &str) -> Result<(), ApiError> {
     }
 }
 
+fn reject_manual_verification(requested: Option<bool>) -> Result<(), ApiError> {
+    if requested.is_some() {
+        Err(ApiError::bad_request(
+            "Email verification status can only change through the emailed verification link",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn value_is_empty(value: Option<&Value>) -> bool {
     matches!(value, None | Some(Value::Null))
         || value
@@ -1031,4 +1292,113 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing source marker: {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing source marker: {end}"))
+            .0
+    }
+
+    fn assert_source_order(source: &str, markers: &[&str]) {
+        let mut remaining = source;
+        for marker in markers {
+            remaining = remaining
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("missing or out-of-order source marker: {marker}"))
+                .1;
+        }
+    }
+
+    #[test]
+    fn admin_user_mutations_follow_the_global_lock_order() {
+        let source = include_str!("user_accounts.rs");
+        let create = source_between(
+            source,
+            "pub(super) async fn create(",
+            "pub(super) async fn detail(",
+        );
+        assert_source_order(
+            create,
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "lock_registration_capacity",
+                "INSERT INTO ctfzone.users",
+            ],
+        );
+
+        let delete = source_between(source, "pub(super) async fn delete(", "async fn update(");
+        assert_source_order(
+            delete,
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "lock_registration_capacity",
+                "lock_team_membership",
+                "guard_admin_delete",
+                "FOR UPDATE",
+            ],
+        );
+
+        let update = source_between(source, "async fn update(", "async fn load_user_for_update(");
+        assert_source_order(
+            update,
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "lock_registration_capacity",
+                "lock_team_membership",
+                "guard_admin_update",
+                "load_user_for_update",
+            ],
+        );
+    }
+
+    #[test]
+    fn email_verification_status_is_read_only_for_every_account_mutation() {
+        assert!(reject_manual_verification(Some(true)).is_err());
+        assert!(reject_manual_verification(Some(false)).is_err());
+        assert!(reject_manual_verification(None).is_ok());
+    }
+
+    #[test]
+    fn allowlist_sync_preserves_unreserved_participants_and_stable_rows() {
+        assert_eq!(
+            allowlist_sync_plan("old@example.test", "old@example.test", "user", "user"),
+            AllowlistSyncPlan::None
+        );
+        assert_eq!(
+            allowlist_sync_plan("Old@Example.test", "old@example.test", "user", "user"),
+            AllowlistSyncPlan::None
+        );
+        assert_eq!(
+            allowlist_sync_plan("old@example.test", "new@example.test", "user", "user"),
+            AllowlistSyncPlan::MoveIfReserved
+        );
+    }
+
+    #[test]
+    fn allowlist_sync_follows_participant_role_transitions() {
+        assert_eq!(
+            allowlist_sync_plan("user@example.test", "user@example.test", "user", "admin"),
+            AllowlistSyncPlan::Remove
+        );
+        assert_eq!(
+            allowlist_sync_plan("admin@example.test", "user@example.test", "admin", "user"),
+            AllowlistSyncPlan::Add
+        );
+        assert_eq!(
+            allowlist_sync_plan("old@example.test", "new@example.test", "admin", "admin"),
+            AllowlistSyncPlan::None
+        );
+    }
 }

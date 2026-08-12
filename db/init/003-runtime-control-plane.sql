@@ -15,7 +15,8 @@ VALUES ('private_challenges', false, 1)
 ON CONFLICT (key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS ctfzone.challenge_runtime_configs (
-    challenge_id integer PRIMARY KEY,
+    challenge_id integer PRIMARY KEY
+        REFERENCES ctfzone.challenges(id) ON DELETE CASCADE,
     runtime_mode text NOT NULL DEFAULT 'static'
         CHECK (runtime_mode IN ('static', 'managed')),
     enabled boolean NOT NULL DEFAULT false,
@@ -86,7 +87,9 @@ CREATE TABLE IF NOT EXISTS ctfzone.runtime_instances (
     maximum_expires_at timestamptz NOT NULL,
     observed_expires_at timestamptz,
     expires_at timestamptz NOT NULL,
-    remote_server_id uuid REFERENCES ctfzone.remote_servers(id) ON DELETE SET NULL,
+    -- Runtime hosts are durable audit identities. Disable retired hosts; do
+    -- not delete a row while any instance history or cleanup still references it.
+    remote_server_id uuid REFERENCES ctfzone.remote_servers(id) ON DELETE RESTRICT,
     remote_container_id text,
     remote_ip inet,
     container_port integer CHECK (container_port BETWEEN 1 AND 65535),
@@ -116,7 +119,17 @@ CREATE INDEX IF NOT EXISTS runtime_instances_active_deadline
     ON ctfzone.runtime_instances (expires_at)
     WHERE active;
 CREATE INDEX IF NOT EXISTS runtime_instances_challenge_history
-    ON ctfzone.runtime_instances (challenge_id, created_at DESC);
+    ON ctfzone.runtime_instances (challenge_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS runtime_instances_owner_history
+    ON ctfzone.runtime_instances (owner_user_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS runtime_instances_created_history
+    ON ctfzone.runtime_instances (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS runtime_instances_active_remote_server
+    ON ctfzone.runtime_instances (remote_server_id)
+    WHERE active AND remote_server_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runtime_instances_active_observation
+    ON ctfzone.runtime_instances (last_observed_at NULLS FIRST, created_at, id)
+    WHERE active AND remote_server_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS ctfzone.runtime_commands (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -133,9 +146,14 @@ CREATE TABLE IF NOT EXISTS ctfzone.runtime_commands (
     available_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now(),
     claimed_at timestamptz,
+    claim_token uuid,
     completed_at timestamptz,
     last_error text,
-    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    CONSTRAINT runtime_commands_claim_metadata CHECK (
+        (status = 'claimed' AND claimed_at IS NOT NULL AND claim_token IS NOT NULL)
+        OR (status <> 'claimed' AND claimed_at IS NULL AND claim_token IS NULL)
+    )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS runtime_commands_idempotency
@@ -147,6 +165,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS runtime_commands_one_open_kind_generation
 CREATE INDEX IF NOT EXISTS runtime_commands_claim_queue
     ON ctfzone.runtime_commands (available_at, created_at)
     WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS runtime_commands_stale_claims
+    ON ctfzone.runtime_commands (claimed_at)
+    WHERE status = 'claimed';
+CREATE INDEX IF NOT EXISTS runtime_commands_failed_cleanup
+    ON ctfzone.runtime_commands (instance_id, completed_at DESC)
+    WHERE kind = 'terminate' AND status = 'failed';
 
 CREATE TABLE IF NOT EXISTS ctfzone.runtime_instance_events (
     sequence bigserial PRIMARY KEY,

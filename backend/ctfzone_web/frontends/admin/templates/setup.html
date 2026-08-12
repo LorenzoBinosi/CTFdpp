@@ -1,0 +1,48 @@
+{% extends "admin/base.html" %}
+{% block title %}Initial setup · {{ site.name }}{% endblock %}
+{% block description %}<p>Set the event identity, choose its player experience, and create the first administrator.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel setup-panel">
+    <div class="setup-introduction">
+      <span class="eyebrow">FIRST BOOT</span>
+      <h2>Initialize the control plane</h2>
+      <p>The one-time <code>SETUP_TOKEN</code> authorizes this operation. Setup closes permanently after the administrator and installation marker are created.</p>
+    </div>
+    <div class="setup-form-card">
+      <div class="panel-heading"><span class="status-dot {{ 'off' if not bootstrap.available }}"></span><span>{{ 'INITIAL ADMINISTRATOR' if bootstrap.setup_required else 'SETUP STATUS' }}</span></div>
+      {% if error %}<div class="form-message error" role="alert">{{ error }}</div>{% endif %}
+      {% if notice %}<div class="form-message warning">{{ notice }}</div>{% endif %}
+      {% if not bootstrap.available %}
+        <div class="form-message error" role="alert">The API is unavailable, so CTFZone cannot verify whether setup is open. No setup data will be submitted.</div>
+        <a class="secondary-button button-wide" href="{{ url_for('web.setup') }}">Retry status check</a>
+      {% elif bootstrap.setup_required %}
+        <form action="{{ url_for('web.setup') }}" method="post" class="stack-form">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+          <label for="setup-token">Setup token</label>
+          <input id="setup-token" name="setup_token" type="password" autocomplete="off" required autofocus>
+          <label for="ctf-name">CTF name</label>
+          <input id="ctf-name" name="ctf_name" type="text" maxlength="128" value="{{ site.name if site.name != 'CTFZone' else '' }}" placeholder="My CTF" required>
+          <label for="player-frontend">Player frontend</label>
+          <select id="player-frontend" name="player_frontend" required>
+            {% for frontend in installed_player_frontends | default([{'id': 'terminal', 'name': 'Terminal'}], true) %}
+              <option value="{{ frontend.id }}" {{ 'selected' if frontend.id == site.player_frontend }}>{{ frontend.name }}{% if frontend.version %} ({{ frontend.version }}){% endif %}</option>
+            {% endfor %}
+          </select>
+          <label for="name">Administrator name</label>
+          <input id="name" name="name" type="text" maxlength="128" autocomplete="username" required>
+          <label for="email">Administrator email</label>
+          <input id="email" name="email" type="email" maxlength="254" autocomplete="email" required>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" maxlength="128" autocomplete="new-password" required>
+          <button class="button button-wide" type="submit">Initialize platform</button>
+        </form>
+      {% else %}
+        {% if bootstrap.authenticated and user and user.type == 'admin' %}
+          <a class="button button-wide" href="{{ url_for('web.admin_overview') }}">Open administration</a>
+        {% else %}
+          <a class="button button-wide" href="{{ url_for('web.login') }}">Sign in</a>
+        {% endif %}
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,56 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Manage account role and platform visibility.</p>{% endblock %}
+{% block actions %}<a class="secondary-button button-small" href="{{ url_for('web.admin_users') }}">← Back to users</a>{% endblock %}
+{% block admin_content %}
+  {% if module_error or not user_record %}
+    <section class="admin-panel admin-empty-card"><h2>User unavailable</h2><p>The user could not be loaded. Return to the list and try again.</p></section>
+  {% else %}
+    <form class="admin-form admin-user-form" data-user-form data-user-id="{{ user_record.id }}" data-current-user="{{ 'true' if user and user.id == user_record.id else 'false' }}" data-initial-role="{{ user_record.type or 'user' }}">
+      <section class="admin-panel admin-user-card">
+        <header class="admin-user-card-header">
+          <span class="admin-user-avatar" aria-hidden="true">{{ (user_record.name or '?')[:1] | upper }}</span>
+          <div class="admin-user-card-identity">
+            <span class="eyebrow">USER #{{ user_record.id }}</span>
+            <h2>{{ user_record.name or 'Unnamed user' }}</h2>
+            <p class="mono">{{ user_record.email or 'No email address' }}</p>
+          </div>
+        </header>
+
+        <div class="admin-user-card-body">
+          <section class="admin-user-card-section" aria-labelledby="user-access-heading">
+            <header>
+              <span class="eyebrow">ACCESS</span>
+              <h3 id="user-access-heading">Role and visibility</h3>
+              <p id="user-role-help">Changing the role revokes this user’s existing browser sessions and API tokens.</p>
+            </header>
+            <div class="admin-user-access-grid">
+              <label class="admin-field">
+                <span>Role</span>
+                <select name="type" aria-describedby="user-role-help">
+                  <option value="user" {{ 'selected' if user_record.type != 'admin' }}>User</option>
+                  <option value="admin" {{ 'selected' if user_record.type == 'admin' }}>Administrator</option>
+                </select>
+              </label>
+              <div class="admin-setting-block">
+                <div><strong id="user-hidden-label">Hidden account</strong><p id="user-hidden-help">Exclude this user from public account lists and scoreboards.</p></div>
+                <label class="admin-switch">
+                  <input name="hidden" type="checkbox" aria-labelledby="user-hidden-label" aria-describedby="user-hidden-help" {{ 'checked' if user_record.hidden }}>
+                  <span aria-hidden="true"></span>
+                  <strong>{{ 'Hidden' if user_record.hidden else 'Visible' }}</strong>
+                </label>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="admin-user-card-footer">
+          <p>Account identity is read-only on this screen.</p>
+          <div>
+            <a class="quiet-button" href="{{ url_for('web.admin_users') }}">Cancel</a>
+            <button class="button" type="submit">Save changes</button>
+          </div>
+        </footer>
+      </section>
+    </form>
+  {% endif %}
+{% endblock %}

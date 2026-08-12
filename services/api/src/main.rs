@@ -2,18 +2,20 @@ mod auth;
 mod browser_auth;
 mod config;
 mod error;
+mod object_storage;
 mod passwords;
 mod rate_limit;
 mod routes;
 mod setup;
 
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -37,12 +39,14 @@ const SCHEMA_VERSION: &str = "1.0.0";
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) auth: auth::AuthConfig,
+    pub(crate) backend_service_token: String,
     pub(crate) database: PgPool,
+    pub(crate) email_verification_ttl_seconds: i64,
     pub(crate) http: Client,
-    pub(crate) public_base_url: Url,
+    pub(crate) object_storage: object_storage::ObjectStorage,
     pub(crate) rate_limiter: rate_limit::RateLimiter,
     pub(crate) setup_token: String,
-    pub(crate) upload_folder: PathBuf,
+    pub(crate) site_url: Url,
 }
 
 #[derive(Serialize)]
@@ -73,22 +77,25 @@ async fn main() -> Result<()> {
 
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
         .redirect(Policy::none())
         .build()
         .context("failed to create internal HTTP client")?;
+    let object_storage = object_storage::ObjectStorage::new(config.object_storage)?;
 
     let app = router(AppState {
         auth: auth::AuthConfig {
-            secret_key: config.secret_key,
-            session_cookie_name: config.session_cookie_name,
+            secret_key: config.api_signing_key,
             session_lifetime_seconds: config.session_lifetime_seconds,
         },
+        backend_service_token: config.backend_service_token,
         database,
+        email_verification_ttl_seconds: config.email_verification_ttl_seconds,
         http,
-        public_base_url: config.public_base_url,
+        object_storage,
         rate_limiter: rate_limit::RateLimiter::default(),
         setup_token: config.setup_token,
-        upload_folder: config.upload_folder,
+        site_url: config.site_url,
     });
     let listener = TcpListener::bind(config.bind_address)
         .await
@@ -111,16 +118,20 @@ async fn main() -> Result<()> {
 
 fn router(state: AppState) -> Router {
     let request_id_header = axum::http::HeaderName::from_static("x-request-id");
-    let native_routes = routes::router(state.clone());
-    let browser_auth_routes = browser_auth::router();
+    let application_routes = Router::new()
+        .route("/api/v1/ctfzone", get(product_metadata))
+        .route("/api/v1/ctfzone/architecture", get(architecture))
+        .merge(browser_auth::router())
+        .merge(routes::router(state.clone()))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_backend_service,
+        ));
 
     Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
-        .route("/api/v1/ctfzone", get(product_metadata))
-        .route("/api/v1/ctfzone/architecture", get(architecture))
-        .merge(browser_auth_routes)
-        .merge(native_routes)
+        .merge(application_routes)
         .with_state(state)
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
@@ -137,7 +148,13 @@ async fn liveness() -> impl IntoResponse {
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
-    match sqlx::query_as::<_, (Option<String>, bool, bool, bool, bool)>(
+    let object_storage_ready = state
+        .http
+        .head(state.object_storage.internal_bucket_head_url())
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    match sqlx::query_as::<_, (Option<String>, bool, bool, bool, bool, bool, bool, bool)>(
         r#"
         SELECT
             (SELECT value FROM ctfzone.release_metadata WHERE key = 'schema_version'),
@@ -147,22 +164,39 @@ async fn readiness(State(state): State<AppState>) -> Response {
             ),
             to_regclass('ctfzone.users') IS NOT NULL,
             to_regclass('ctfzone.challenges') IS NOT NULL,
-            to_regclass('ctfzone.runtime_instances') IS NOT NULL
+            to_regclass('ctfzone.runtime_instances') IS NOT NULL,
+            to_regclass('ctfzone.email_verification_tokens') IS NOT NULL,
+            to_regclass('ctfzone.stored_objects') IS NOT NULL,
+            to_regclass('ctfzone.object_operations') IS NOT NULL
         "#,
     )
     .fetch_one(&state.database)
     .await
     {
-        Ok((Some(version), true, true, true, true)) if version == SCHEMA_VERSION => (
-            StatusCode::OK,
-            Json(json!({
-                "status": "ready",
-                "database": "available",
-                "schema_version": version,
-            })),
-        )
-            .into_response(),
-        Ok((version, install_complete, users_ready, challenges_ready, runtimes_ready)) => {
+        Ok((Some(version), true, true, true, true, true, true, true))
+            if version == SCHEMA_VERSION && object_storage_ready =>
+        {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ready",
+                    "database": "available",
+                    "object_storage": "available",
+                    "schema_version": version,
+                })),
+            )
+                .into_response()
+        }
+        Ok((
+            version,
+            install_complete,
+            users_ready,
+            challenges_ready,
+            runtimes_ready,
+            email_verification_ready,
+            objects_ready,
+            object_operations_ready,
+        )) => {
             warn!(
                 observed_schema_version = ?version,
                 expected_schema_version = SCHEMA_VERSION,
@@ -170,6 +204,10 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 users_ready,
                 challenges_ready,
                 runtimes_ready,
+                email_verification_ready,
+                objects_ready,
+                object_operations_ready,
+                object_storage_ready,
                 "API readiness check found an incompatible database schema"
             );
             (
@@ -177,6 +215,7 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 Json(json!({
                     "status": "not_ready",
                     "database": "available",
+                    "object_storage": if object_storage_ready { "available" } else { "unavailable" },
                     "schema": "incompatible",
                     "expected_schema_version": SCHEMA_VERSION,
                     "observed_schema_version": version,
@@ -185,6 +224,9 @@ async fn readiness(State(state): State<AppState>) -> Response {
                         "users": users_ready,
                         "challenges": challenges_ready,
                         "runtime_instances": runtimes_ready,
+                        "email_verification_tokens": email_verification_ready,
+                        "stored_objects": objects_ready,
+                        "object_operations": object_operations_ready,
                     },
                 })),
             )

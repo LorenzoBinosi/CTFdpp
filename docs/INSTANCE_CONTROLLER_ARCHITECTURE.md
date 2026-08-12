@@ -1,7 +1,7 @@
 # CTFZone managed-instance controller
 
 Status: Implemented 1.0.0 baseline
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 This document describes the controller implemented in this repository. It is
 the selected PostgreSQL-coordinated design from
@@ -9,36 +9,42 @@ the selected PostgreSQL-coordinated design from
 
 ## 1. Boundary and topology
 
-CTFZone has four core services and one edge proxy:
+CTFZone has four core services plus Caddy and object-storage infrastructure:
 
 ```text
-                                      PostgreSQL
-                                    /      |      \
-                                   /       |       \
-Browser -- HTTPS --> Caddy --> Python BFF --> Rust API   Rust controller
-                           pages + UI API       |              |
-API clients -- HTTPS --> Caddy -----------------^              | SSH
-                                                               |
-                                                      remote runtime host
-                                                      + host expiry timer
+Browser -- HTTPS --> Caddy(site) --> Python BFF --> private Rust API
+                                      |                    |
+                                      |                    v
+                                      |                PostgreSQL
+                                      |                    ^
+                                      |                    |
+                                      |             Rust controller -- SSH --> remote runtime host
+                                      |                                    + host expiry timer
+                                      |
+                                      +-- signed redirect/PUT --> Caddy(storage) --> object storage
 ```
 
-- Caddy is the only public listener and owns certificates.
+- Caddy is the only public listener and owns certificates for the distinct site
+  and signed-storage origins.
 - Python renders HTML, templates, and private Markdown/challenge fragments, and
-  forwards browser UI actions through its constrained `/bff` boundary.
-- Rust owns the public `/api/v1` behavior, authorization, domain rules, and
-  browser session mutations.
+  accepts browser UI actions through its constrained `/bff` boundary. It owns
+  the browser cookie, same-origin checks, and CSRF.
+- Rust owns the private `/api/v1` behavior, internal session rows,
+  authorization, and domain rules. Every application request requires the
+  backend service credential; authenticated calls also carry an opaque internal
+  session identifier.
 - PostgreSQL is the only authoritative platform database.
 - The controller is an internal worker. A participant cannot connect to it or
   send it arbitrary container instructions.
 - Remote hosts run challenge workloads and are not additional CTFZone platform
   services.
 
-The browser uses one origin. Human-facing pages and their JavaScript actions
-reach Python through Caddy; Python forwards those actions to Rust without
-implementing domain behavior. External API clients may call `/api/v1` through
-Caddy directly. The controller is never part of the user authentication
-boundary.
+Human-facing pages and their JavaScript actions reach Python through Caddy;
+Python validates the browser boundary and calls Rust without implementing
+domain behavior. Caddy does not expose a generic Rust `/api/v1` or `/files`
+route. A future machine API needs a separate, explicitly scoped ingress and
+credential model rather than reusing the private BFF contract. The controller
+is never part of the user authentication boundary.
 
 ## 2. Why the controller stays running
 
@@ -141,7 +147,7 @@ id, instance_id, kind, generation
 setting_revision, challenge_runtime_revision
 payload, status, attempts, available_at
 requested_by_user_id, idempotency_key
-created_at, claimed_at, completed_at, last_error
+created_at, claimed_at, claim_token, completed_at, last_error
 ```
 
 Kinds are `start`, `terminate`, `extend`, `inspect`, and `reconcile`. Status is
@@ -151,7 +157,12 @@ Kinds are `start`, `terminate`, `extend`, `inspect`, and `reconcile`. Status is
 global sequence, UUID, instance, event type, source (`api`, `controller`, or
 `remote`), optional user actor, JSON payload, and timestamp.
 
-## 4. Exchanges between browser, API, database, and controller
+## 4. Exchanges between browser, BFF, API, database, and controller
+
+The paths below are the private Rust contract. Browser JavaScript supplies the
+same path under Python's same-origin `/bff` prefix; Python validates the request,
+removes browser credentials, and replaces them with its service credential and,
+when authenticated, the opaque Rust session reference.
 
 ### Participant endpoints
 
@@ -193,7 +204,7 @@ not simply turn the worker off: it causes active affected instances to drain.
 
 For `POST /api/v1/challenges/{challenge_id}/instance` the API:
 
-1. Authenticates the browser session or API token.
+1. Authenticates the BFF service credential and opaque internal user session.
 2. Verifies challenge visibility, CTF time, account verification, and team rules.
 3. Reads the master setting and managed profile.
 4. Validates the requested TTL against the profile.
@@ -236,7 +247,15 @@ On any wake it:
 Failures increment `attempts`, record a bounded error, and make the command
 available again with backoff until `MAX_COMMAND_ATTEMPTS`. Generation checks
 prevent a late start result from reviving an instance that was terminated while
-the remote call was running.
+the remote call was running. A terminal start failure atomically requests
+cleanup, and failed termination work is re-created only after the bounded safety
+interval; an uncertain remote workload never releases the user's active slot.
+
+Only the controller holding the PostgreSQL advisory leadership connection may
+claim work. Every claim receives a fresh UUID token, and all completion,
+cancellation, failure, retry, instance projection, and history writes lock and
+verify that token. If leadership is lost during a remote call, a replacement may
+reclaim the command, but the stale worker cannot overwrite its database result.
 
 ### No one-second polling
 
@@ -249,7 +268,9 @@ After draining available work, the controller computes the next wake time from:
 It waits for the earliest timer or PostgreSQL notification. It does not query
 the API or inspect every runtime host once per second. The bounded reconciliation
 timer exists to recover a lost notification or manually repaired row; exact
-expiry uses the specific instance deadline.
+expiry uses the specific instance deadline. At each bounded reconciliation it
+also inspects a limited batch of active workloads so an externally stopped or
+unhealthy container is eventually reflected without continuous polling.
 
 ## 7. Activities on a remote host
 
@@ -278,20 +299,27 @@ For a start, the helper:
 1. Validates the instance ID, generation, digest-pinned image, limits, port, and
    absolute deadline.
 2. Uses a dedicated rootless Podman account.
-3. creates/fetches the private challenge network;
+3. creates/fetches a private network unique to the instance;
 4. starts the image with no added capabilities, `no-new-privileges`, and the
    configured CPU, memory, PID, and storage limits;
 5. publishes a random host port rather than accepting one from the participant;
 6. labels the workload with instance and generation metadata;
-7. writes fsynced local generation/deadline state;
-8. installs a transient systemd timer on the runtime host for the absolute
-   deadline;
+7. installs and verifies a generation-specific transient systemd timer on the
+   runtime host for the absolute deadline, removing a newly created workload if
+   that fail-closed guard cannot be installed;
+8. writes fsynced local generation/deadline state and waits for the workload's
+   configured readiness/health condition;
 9. returns container ID, internal/published IP and port, protocol, endpoint, and
    effective expiry as JSON.
 
 The helper is idempotent. Repeating `ensure-instance` for the same generation
 returns the existing workload. `stop-instance` succeeds when it is already
-absent. A stale timer cannot kill a newer generation.
+absent. A stale timer cannot kill a newer generation. Stop and expiry first
+persist a permanent UUID/generation tombstone; since instance UUIDs are never
+reused, a delayed older `ensure-instance` cannot resurrect a stopped workload.
+Missing or corrupt local state fails closed: the helper tombstones the UUID and
+removes the workload rather than reconstructing stale extension or health data
+from immutable creation labels.
 
 The controller never receives a Docker or Podman socket and the remote SSH user
 must not belong to privileged groups.
@@ -396,9 +424,12 @@ container while the whole control plane is off.
 
 ### Controller outage only
 
-Commands accumulate in PostgreSQL. On restart the controller recovers claims
-older than `STALE_CLAIM_AFTER_SECONDS`, queues overdue/policy cleanup, and drains
-pending work. Remote timers still enforce already-installed expiries.
+Commands accumulate in PostgreSQL. A singleton PostgreSQL lease fences
+controller ownership; after acquiring it on restart, the controller immediately
+recovers every prior claim, queues overdue/policy cleanup, and drains pending
+work. While running it also recovers claims whose lease exceeds
+`STALE_CLAIM_AFTER_SECONDS`. Remote timers still enforce already-installed
+expiries.
 
 ### PostgreSQL outage while controller stays up
 
@@ -424,15 +455,17 @@ controller reconnect.
 
 The controller records the error and retries with backoff. The user slot remains
 active while cleanup is uncertain. After the configured attempt limit the
-command and instance expose failure data for an administrator, who can repair the
-host and request reconciliation.
+command and instance expose failure data, but desired-stopped cleanup is queued
+again after the safety interval rather than abandoned. An administrator can
+repair the host and request immediate reconciliation.
 
 ## 13. Security invariants
 
-- Caddy is the only public service.
-- All runtime mutations require normal API authentication and ownership/admin
-  authorization.
-- Session cookies are signed; server-side session rows support revocation.
+- Caddy is the only public service; it exposes Python for portal traffic and
+  object storage only for short-lived signed transfers.
+- All runtime mutations pass Python's same-origin/CSRF checks and then require
+  Rust session authentication plus ownership/admin authorization.
+- Browser cookies are signed and HttpOnly; Rust session rows support revocation.
 - Participant input never becomes an image name, shell command, host, or
   published port.
 - Images are immutable digest references.

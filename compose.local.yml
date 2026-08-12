@@ -1,7 +1,30 @@
 services:
   caddy:
+    ports:
+      - "80:80"
     environment:
-      SITE_ADDRESS: :80
+      CADDY_SITE_ADDRESS: http://localhost
+      CADDY_STORAGE_ADDRESS: http://files.localhost
+  backend:
+    environment:
+      BROWSER_SESSION_COOKIE_SECURE: "false"
+      OBJECT_STORAGE_PUBLIC_URL: http://files.localhost
   api:
     environment:
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost}
+      CADDY_SITE_ADDRESS: http://localhost
+      OBJECT_STORAGE_PUBLIC_URL: http://files.localhost
+  storage:
+    command:
+      - mini
+      - -dir=/data
+      - -master.telemetry=false
+      - -admin.ui=false
+      - -webdav=false
+      - -s3.iam=false
+      - -s3.allowDeleteBucketNotEmpty=false
+      - -s3.concurrentFileUploadLimit=${OBJECT_STORAGE_UPLOAD_CONCURRENCY:-16}
+      - -s3.concurrentUploadLimitMB=${OBJECT_STORAGE_CONCURRENT_UPLOAD_MB:-2048}
+      - -filer.disableDirListing=true
+      - -filer.exposeDirectoryData=false
+      - -bucket=${OBJECT_STORAGE_BUCKET:-ctfzone}
+      - -s3.allowedOrigins=http://localhost

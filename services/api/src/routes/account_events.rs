@@ -502,10 +502,10 @@ fn require_team(user: &CurrentUser) -> Result<i32, ApiError> {
 }
 
 async fn require_team_mode(state: &AppState) -> Result<(), ApiError> {
-    if config_string(state, "user_mode").await?.as_deref() == Some("users") {
-        Err(ApiError::not_found("Team mode is disabled"))
-    } else {
+    if config_string(state, "user_mode").await?.as_deref() == Some("teams") {
         Ok(())
+    } else {
+        Err(ApiError::not_found("Team mode is disabled"))
     }
 }
 

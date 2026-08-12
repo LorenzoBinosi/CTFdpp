@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -171,18 +172,33 @@ impl OperationJournal {
                 .execute(server, RemoteOperation::StopInstance, &payload)
                 .await
             {
-                Ok(result) => {
+                Ok(result)
+                    if result.absent == Some(true) || result.stale_generation == Some(true) =>
+                {
                     self.append(&JournalRecord {
                         phase: JournalPhase::DegradedCleanup,
-                        remote_result: Some(result),
+                        remote_result: Some(result.clone()),
                         payload: Some(payload),
                         updated_at: Utc::now(),
                         ..record.clone()
                     })
                     .await?;
                     cleaned += 1;
-                    info!(instance_id = %record.instance_id, "cleaned overdue journaled instance while database was unavailable");
+                    if result.stale_generation == Some(true) {
+                        info!(
+                            instance_id = %record.instance_id,
+                            journal_generation = record.generation,
+                            effective_generation = ?result.effective_generation,
+                            "ignored stale degraded cleanup without removing a newer generation"
+                        );
+                    } else {
+                        info!(instance_id = %record.instance_id, "cleaned overdue journaled instance while database was unavailable");
+                    }
                 }
+                Ok(_) => warn!(
+                    instance_id = %record.instance_id,
+                    "remote helper did not confirm degraded workload removal"
+                ),
                 Err(error) => warn!(
                     instance_id = %record.instance_id,
                     %error,
@@ -191,6 +207,51 @@ impl OperationJournal {
             }
         }
         Ok(cleaned)
+    }
+
+    pub(crate) async fn reconcile_database_acknowledgements(&self, pool: &PgPool) -> Result<usize> {
+        let records = self.current_unacknowledged().await?;
+        let mut acknowledged = 0;
+        for record in records.values() {
+            let state = sqlx::query_as::<_, (String, i64, i64)>(
+                r#"
+                SELECT c.status,c.generation,i.generation
+                FROM ctfzone.runtime_commands c
+                JOIN ctfzone.runtime_instances i ON i.id=c.instance_id
+                WHERE c.id=$1 AND c.instance_id=$2
+                "#,
+            )
+            .bind(record.command_id)
+            .bind(record.instance_id)
+            .fetch_optional(pool)
+            .await?;
+            let database_finished = match state {
+                None => true,
+                Some((status, command_generation, instance_generation)) => {
+                    matches!(status.as_str(), "completed" | "failed" | "cancelled")
+                        || command_generation != record.generation
+                        || (instance_generation != record.generation && status != "claimed")
+                }
+            };
+            if database_finished {
+                self.append(&JournalRecord {
+                    phase: JournalPhase::DatabaseAcknowledged,
+                    remote_result: None,
+                    payload: None,
+                    updated_at: Utc::now(),
+                    ..record.clone()
+                })
+                .await?;
+                acknowledged += 1;
+            }
+        }
+        if acknowledged > 0 {
+            info!(
+                count = acknowledged,
+                "reconciled operation journal with PostgreSQL"
+            );
+        }
+        Ok(acknowledged)
     }
 
     async fn current_unacknowledged(&self) -> Result<HashMap<(Uuid, Uuid), JournalRecord>> {

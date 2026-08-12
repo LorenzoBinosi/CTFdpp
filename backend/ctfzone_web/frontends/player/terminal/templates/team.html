@@ -1,0 +1,74 @@
+{% extends player_template('base.html') %}
+{% block title %}Team · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="content-shell team-shell">
+    <header class="page-heading"><div><span class="eyebrow">YOUR CREW</span><h1>Team</h1><p>Coordinate your operators and review the team identity used for scoring.</p></div></header>
+    {% if not bootstrap.available %}
+      <div class="feature-card centered"><span class="empty-glyph">!</span><h2>Team management unavailable</h2><p>The API is temporarily unavailable. Try again when the service has recovered.</p></div>
+    {% elif site.user_mode != 'teams' %}
+      <div class="feature-card centered"><span class="empty-glyph">—</span><h2>Individual competition</h2><p>This event scores individual accounts, so team management is not available.</p></div>
+    {% elif not bootstrap.authenticated %}
+      <div class="feature-card centered"><svg class="feature-icon"><use href="#icon-user"></use></svg><h2>Sign in to view your team</h2><p>Your team roster and shared score are private.</p><a class="button" href="{{ url_for('web.login', next=url_for('web.team')) }}">Log in</a></div>
+    {% elif user.type == 'admin' %}
+      <div class="feature-card centered"><span class="empty-glyph">i</span><h2>Administrator account</h2><p>Administrators can manage teams from the administration interface, but cannot join the participant roster.</p><a class="button" href="{{ url_for('web.admin_teams') }}">Manage teams</a></div>
+    {% elif team_error %}
+      <div class="feature-card centered"><span class="empty-glyph">!</span><h2>Team details unavailable</h2><p>{{ team_error }}</p><a class="quiet-button" href="{{ url_for('web.team') }}">Try again</a></div>
+    {% elif team %}
+      <div class="team-grid">
+        <article class="feature-card team-identity">
+          <span class="eyebrow">ACTIVE TEAM</span>
+          <h2>{{ team.name }}</h2>
+          {% if team.affiliation %}<p>{{ team.affiliation }}</p>{% endif %}
+          <dl><div><dt>Score</dt><dd>{{ team.score or 0 }}</dd></div><div><dt>Rank</dt><dd>{{ team.place or '—' }}</dd></div></dl>
+          {% if team.captain_id == user.id %}
+            <div class="team-invite" data-team-invite>
+              <div><span class="eyebrow">CAPTAIN INVITE</span><p>Generate a reusable invite that expires after 24 hours.</p></div>
+              <form data-team-invite-form><button class="quiet-button" type="submit">Generate invite</button></form>
+              <div class="team-invite-code" data-team-invite-result hidden>
+                <label for="team-invite-code">Invite code</label>
+                <textarea id="team-invite-code" rows="3" readonly data-team-invite-code></textarea>
+                <button class="quiet-button" type="button" data-team-invite-copy>Copy code</button>
+              </div>
+            </div>
+          {% endif %}
+        </article>
+        <article class="feature-card">
+          <span class="eyebrow">ROSTER</span>
+          <div class="member-list">
+            {% for member in team.members or [] %}
+              <div><span class="avatar">{{ (member.name or '?')[0] | upper }}</span><strong>{{ member.name }}</strong><small>{% if member.id == team.captain_id %}Captain{% else %}Member{% endif %}</small></div>
+            {% else %}
+              <p class="muted">Roster details are not available yet.</p>
+            {% endfor %}
+          </div>
+        </article>
+      </div>
+    {% else %}
+      <div class="team-onboarding-grid">
+        {% if site.team_creation %}
+          <article class="feature-card team-action-card">
+            <span class="eyebrow">START A TEAM</span>
+            <h2>Create a team</h2>
+            <p>You become captain and can invite other participants after creation.{% if site.team_size %} Teams may contain up to {{ site.team_size }} participants.{% endif %}{% if site.num_teams %} This event allows up to {{ site.num_teams }} teams.{% endif %}</p>
+            <form class="stack-form" data-team-create>
+              <label for="team-name">Team name</label>
+              <input id="team-name" name="name" type="text" autocomplete="organization" maxlength="128" required>
+              <button class="button" type="submit">Create team</button>
+            </form>
+          </article>
+        {% endif %}
+        <article class="feature-card team-action-card">
+          <span class="eyebrow">JOIN A TEAM</span>
+          <h2>Use an invite</h2>
+          <p>Paste the invite code shared by a team captain.{% if site.team_size %} Teams may contain up to {{ site.team_size }} participants.{% endif %}</p>
+          <form class="stack-form" data-team-join>
+            <label for="team-invite">Invite code</label>
+            <textarea id="team-invite" name="code" rows="4" autocomplete="off" maxlength="4096" required></textarea>
+            <button class="button" type="submit">Join team</button>
+          </form>
+        </article>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}
+{% block scripts %}<script type="module" src="{{ player_asset('js/team.js') }}"></script>{% endblock %}

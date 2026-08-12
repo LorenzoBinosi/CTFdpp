@@ -32,6 +32,13 @@ pub(super) struct AdminQuery {
     target_id: Option<i32>,
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct RegistrationEmailQuery {
+    q: Option<String>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct ConfigInput {
     key: String,
@@ -187,13 +194,6 @@ pub(super) struct SubmissionPatch {
 }
 
 #[derive(FromRow, Serialize)]
-struct ConfigView {
-    id: i32,
-    key: Option<String>,
-    value: Option<String>,
-}
-
-#[derive(FromRow, Serialize)]
 struct FieldView {
     id: i32,
     name: Option<String>,
@@ -310,23 +310,20 @@ pub(super) async fn list_configs(
     user: CurrentUser,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let mut configs =
-        sqlx::query_as::<_, ConfigView>("SELECT id,key,value FROM ctfzone.config ORDER BY key,id")
-            .fetch_all(&state.database)
-            .await
-            .map_err(ApiError::database)?;
-    let (enabled, revision) = sqlx::query_as::<_, (bool, i64)>(
-        "SELECT enabled,revision FROM ctfzone.runtime_settings WHERE key='private_challenges'",
+    let configs = sqlx::query_as::<_, super::configuration::StoredConfig>(
+        "SELECT id,key,value FROM ctfzone.config ORDER BY key,id",
     )
-    .fetch_one(&state.database)
+    .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?;
-    configs.push(ConfigView {
-        id: i32::try_from(revision).unwrap_or(i32::MAX),
-        key: Some("private_challenges".to_owned()),
-        value: Some(enabled.to_string()),
-    });
-    Ok(Json(Success::new(configs)).into_response())
+    Ok(Json(Success::new(
+        configs
+            .into_iter()
+            .filter(|config| config.key.as_deref() != Some(crate::setup::COMPLETED_MARKER_KEY))
+            .map(super::configuration::PublicConfig::from)
+            .collect::<Vec<_>>(),
+    ))
+    .into_response())
 }
 
 pub(super) async fn create_config(
@@ -335,28 +332,34 @@ pub(super) async fn create_config(
     Json(request): Json<ConfigInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    validate_config_mutation(&request.key, &request.value)?;
     if request.key == "private_challenges" {
         return set_private_challenges(&state, &user, value_bool(&request.value)?).await;
     }
-    let exists =
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ctfzone.config WHERE key=$1)")
-            .bind(&request.key)
-            .fetch_one(&state.database)
-            .await
-            .map_err(ApiError::database)?;
-    if exists {
-        return Err(ApiError::conflict("Configuration key already exists"));
-    }
-    let config = sqlx::query_as::<_, ConfigView>(
+    let key = request.key;
+    let values = Map::from_iter([(key.clone(), request.value)]);
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let stored_value = super::configuration::normalize_mutations(&mut transaction, &values)
+        .await?
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+        .ok_or_else(|| ApiError::bad_request("Configuration mutation is empty"))?;
+    let config = sqlx::query_as::<_, super::configuration::StoredConfig>(
         "INSERT INTO ctfzone.config (key,value) VALUES ($1,$2) RETURNING id,key,value",
     )
-    .bind(request.key)
-    .bind(config_value(request.value)?)
-    .fetch_one(&state.database)
+    .bind(key)
+    .bind(stored_value)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(map_admin_database_error)?;
-    Ok((StatusCode::CREATED, Json(Success::new(config))).into_response())
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Success::new(super::configuration::PublicConfig::from(
+            config,
+        ))),
+    )
+        .into_response())
 }
 
 pub(super) async fn patch_configs(
@@ -366,11 +369,11 @@ pub(super) async fn patch_configs(
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
     request.remove("clear_registration_access_modes");
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     let private_value = request.remove("private_challenges");
-    for (key, value) in request {
-        validate_config_mutation(&key, &value)?;
-        upsert_config(&mut transaction, &key, config_value(value)?).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let normalized = super::configuration::normalize_mutations(&mut transaction, &request).await?;
+    for (key, value) in normalized {
+        super::configuration::upsert_normalized(&mut transaction, &key, value).await?;
     }
     if let Some(value) = private_value {
         let enabled = value_bool(&value)?;
@@ -405,15 +408,20 @@ pub(super) async fn get_config(
         .fetch_one(&state.database)
         .await
         .map_err(ApiError::database)?;
-        return Ok(Json(Success::new(ConfigView {
-            id: i32::try_from(revision).unwrap_or(i32::MAX),
-            key: Some(config_key),
-            value: Some(enabled.to_string()),
-        }))
+        return Ok(Json(Success::new(super::configuration::PublicConfig::from(
+            super::configuration::StoredConfig {
+                id: i32::try_from(revision).unwrap_or(i32::MAX),
+                key: Some(config_key),
+                value: Some(enabled.to_string()),
+            },
+        )))
         .into_response());
     }
     let config = load_config(&state, &config_key).await?;
-    Ok(Json(Success::new(config)).into_response())
+    Ok(Json(Success::new(super::configuration::PublicConfig::from(
+        config,
+    )))
+    .into_response())
 }
 
 pub(super) async fn update_config(
@@ -423,14 +431,23 @@ pub(super) async fn update_config(
     Json(request): Json<ConfigValueInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    validate_config_mutation(&config_key, &request.value)?;
     if config_key == "private_challenges" {
         return set_private_challenges(&state, &user, value_bool(&request.value)?).await;
     }
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    let config = upsert_config(&mut transaction, &config_key, config_value(request.value)?).await?;
+    let values = Map::from_iter([(config_key.clone(), request.value)]);
+    let stored_value = super::configuration::normalize_mutations(&mut transaction, &values)
+        .await?
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+        .ok_or_else(|| ApiError::bad_request("Configuration mutation is empty"))?;
+    let config = upsert_config(&mut transaction, &config_key, stored_value).await?;
     transaction.commit().await.map_err(ApiError::database)?;
-    Ok(Json(Success::new(config)).into_response())
+    Ok(Json(Success::new(super::configuration::PublicConfig::from(
+        config,
+    )))
+    .into_response())
 }
 
 pub(super) async fn delete_config(
@@ -449,27 +466,67 @@ pub(super) async fn delete_config(
             "The private challenge setting cannot be deleted",
         ));
     }
-    delete_text_key(&state, "config", "key", &config_key).await
+    if config_key == "player_frontend" || config_key == "ctf_name" {
+        return Err(ApiError::bad_request(
+            "Required site identity settings cannot be deleted",
+        ));
+    }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let deleted = super::configuration::delete_legacy(&mut transaction, &config_key).await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    if deleted == 0 {
+        return Err(ApiError::not_found("Configuration not found"));
+    }
+    Ok(Json(json!({"success": true})).into_response())
 }
 
 pub(super) async fn list_registration_emails(
     State(state): State<AppState>,
     user: CurrentUser,
+    Query(query): Query<RegistrationEmailQuery>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
+    let page = query.page.unwrap_or(1).clamp(1, 1_000_000);
+    let per_page = query.per_page.unwrap_or(50).clamp(1, 200);
+    let search = query.q.unwrap_or_default();
+    if search.len() > 254 || search.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("Email search is invalid"));
+    }
+    let pattern = format!("%{}%", escape_like(search.trim()));
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM ctfzone.registration_email_allowlist WHERE email ILIKE $1 ESCAPE '\'"#,
+    )
+    .bind(&pattern)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::database)?;
     let rows = sqlx::query_as::<_, (i32, String, bool)>(
         r#"
         SELECT a.id,a.email,EXISTS(SELECT 1 FROM ctfzone.users u WHERE lower(u.email)=lower(a.email))
-        FROM ctfzone.registration_email_allowlist a ORDER BY a.email
+        FROM ctfzone.registration_email_allowlist a
+        WHERE a.email ILIKE $1 ESCAPE '\'
+        ORDER BY a.email LIMIT $2 OFFSET $3
         "#,
     )
+    .bind(pattern)
+    .bind(per_page)
+    .bind((page - 1) * per_page)
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?
     .into_iter()
     .map(|(id, email, registered)| json!({"id": id, "email": email, "registered": registered}))
     .collect::<Vec<_>>();
-    Ok(Json(Success::new(rows)).into_response())
+    let pages = if total == 0 {
+        0
+    } else {
+        (total + per_page - 1) / per_page
+    };
+    Ok(Json(Success::new(json!({
+        "items": rows,
+        "pagination": {"page": page, "per_page": per_page, "pages": pages, "total": total}
+    })))
+    .into_response())
 }
 
 pub(super) async fn create_registration_email(
@@ -633,16 +690,29 @@ pub(super) async fn delete_registration_email(
     Path(entry_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let registered = sqlx::query_scalar::<_, bool>(
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let email = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT EXISTS(
-            SELECT 1 FROM ctfzone.registration_email_allowlist a
-            JOIN ctfzone.users u ON lower(u.email)=lower(a.email) WHERE a.id=$1
-        )
+        SELECT email
+        FROM ctfzone.registration_email_allowlist
+        WHERE id=$1
+        FOR UPDATE
         "#,
     )
     .bind(entry_id)
-    .fetch_one(&state.database)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let registered = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ctfzone.users WHERE lower(email)=lower($1)
+        )
+        "#,
+    )
+    .bind(&email)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
     if registered {
@@ -650,7 +720,13 @@ pub(super) async fn delete_registration_email(
             "Delete the registered user before removing this allowlist entry",
         ));
     }
-    delete_integer_id(&state, "registration_email_allowlist", entry_id).await
+    sqlx::query("DELETE FROM ctfzone.registration_email_allowlist WHERE id=$1")
+        .bind(entry_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(Json(json!({"success": true})).into_response())
 }
 
 pub(super) async fn list_fields(
@@ -1536,11 +1612,13 @@ async fn set_private_challenges(
     .map_err(ApiError::database)?;
     notify(&mut transaction, SETTINGS_CHANNEL, &revision.to_string()).await?;
     transaction.commit().await.map_err(ApiError::database)?;
-    Ok(Json(Success::new(ConfigView {
-        id: i32::try_from(revision).unwrap_or(i32::MAX),
-        key: Some("private_challenges".to_owned()),
-        value: Some(enabled.to_string()),
-    }))
+    Ok(Json(Success::new(super::configuration::PublicConfig::from(
+        super::configuration::StoredConfig {
+            id: i32::try_from(revision).unwrap_or(i32::MAX),
+            key: Some("private_challenges".to_owned()),
+            value: Some(enabled.to_string()),
+        },
+    )))
     .into_response())
 }
 
@@ -1548,24 +1626,13 @@ async fn upsert_config(
     transaction: &mut Transaction<'_, Postgres>,
     key: &str,
     value: String,
-) -> Result<ConfigView, ApiError> {
-    if let Some(config) = sqlx::query_as::<_, ConfigView>(
+) -> Result<super::configuration::StoredConfig, ApiError> {
+    sqlx::query_as::<_, super::configuration::StoredConfig>(
         r#"
-        UPDATE ctfzone.config SET value=$2
-        WHERE id=(SELECT id FROM ctfzone.config WHERE key=$1 ORDER BY id LIMIT 1)
+        INSERT INTO ctfzone.config (key,value) VALUES ($1,$2)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
         RETURNING id,key,value
         "#,
-    )
-    .bind(key)
-    .bind(&value)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(ApiError::database)?
-    {
-        return Ok(config);
-    }
-    sqlx::query_as::<_, ConfigView>(
-        "INSERT INTO ctfzone.config (key,value) VALUES ($1,$2) RETURNING id,key,value",
     )
     .bind(key)
     .bind(value)
@@ -1574,13 +1641,18 @@ async fn upsert_config(
     .map_err(ApiError::database)
 }
 
-async fn load_config(state: &AppState, key: &str) -> Result<ConfigView, ApiError> {
-    sqlx::query_as::<_, ConfigView>("SELECT id,key,value FROM ctfzone.config WHERE key=$1")
-        .bind(key)
-        .fetch_optional(&state.database)
-        .await
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::not_found("Configuration not found"))
+async fn load_config(
+    state: &AppState,
+    key: &str,
+) -> Result<super::configuration::StoredConfig, ApiError> {
+    sqlx::query_as::<_, super::configuration::StoredConfig>(
+        "SELECT id,key,value FROM ctfzone.config WHERE key=$1",
+    )
+    .bind(key)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Configuration not found"))
 }
 
 async fn load_field(state: &AppState, id: i32) -> Result<FieldView, ApiError> {
@@ -1702,28 +1774,6 @@ async fn delete_integer_id(state: &AppState, table: &str, id: i32) -> Result<Res
     Ok(Json(json!({"success": true})).into_response())
 }
 
-async fn delete_text_key(
-    state: &AppState,
-    table: &str,
-    column: &str,
-    key: &str,
-) -> Result<Response, ApiError> {
-    if table != "config" || column != "key" {
-        return Err(ApiError::bad_request(
-            "Unsupported administrative content type",
-        ));
-    }
-    let result = sqlx::query("DELETE FROM ctfzone.config WHERE key=$1")
-        .bind(key)
-        .execute(&state.database)
-        .await
-        .map_err(ApiError::database)?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("Configuration not found"));
-    }
-    Ok(Json(json!({"success": true})).into_response())
-}
-
 async fn notify(
     transaction: &mut Transaction<'_, Postgres>,
     channel: &str,
@@ -1771,17 +1821,6 @@ fn flag_types_value() -> Value {
     })
 }
 
-fn config_value(value: Value) -> Result<String, ApiError> {
-    match value {
-        Value::String(value) => Ok(value),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::Null => Ok(String::new()),
-        _ => serde_json::to_string(&value)
-            .map_err(|_| ApiError::bad_request("Configuration value is invalid")),
-    }
-}
-
 fn value_bool(value: &Value) -> Result<bool, ApiError> {
     match value {
         Value::Bool(value) => Ok(*value),
@@ -1792,28 +1831,6 @@ fn value_bool(value: &Value) -> Result<bool, ApiError> {
         },
         _ => Err(ApiError::bad_request("Setting must be a boolean")),
     }
-}
-
-fn validate_config_key(key: &str) -> Result<(), ApiError> {
-    if key.is_empty()
-        || key.len() > 128
-        || !key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
-    {
-        return Err(ApiError::bad_request("Configuration key is invalid"));
-    }
-    Ok(())
-}
-
-fn validate_config_mutation(key: &str, value: &Value) -> Result<(), ApiError> {
-    validate_config_key(key)?;
-    if key == crate::setup::COMPLETED_MARKER_KEY && !value_bool(value)? {
-        return Err(ApiError::bad_request(
-            "The setup completion marker cannot be disabled",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_field(owner_type: &str, field_type: &str, name: &str) -> Result<(), ApiError> {
@@ -1905,6 +1922,13 @@ fn valid_email(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn default_markdown() -> String {
     "markdown".to_owned()
 }
@@ -1944,10 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_completion_marker_is_one_way() {
-        assert!(validate_config_mutation("setup", &json!(true)).is_ok());
-        assert!(validate_config_mutation("setup", &json!("yes")).is_ok());
-        assert!(validate_config_mutation("setup", &json!(false)).is_err());
-        assert!(validate_config_mutation("setup", &json!("off")).is_err());
+    fn escapes_allowlist_search_wildcards_as_literals() {
+        assert_eq!(escape_like("100%_\\example"), "100\\%\\_\\\\example");
     }
 }

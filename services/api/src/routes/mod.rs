@@ -2,6 +2,7 @@ mod account_events;
 mod administration;
 mod bootstrap;
 mod challenges;
+mod configuration;
 mod content;
 mod exports;
 mod files;
@@ -16,6 +17,7 @@ mod team_accounts;
 mod tokens;
 mod user_accounts;
 mod users;
+mod views;
 
 use axum::{
     Router,
@@ -45,6 +47,12 @@ impl<T> Success<T> {
 pub(crate) fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/v1/bootstrap", get(bootstrap::get))
+        .route("/api/v1/views/challenges", get(views::challenges))
+        .route("/api/v1/views/admin/overview", get(views::admin_overview))
+        .route(
+            "/api/v1/views/admin/configuration",
+            get(views::admin_configuration),
+        )
         .route(
             "/api/v1/challenges",
             get(challenges::list).post(challenges::create),
@@ -263,7 +271,22 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             "/api/v1/files/{file_id}",
             get(files::detail).delete(files::delete),
         )
-        .route("/files/{*path}", get(files::download))
+        .route(
+            "/api/v1/storage/uploads",
+            post(files::initiate_upload).layer(DefaultBodyLimit::max(files::MAX_UPLOAD_BODY_BYTES)),
+        )
+        .route(
+            "/api/v1/storage/objects/{object_id}",
+            get(files::object_detail).delete(files::delete_object),
+        )
+        .route(
+            "/api/v1/storage/objects/{object_id}/complete",
+            post(files::complete_upload),
+        )
+        .route(
+            "/api/v1/storage/objects/{object_id}/download",
+            get(files::download_grant),
+        )
         .route(
             "/api/v1/users/me",
             get(users::current_user).patch(user_accounts::update_self),
@@ -279,6 +302,14 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
                 .delete(user_accounts::delete),
         )
         .route("/api/v1/users/{user_id}/email", post(mail::email_user))
+        .route(
+            "/api/v1/users/me/verification-email",
+            post(mail::send_self_verification_email),
+        )
+        .route(
+            "/api/v1/email-verifications/confirm",
+            post(mail::confirm_email),
+        )
         .route(
             "/api/v1/users/me/submissions",
             get(account_events::user_me_submissions),
@@ -311,9 +342,11 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/v1/teams/me",
             get(team_accounts::current)
+                .post(team_accounts::create_current)
                 .patch(team_accounts::update_current)
                 .delete(team_accounts::delete_current),
         )
+        .route("/api/v1/teams/me/join", post(team_accounts::join_current))
         .route(
             "/api/v1/teams/me/members",
             post(team_accounts::current_invite),
@@ -399,8 +432,12 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route("/api/v1/sessions", get(sessions::list))
         .route("/api/v1/sessions/revoke", post(sessions::revoke_all))
         .route(
-            "/api/v1/sessions/{user_id}/revoke",
+            "/api/v1/sessions/users/{user_id}/revoke",
             post(sessions::revoke_user),
+        )
+        .route(
+            "/api/v1/sessions/{management_id}/revoke",
+            post(sessions::revoke_one),
         )
         .route("/api/v1/instances", get(runtimes::history))
         .route("/api/v1/instances/{instance_id}", get(runtimes::detail))

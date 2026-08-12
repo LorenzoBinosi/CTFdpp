@@ -12,7 +12,8 @@ use axum::{
 use chrono::{Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
+use sqlx::{FromRow, PgConnection, Postgres, QueryBuilder, Transaction};
+use uuid::Uuid;
 
 use crate::{
     AppState,
@@ -20,6 +21,8 @@ use crate::{
     error::ApiError,
     routes::Success,
 };
+
+const DYNAMIC_SCORE_LOCK_NAMESPACE: i32 = 0x4354_465A;
 
 #[derive(Deserialize, Default)]
 pub(super) struct ChallengeListQuery {
@@ -95,7 +98,29 @@ struct ChallengeDetailRow {
     requirements: Option<Value>,
 }
 
-#[derive(FromRow, Serialize)]
+struct ChallengeAccessContext {
+    challenge: ChallengeDetailRow,
+    team_mode: bool,
+    solved: HashSet<i32>,
+    prerequisite_preview: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChallengeRowAccess {
+    Full,
+    HiddenPreview(bool),
+    NotFound,
+    PrerequisitesDenied,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CtfTimeAccess {
+    Allowed,
+    NotStarted,
+    Ended,
+}
+
+#[derive(Deserialize, FromRow, Serialize)]
 struct HintRenderRow {
     id: i32,
     title: Option<String>,
@@ -104,19 +129,24 @@ struct HintRenderRow {
     unlocked: bool,
 }
 
-#[derive(FromRow)]
+#[derive(Deserialize, FromRow)]
 struct FileRenderRow {
     id: i32,
-    location: Option<String>,
-    sha1sum: Option<String>,
+    object_id: Uuid,
+    name: String,
+    content_type: String,
+    size: i64,
+    sha256: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ChallengeFileView {
     id: i32,
+    object_id: Uuid,
     name: String,
-    url: String,
-    sha1sum: Option<String>,
+    content_type: String,
+    size: i64,
+    sha256: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -152,6 +182,14 @@ pub(super) async fn list(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Query(query): Query<ChallengeListQuery>,
 ) -> Result<Response, ApiError> {
+    Ok(Json(Success::new(list_data(state, user, query).await?)).into_response())
+}
+
+pub(super) async fn list_data(
+    state: AppState,
+    user: Option<CurrentUser>,
+    query: ChallengeListQuery,
+) -> Result<Vec<Value>, ApiError> {
     require_challenge_visibility(&state, user.as_ref()).await?;
     require_ctf_time(&state, user.as_ref()).await?;
     require_verified(&state, user.as_ref()).await?;
@@ -221,6 +259,8 @@ pub(super) async fn list(
         .fetch_all(&state.database)
         .await
         .map_err(ApiError::database)?;
+    let challenge_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+    let mut tags_by_challenge = tags_for_challenges(&state, &challenge_ids).await?;
     let solved = solved_challenge_ids(&state, user.as_ref(), team_mode).await?;
     let scores_visible = scores_and_accounts_visible(&state, user.as_ref()).await?;
     let solve_counts = if scores_visible {
@@ -231,7 +271,7 @@ pub(super) async fn list(
 
     let mut response = Vec::with_capacity(rows.len());
     for row in rows {
-        let tags = tags_for_challenge(&state, row.id).await?;
+        let tags = tags_by_challenge.remove(&row.id).unwrap_or_default();
         if !requirements_met(row.requirements.as_ref(), &solved) && !admin_view {
             let anonymize = row
                 .requirements
@@ -271,7 +311,128 @@ pub(super) async fn list(
         }));
     }
 
-    Ok(Json(Success::new(response)).into_response())
+    Ok(response)
+}
+
+async fn challenge_access_context(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    challenge_id: i32,
+) -> Result<ChallengeAccessContext, ApiError> {
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    challenge_access_context_on(&mut connection, user, challenge_id).await
+}
+
+async fn challenge_access_context_on(
+    connection: &mut PgConnection,
+    user: Option<&CurrentUser>,
+    challenge_id: i32,
+) -> Result<ChallengeAccessContext, ApiError> {
+    require_challenge_visibility_on(connection, user).await?;
+    require_ctf_time_on(connection, user).await?;
+    require_verified_on(connection, user).await?;
+
+    let admin = user.is_some_and(CurrentUser::is_admin);
+    let team_mode = is_team_mode_on(connection).await?;
+    if team_membership_missing(
+        team_mode,
+        user.map(|current| (current.is_admin(), current.team_id)),
+    ) {
+        return Err(ApiError::forbidden("Join a team before viewing challenges"));
+    }
+
+    let challenge = challenge_detail_by_id_on(connection, challenge_id).await?;
+    let solved = solved_challenge_ids_on(connection, user, team_mode).await?;
+    let prerequisite_preview = match challenge_row_access(&challenge, admin, &solved) {
+        ChallengeRowAccess::Full => None,
+        ChallengeRowAccess::HiddenPreview(preview) => Some(preview),
+        ChallengeRowAccess::NotFound => {
+            return Err(ApiError::not_found("Challenge not found"));
+        }
+        ChallengeRowAccess::PrerequisitesDenied => {
+            return Err(ApiError::forbidden(
+                "Challenge prerequisites are not satisfied",
+            ));
+        }
+    };
+
+    Ok(ChallengeAccessContext {
+        challenge,
+        team_mode,
+        solved,
+        prerequisite_preview,
+    })
+}
+
+pub(super) async fn require_full_challenge_access(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    challenge_id: i32,
+) -> Result<(), ApiError> {
+    let access = challenge_access_context(state, user, challenge_id).await?;
+    require_unanonymized_access(&access)
+}
+
+pub(super) async fn require_full_challenge_access_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    user: Option<&CurrentUser>,
+    challenge_id: i32,
+) -> Result<(), ApiError> {
+    let access = challenge_access_context_on(transaction, user, challenge_id).await?;
+    require_unanonymized_access(&access)
+}
+
+fn require_unanonymized_access(access: &ChallengeAccessContext) -> Result<(), ApiError> {
+    if access.prerequisite_preview.is_some() {
+        Err(ApiError::forbidden(
+            "Challenge prerequisites are not satisfied",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn challenge_row_access(
+    challenge: &ChallengeDetailRow,
+    admin: bool,
+    solved: &HashSet<i32>,
+) -> ChallengeRowAccess {
+    if admin {
+        return ChallengeRowAccess::Full;
+    }
+    if challenge.state != "visible" {
+        return ChallengeRowAccess::NotFound;
+    }
+    if requirements_met(challenge.requirements.as_ref(), solved) {
+        return ChallengeRowAccess::Full;
+    }
+    match challenge
+        .requirements
+        .as_ref()
+        .and_then(|value| value.get("anonymize"))
+    {
+        Some(value) => ChallengeRowAccess::HiddenPreview(value.as_str() == Some("preview")),
+        None => ChallengeRowAccess::PrerequisitesDenied,
+    }
+}
+
+fn team_membership_missing(team_mode: bool, identity: Option<(bool, Option<i32>)>) -> bool {
+    team_mode && identity.is_some_and(|(admin, team_id)| !admin && team_id.is_none())
+}
+
+fn verification_missing(verification_enabled: bool, identity: Option<(bool, bool)>) -> bool {
+    verification_enabled && identity.is_some_and(|(admin, verified)| !admin && !verified)
+}
+
+fn ctf_time_access(now: i64, start: i64, end: i64, view_after_ctf: bool) -> CtfTimeAccess {
+    let in_time = (start == 0 || start < now) && (end == 0 || now < end);
+    if in_time || (end != 0 && now > end && view_after_ctf) {
+        CtfTimeAccess::Allowed
+    } else if start != 0 && now <= start {
+        CtfTimeAccess::NotStarted
+    } else {
+        CtfTimeAccess::Ended
+    }
 }
 
 pub(super) async fn create(
@@ -420,36 +581,24 @@ pub(super) async fn detail(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
-    require_challenge_visibility(&state, user.as_ref()).await?;
-    require_ctf_time(&state, user.as_ref()).await?;
-    require_verified(&state, user.as_ref()).await?;
-    let admin = user.as_ref().is_some_and(CurrentUser::is_admin);
-    let team_mode = is_team_mode(&state).await?;
-    if team_mode
-        && user
-            .as_ref()
-            .is_some_and(|current| !current.is_admin() && current.team_id.is_none())
-    {
-        return Err(ApiError::forbidden("Join a team before viewing challenges"));
-    }
+    Ok(Json(Success::new(detail_data(state, user, challenge_id).await?)).into_response())
+}
 
-    let challenge = challenge_detail_by_id(&state, challenge_id).await?;
-    if !admin && challenge.state != "visible" {
-        return Err(ApiError::not_found("Challenge not found"));
-    }
-    let solved = solved_challenge_ids(&state, user.as_ref(), team_mode).await?;
-    if !requirements_met(challenge.requirements.as_ref(), &solved) && !admin {
-        let anonymize = challenge
-            .requirements
-            .as_ref()
-            .and_then(|value| value.get("anonymize"));
-        if anonymize.is_none() {
-            return Err(ApiError::forbidden(
-                "Challenge prerequisites are not satisfied",
-            ));
-        }
-        let preview = anonymize.and_then(Value::as_str) == Some("preview");
-        return Ok(Json(Success::new(json!({
+pub(super) async fn detail_data(
+    state: AppState,
+    user: Option<CurrentUser>,
+    challenge_id: i32,
+) -> Result<Value, ApiError> {
+    let admin = user.as_ref().is_some_and(CurrentUser::is_admin);
+    let access = challenge_access_context(&state, user.as_ref(), challenge_id).await?;
+    let ChallengeAccessContext {
+        challenge,
+        team_mode,
+        solved,
+        prerequisite_preview,
+    } = access;
+    if let Some(preview) = prerequisite_preview {
+        return Ok(json!({
             "id": challenge.id,
             "type": "hidden",
             "name": if preview { challenge.name } else { Some("???".to_owned()) },
@@ -460,8 +609,7 @@ pub(super) async fn detail(
             "solution_id": Value::Null,
             "category": if preview { challenge.category } else { Some("???".to_owned()) },
             "tags": [],
-        })))
-        .into_response());
+        }));
     }
     if !matches!(
         challenge.challenge_type.as_deref(),
@@ -508,13 +656,40 @@ pub(super) async fn detail(
     } else {
         HashSet::new()
     };
-    let mut hints = sqlx::query_as::<_, HintRenderRow>(
-        "SELECT id,title,cost,content,false AS unlocked FROM ctfzone.hints WHERE challenge_id=$1 ORDER BY cost,id",
+    let (hints_value, files_value, tags_value) = sqlx::query_as::<_, (Value, Value, Value)>(
+        r#"
+        SELECT
+          COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',id,'title',title,'cost',cost,'content',content,'unlocked',false
+            ) ORDER BY cost,id)
+            FROM ctfzone.hints WHERE challenge_id=$1
+          ),'[]'::jsonb),
+          COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',files.id,'object_id',stored_objects.id,
+              'name',stored_objects.original_filename,
+              'content_type',stored_objects.content_type,
+              'size',COALESCE(stored_objects.actual_size,stored_objects.expected_size),
+              'sha256',stored_objects.actual_checksum
+            ) ORDER BY files.id)
+            FROM ctfzone.files
+            JOIN ctfzone.stored_objects ON stored_objects.id=files.object_id
+            WHERE files.type='challenge' AND files.challenge_id=$1
+              AND stored_objects.status='ready'
+          ),'[]'::jsonb),
+          COALESCE((
+            SELECT jsonb_agg(value ORDER BY id)
+            FROM ctfzone.tags WHERE challenge_id=$1 AND value IS NOT NULL
+          ),'[]'::jsonb)
+        "#,
     )
     .bind(challenge.id)
-    .fetch_all(&state.database)
+    .fetch_one(&state.database)
     .await
     .map_err(ApiError::database)?;
+    let mut hints = serde_json::from_value::<Vec<HintRenderRow>>(hints_value)
+        .map_err(|_| ApiError::upstream("Challenge hints are invalid"))?;
     for hint in &mut hints {
         if ended || unlocked_hints.contains(&hint.id) || admin {
             hint.unlocked = true;
@@ -522,22 +697,14 @@ pub(super) async fn detail(
             hint.content = None;
         }
     }
-    let file_rows = sqlx::query_as::<_, FileRenderRow>(
-        "SELECT id,location,sha1sum FROM ctfzone.files WHERE type='challenge' AND challenge_id=$1 ORDER BY id",
-    )
-    .bind(challenge.id)
-    .fetch_all(&state.database)
-    .await
-    .map_err(ApiError::database)?;
+    let file_rows = serde_json::from_value::<Vec<FileRenderRow>>(files_value)
+        .map_err(|_| ApiError::upstream("Challenge files are invalid"))?;
     let files = file_rows
         .into_iter()
-        .filter_map(challenge_file_view)
+        .map(challenge_file_view)
         .collect::<Vec<_>>();
-    let tag_objects = tags_for_challenge(&state, challenge.id).await?;
-    let tags = tag_objects
-        .iter()
-        .filter_map(|tag| tag.get("value").and_then(Value::as_str).map(str::to_owned))
-        .collect::<Vec<_>>();
+    let tags = serde_json::from_value::<Vec<String>>(tags_value)
+        .map_err(|_| ApiError::upstream("Challenge tags are invalid"))?;
 
     let rating_mode = config_string(&state, "challenge_ratings")
         .await?
@@ -621,11 +788,8 @@ pub(super) async fn detail(
         sqlx::query(
             r#"
             INSERT INTO ctfzone.tracking (type,ip,target,user_id,date)
-            SELECT 'challenges.open',$1,$2,$3,timezone('utc',now())
-            WHERE NOT EXISTS (
-                SELECT 1 FROM ctfzone.tracking
-                WHERE type='challenges.open' AND user_id=$3 AND target=$2
-            )
+            VALUES ('challenges.open',$1,$2,$3,timezone('utc',now()))
+            ON CONFLICT DO NOTHING
             "#,
         )
         .bind(current.request_ip())
@@ -636,7 +800,7 @@ pub(super) async fn detail(
         .map_err(ApiError::database)?;
     }
 
-    Ok(Json(Success::new(response)).into_response())
+    Ok(response)
 }
 
 pub(super) async fn update(
@@ -717,6 +881,11 @@ pub(super) async fn update(
         current.requirements
     };
     validate_requirements(requirements.as_ref())?;
+    let team_mode = if dynamic {
+        Some(is_team_mode(&state).await?)
+    } else {
+        None
+    };
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     sqlx::query(
@@ -772,7 +941,12 @@ pub(super) async fn update(
     }
     if dynamic {
         let updated = challenge_attempt_by_id(&mut transaction, challenge_id).await?;
-        recalculate_dynamic_value(&mut transaction, &updated, is_team_mode(&state).await?).await?;
+        recalculate_dynamic_value(
+            &mut transaction,
+            &updated,
+            team_mode.expect("loaded for dynamic challenges"),
+        )
+        .await?;
     }
     transaction.commit().await.map_err(ApiError::database)?;
     let updated = challenge_detail_by_id(&state, challenge_id).await?;
@@ -854,6 +1028,11 @@ pub(super) async fn attempt(
     if submission.is_empty() {
         return Err(ApiError::bad_request("A submission is required"));
     }
+    let incorrect_limit = config_i64(&state, "incorrect_submissions_per_min", 10).await?;
+    let max_behavior = config_string(&state, "max_attempts_behavior")
+        .await?
+        .unwrap_or_else(|| "lockout".to_owned());
+    let max_timeout = config_i64(&state, "max_attempts_timeout", 300).await?;
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     let lock_key = ((i64::from(account.id())) << 32) ^ i64::from(request.challenge_id);
@@ -924,7 +1103,6 @@ pub(super) async fn attempt(
     }
 
     let now = Utc::now().naive_utc();
-    let incorrect_limit = config_i64(&state, "incorrect_submissions_per_min", 10).await?;
     let recent_incorrect = submission_count(
         &mut transaction,
         account,
@@ -944,10 +1122,6 @@ pub(super) async fn attempt(
     let wait_for_minute = seconds_remaining(oldest_recent, now, 60);
 
     let max_attempts = i64::from(challenge.max_attempts.unwrap_or(0));
-    let max_behavior = config_string(&state, "max_attempts_behavior")
-        .await?
-        .unwrap_or_else(|| "lockout".to_owned());
-    let max_timeout = config_i64(&state, "max_attempts_timeout", 300).await?;
     if max_attempts > 0 {
         let since = (max_behavior == "timeout").then_some(now - Duration::seconds(max_timeout));
         let fails = submission_count(
@@ -1093,6 +1267,14 @@ async fn challenge_detail_by_id(
     state: &AppState,
     challenge_id: i32,
 ) -> Result<ChallengeDetailRow, ApiError> {
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    challenge_detail_by_id_on(&mut connection, challenge_id).await
+}
+
+async fn challenge_detail_by_id_on(
+    connection: &mut PgConnection,
+    challenge_id: i32,
+) -> Result<ChallengeDetailRow, ApiError> {
     sqlx::query_as::<_, ChallengeDetailRow>(
         r#"
         SELECT c.id,c.name,c.description,c.attribution,c.connection_info,c.next_id,c.max_attempts,
@@ -1107,7 +1289,7 @@ async fn challenge_detail_by_id(
         "#,
     )
     .bind(challenge_id)
-    .fetch_optional(&state.database)
+    .fetch_optional(&mut *connection)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Challenge not found"))
@@ -1170,28 +1352,15 @@ fn challenge_read_json(challenge: &ChallengeDetailRow) -> Value {
     })
 }
 
-fn challenge_file_view(file: FileRenderRow) -> Option<ChallengeFileView> {
-    let location = file.location?;
-    let name = location.rsplit('/').next()?.to_owned();
-    Some(ChallengeFileView {
+fn challenge_file_view(file: FileRenderRow) -> ChallengeFileView {
+    ChallengeFileView {
         id: file.id,
-        name,
-        url: format!("/files/{}", encode_url_path(&location)),
-        sha1sum: file.sha1sum,
-    })
-}
-
-fn encode_url_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
-        }
+        object_id: file.object_id,
+        name: file.name,
+        content_type: file.content_type,
+        size: file.size,
+        sha256: file.sha256,
     }
-    encoded
 }
 
 async fn solve_count_for_challenge(
@@ -1581,6 +1750,14 @@ async fn recalculate_dynamic_value(
     if function == "static" {
         return Ok(());
     }
+    // Account locks prevent duplicate solves by one account; this lock serializes the dynamic
+    // value transition across different accounts and administrator recalculations.
+    sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
+        .bind(DYNAMIC_SCORE_LOCK_NAMESPACE)
+        .bind(challenge.id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?;
     let initial = challenge.initial.unwrap_or(0);
     let minimum = challenge.minimum.unwrap_or(0);
     let decay = challenge.decay.unwrap_or(1).max(1);
@@ -1618,6 +1795,15 @@ async fn solved_challenge_ids(
     user: Option<&CurrentUser>,
     team_mode: bool,
 ) -> Result<HashSet<i32>, ApiError> {
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    solved_challenge_ids_on(&mut connection, user, team_mode).await
+}
+
+async fn solved_challenge_ids_on(
+    connection: &mut PgConnection,
+    user: Option<&CurrentUser>,
+    team_mode: bool,
+) -> Result<HashSet<i32>, ApiError> {
     let Some(user) = user else {
         return Ok(HashSet::new());
     };
@@ -1632,7 +1818,7 @@ async fn solved_challenge_ids(
     let sql = format!("SELECT challenge_id FROM ctfzone.solves WHERE {column}=$1");
     Ok(sqlx::query_scalar::<_, Option<i32>>(&sql)
         .bind(account_id)
-        .fetch_all(&state.database)
+        .fetch_all(&mut *connection)
         .await
         .map_err(ApiError::database)?
         .into_iter()
@@ -1663,19 +1849,30 @@ async fn solve_counts(
         .collect())
 }
 
-async fn tags_for_challenge(state: &AppState, challenge_id: i32) -> Result<Vec<Value>, ApiError> {
-    let rows = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM ctfzone.tags WHERE challenge_id=$1 ORDER BY id",
+async fn tags_for_challenges(
+    state: &AppState,
+    challenge_ids: &[i32],
+) -> Result<HashMap<i32, Vec<Value>>, ApiError> {
+    if challenge_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (i32, Option<String>)>(
+        "SELECT challenge_id,value FROM ctfzone.tags WHERE challenge_id=ANY($1) ORDER BY challenge_id,id",
     )
-    .bind(challenge_id)
+    .bind(challenge_ids)
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?;
-    Ok(rows
-        .into_iter()
-        .flatten()
-        .map(|value| json!({"value": value}))
-        .collect())
+    let mut grouped = HashMap::<i32, Vec<Value>>::new();
+    for (challenge_id, value) in rows {
+        if let Some(value) = value {
+            grouped
+                .entry(challenge_id)
+                .or_default()
+                .push(json!({"value": value}));
+        }
+    }
+    Ok(grouped)
 }
 
 fn requirements_met(requirements: Option<&Value>, solved: &HashSet<i32>) -> bool {
@@ -1779,7 +1976,15 @@ pub(super) async fn require_challenge_visibility(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> Result<(), ApiError> {
-    match config_string(state, "challenge_visibility")
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    require_challenge_visibility_on(&mut connection, user).await
+}
+
+async fn require_challenge_visibility_on(
+    connection: &mut PgConnection,
+    user: Option<&CurrentUser>,
+) -> Result<(), ApiError> {
+    match config_string_on(connection, "challenge_visibility")
         .await?
         .as_deref()
         .unwrap_or("private")
@@ -1795,19 +2000,26 @@ pub(super) async fn require_ctf_time(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> Result<(), ApiError> {
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    require_ctf_time_on(&mut connection, user).await
+}
+
+async fn require_ctf_time_on(
+    connection: &mut PgConnection,
+    user: Option<&CurrentUser>,
+) -> Result<(), ApiError> {
     if user.is_some_and(CurrentUser::is_admin) {
         return Ok(());
     }
     let now = Utc::now().timestamp();
-    let start = config_i64(state, "start", 0).await?;
-    let end = config_i64(state, "end", 0).await?;
-    let in_time = (start == 0 || start < now) && (end == 0 || now < end);
-    if in_time || (end != 0 && now > end && config_bool(state, "view_after_ctf", false).await?) {
-        Ok(())
-    } else if start != 0 && now <= start {
-        Err(ApiError::forbidden("CTFZone has not started yet"))
-    } else {
-        Err(ApiError::forbidden("CTFZone has ended"))
+    let start = config_i64_on(connection, "start", 0).await?;
+    let end = config_i64_on(connection, "end", 0).await?;
+    let view_after_ctf =
+        end != 0 && now > end && config_bool_on(connection, "view_after_ctf", false).await?;
+    match ctf_time_access(now, start, end, view_after_ctf) {
+        CtfTimeAccess::Allowed => Ok(()),
+        CtfTimeAccess::NotStarted => Err(ApiError::forbidden("CTFZone has not started yet")),
+        CtfTimeAccess::Ended => Err(ApiError::forbidden("CTFZone has ended")),
     }
 }
 
@@ -1815,9 +2027,19 @@ pub(super) async fn require_verified(
     state: &AppState,
     user: Option<&CurrentUser>,
 ) -> Result<(), ApiError> {
-    if config_bool(state, "verify_emails", false).await?
-        && user.is_some_and(|user| !user.is_admin() && !user.verified)
-    {
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    require_verified_on(&mut connection, user).await
+}
+
+async fn require_verified_on(
+    connection: &mut PgConnection,
+    user: Option<&CurrentUser>,
+) -> Result<(), ApiError> {
+    let verification_enabled = config_bool_on(connection, "verify_emails", false).await?;
+    if verification_missing(
+        verification_enabled,
+        user.map(|user| (user.is_admin(), user.verified)),
+    ) {
         Err(ApiError::forbidden(
             "Verify your email before viewing challenges",
         ))
@@ -1857,13 +2079,30 @@ async fn visibility_value(
 }
 
 pub(super) async fn is_team_mode(state: &AppState) -> Result<bool, ApiError> {
-    Ok(config_string(state, "user_mode").await?.as_deref() == Some("teams"))
+    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
+    is_team_mode_on(&mut connection).await
+}
+
+async fn is_team_mode_on(connection: &mut PgConnection) -> Result<bool, ApiError> {
+    Ok(config_string_on(connection, "user_mode").await?.as_deref() == Some("teams"))
 }
 
 async fn config_string(state: &AppState, key: &str) -> Result<Option<String>, ApiError> {
     sqlx::query_scalar::<_, Option<String>>("SELECT value FROM ctfzone.config WHERE key=$1 LIMIT 1")
         .bind(key)
         .fetch_optional(&state.database)
+        .await
+        .map_err(ApiError::database)
+        .map(Option::flatten)
+}
+
+async fn config_string_on(
+    connection: &mut PgConnection,
+    key: &str,
+) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT value FROM ctfzone.config WHERE key=$1 LIMIT 1")
+        .bind(key)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(ApiError::database)
         .map(Option::flatten)
@@ -1881,8 +2120,38 @@ async fn config_bool(state: &AppState, key: &str, default: bool) -> Result<bool,
         .unwrap_or(default))
 }
 
+async fn config_bool_on(
+    connection: &mut PgConnection,
+    key: &str,
+    default: bool,
+) -> Result<bool, ApiError> {
+    Ok(config_string_on(connection, key)
+        .await?
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default))
+}
+
 async fn config_i64(state: &AppState, key: &str, default: i64) -> Result<i64, ApiError> {
     let value = config_string(state, key).await?;
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(default);
+    };
+    value
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request(format!("Configuration {key} must be an integer")))
+}
+
+async fn config_i64_on(
+    connection: &mut PgConnection,
+    key: &str,
+    default: i64,
+) -> Result<i64, ApiError> {
+    let value = config_string_on(connection, key).await?;
     let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
         return Ok(default);
     };
@@ -1921,10 +2190,71 @@ mod tests {
     }
 
     #[test]
-    fn encodes_file_locations_as_url_paths() {
+    fn full_access_rejects_hidden_locked_and_unsatisfied_challenges() {
+        let solved = HashSet::from([1]);
+        let mut challenge = access_test_challenge("hidden", None);
         assert_eq!(
-            encode_url_path("challenge files/payload #1.zip"),
-            "challenge%20files/payload%20%231.zip"
+            challenge_row_access(&challenge, false, &solved),
+            ChallengeRowAccess::NotFound
         );
+        challenge.state = "locked".to_owned();
+        assert_eq!(
+            challenge_row_access(&challenge, false, &solved),
+            ChallengeRowAccess::NotFound
+        );
+        challenge.state = "visible".to_owned();
+        challenge.requirements = Some(json!({"prerequisites": [2]}));
+        assert_eq!(
+            challenge_row_access(&challenge, false, &solved),
+            ChallengeRowAccess::PrerequisitesDenied
+        );
+        challenge.requirements = Some(json!({"prerequisites": [2], "anonymize": "preview"}));
+        assert_eq!(
+            challenge_row_access(&challenge, false, &solved),
+            ChallengeRowAccess::HiddenPreview(true)
+        );
+        assert_eq!(
+            challenge_row_access(&challenge, true, &solved),
+            ChallengeRowAccess::Full
+        );
+    }
+
+    #[test]
+    fn full_access_rejects_unverified_teamless_and_prestart_users() {
+        assert!(verification_missing(true, Some((false, false))));
+        assert!(!verification_missing(true, Some((true, false))));
+        assert!(!verification_missing(false, Some((false, false))));
+        assert!(team_membership_missing(true, Some((false, None))));
+        assert!(!team_membership_missing(true, Some((true, None))));
+        assert!(!team_membership_missing(false, Some((false, None))));
+        assert_eq!(
+            ctf_time_access(100, 101, 0, false),
+            CtfTimeAccess::NotStarted
+        );
+        assert_eq!(ctf_time_access(100, 0, 99, false), CtfTimeAccess::Ended);
+        assert_eq!(ctf_time_access(100, 0, 99, true), CtfTimeAccess::Allowed);
+    }
+
+    fn access_test_challenge(state: &str, requirements: Option<Value>) -> ChallengeDetailRow {
+        ChallengeDetailRow {
+            id: 1,
+            name: Some("test".to_owned()),
+            description: None,
+            attribution: None,
+            connection_info: None,
+            next_id: None,
+            max_attempts: None,
+            value: Some(100),
+            category: Some("test".to_owned()),
+            challenge_type: Some("standard".to_owned()),
+            state: state.to_owned(),
+            logic: "any".to_owned(),
+            initial: None,
+            minimum: None,
+            decay: None,
+            position: 0,
+            function: Some("static".to_owned()),
+            requirements,
+        }
     }
 }

@@ -14,6 +14,7 @@ pub(crate) struct RateLimiter {
 struct Window {
     started: Instant,
     count: u32,
+    interval: Duration,
 }
 
 impl RateLimiter {
@@ -26,15 +27,17 @@ impl RateLimiter {
     ) -> bool {
         let now = Instant::now();
         let mut windows = self.windows.lock().await;
-        windows.retain(|_, window| now.duration_since(window.started) < interval);
+        windows.retain(|_, window| now.duration_since(window.started) < window.interval);
         let key = format!("{operation}:{subject}");
         let window = windows.entry(key).or_insert(Window {
             started: now,
             count: 0,
+            interval,
         });
-        if now.duration_since(window.started) >= interval {
+        if window.interval != interval || now.duration_since(window.started) >= window.interval {
             window.started = now;
             window.count = 0;
+            window.interval = interval;
         }
         if window.count >= limit {
             return false;
@@ -56,5 +59,25 @@ mod tests {
         assert!(!limiter.allow("login", "one", 1, interval).await);
         assert!(limiter.allow("register", "one", 1, interval).await);
         assert!(limiter.allow("login", "two", 1, interval).await);
+    }
+
+    #[tokio::test]
+    async fn short_windows_do_not_erase_longer_windows() {
+        let limiter = RateLimiter::default();
+        assert!(
+            limiter
+                .allow("verification", "one", 1, Duration::from_secs(60))
+                .await
+        );
+        assert!(
+            limiter
+                .allow("login", "one", 1, Duration::from_secs(5))
+                .await
+        );
+        assert!(
+            !limiter
+                .allow("verification", "one", 1, Duration::from_secs(60))
+                .await
+        );
     }
 }

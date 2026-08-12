@@ -16,6 +16,8 @@ use crate::{
     routes::Success,
 };
 
+const CONTENT_UNLOCK_LOCK_NAMESPACE: i32 = 0x554E_4C4B;
+
 #[derive(Deserialize, Default)]
 pub(super) struct PageQuery {
     page: Option<i64>,
@@ -167,6 +169,7 @@ pub(super) async fn challenge_solves(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
+    super::challenges::require_full_challenge_access(&state, user.as_ref(), challenge_id).await?;
     if !super::challenges::scores_and_accounts_visible(&state, user.as_ref()).await? {
         return Err(ApiError::forbidden("Solve information is not available"));
     }
@@ -202,16 +205,32 @@ pub(super) async fn challenge_files(
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let data = sqlx::query_as::<_, (i32, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id,type,location,sha1sum FROM ctfzone.files WHERE challenge_id=$1 ORDER BY id",
+    let data = sqlx::query_as::<
+        _,
+        (
+            i32,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<uuid::Uuid>,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT files.id,files.type,files.location,files.sha1sum,files.object_id,
+               stored_objects.status
+        FROM ctfzone.files
+        LEFT JOIN ctfzone.stored_objects ON stored_objects.id=files.object_id
+        WHERE files.challenge_id=$1 ORDER BY files.id
+        "#,
     )
     .bind(challenge_id)
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?
     .into_iter()
-    .map(|(id, file_type, location, sha1sum)| {
-        json!({"id": id, "type": file_type, "location": location, "sha1sum": sha1sum, "challenge_id": challenge_id})
+    .map(|(id, file_type, location, sha1sum, object_id, status)| {
+        json!({"id": id, "type": file_type, "location": location, "sha1sum": sha1sum, "object_id": object_id, "status": status, "challenge_id": challenge_id})
     })
     .collect::<Vec<_>>();
     Ok(Json(Success::new(data)).into_response())
@@ -342,9 +361,7 @@ pub(super) async fn rate_challenge(
     Path(challenge_id): Path<i32>,
     Json(request): Json<RatingInput>,
 ) -> Result<Response, ApiError> {
-    super::challenges::require_challenge_visibility(&state, Some(&user)).await?;
-    super::challenges::require_ctf_time(&state, Some(&user)).await?;
-    super::challenges::require_verified(&state, Some(&user)).await?;
+    super::challenges::require_full_challenge_access(&state, Some(&user), challenge_id).await?;
     if !matches!(request.value, -1 | 1) || request.review.len() > 2000 {
         return Err(ApiError::bad_request("Invalid rating value or review"));
     }
@@ -381,6 +398,7 @@ pub(super) async fn challenge_solution(
     user: CurrentUser,
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
+    super::challenges::require_full_challenge_access(&state, Some(&user), challenge_id).await?;
     let solution = sqlx::query_as::<_, (i32, String)>(
         "SELECT id,state FROM ctfzone.solutions WHERE challenge_id=$1",
     )
@@ -421,9 +439,11 @@ pub(super) async fn get_hint(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Path(hint_id): Path<i32>,
 ) -> Result<Response, ApiError> {
-    super::challenges::require_challenge_visibility(&state, user.as_ref()).await?;
-    super::challenges::require_ctf_time(&state, user.as_ref()).await?;
     let mut hint = load_hint(&state, hint_id).await?;
+    let challenge_id = hint
+        .challenge_id
+        .ok_or_else(|| ApiError::not_found("Hint not found"))?;
+    super::challenges::require_full_challenge_access(&state, user.as_ref(), challenge_id).await?;
     let unlocked = if user.as_ref().is_some_and(CurrentUser::is_admin) {
         true
     } else if let Some(user) = user.as_ref() {
@@ -528,16 +548,16 @@ pub(super) async fn get_solution(
     Path(solution_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     let solution = load_solution(&state, solution_id).await?;
-    if !user.is_admin() {
-        let challenge_id = solution
-            .challenge_id
-            .ok_or_else(|| ApiError::not_found("Solution not found"))?;
-        if solution.state == "hidden"
+    let challenge_id = solution
+        .challenge_id
+        .ok_or_else(|| ApiError::not_found("Solution not found"))?;
+    super::challenges::require_full_challenge_access(&state, Some(&user), challenge_id).await?;
+    if !user.is_admin()
+        && (solution.state == "hidden"
             || (solution.state == "solved"
-                && !user_solved_challenge(&state, &user, challenge_id).await?)
-        {
-            return Err(ApiError::not_found("Solution not found"));
-        }
+                && !user_solved_challenge(&state, &user, challenge_id).await?))
+    {
+        return Err(ApiError::not_found("Solution not found"));
     }
     let mut data = serde_json::to_value(solution).expect("solution is serializable");
     data["content_format"] = json!("markdown");
@@ -577,21 +597,29 @@ pub(super) async fn update_solution(
     if let Some(solution_state) = request.state.as_deref() {
         validate_solution_state(solution_state)?;
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let current_challenge_id = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT challenge_id FROM ctfzone.solutions WHERE id=$1 FOR UPDATE",
+    )
+    .bind(solution_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Solution not found"))?;
+    validate_solution_parent_patch(current_challenge_id, request.challenge_id)?;
     let solution = sqlx::query_as::<_, SolutionView>(
         r#"
-        UPDATE ctfzone.solutions SET challenge_id=COALESCE($1,challenge_id),
-            content=COALESCE($2,content),state=COALESCE($3,state)
-        WHERE id=$4 RETURNING id,challenge_id,content,state
+        UPDATE ctfzone.solutions SET content=COALESCE($1,content),state=COALESCE($2,state)
+        WHERE id=$3 RETURNING id,challenge_id,content,state
         "#,
     )
-    .bind(request.challenge_id)
     .bind(request.content)
     .bind(request.state)
     .bind(solution_id)
-    .fetch_optional(&state.database)
+    .fetch_one(&mut *transaction)
     .await
-    .map_err(map_content_database_error)?
-    .ok_or_else(|| ApiError::not_found("Solution not found"))?;
+    .map_err(map_content_database_error)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(solution)).into_response())
 }
 
@@ -636,6 +664,43 @@ pub(super) async fn unlock(
         user.id
     };
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    // Serialize all purchases for an account so concurrent different hints cannot overspend.
+    sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
+        .bind(CONTENT_UNLOCK_LOCK_NAMESPACE)
+        .bind(if team_mode { -account_id } else { account_id })
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    let (challenge_id, hint_details) = if request.target_type == "hints" {
+        let (challenge_id, title, cost) =
+            sqlx::query_as::<_, (Option<i32>, Option<String>, Option<i32>)>(
+                "SELECT challenge_id,title,cost FROM ctfzone.hints WHERE id=$1",
+            )
+            .bind(request.target)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("Hint not found"))?;
+        let challenge_id = challenge_id.ok_or_else(|| ApiError::not_found("Hint not found"))?;
+        (challenge_id, Some((title, cost)))
+    } else {
+        let challenge_id = sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT challenge_id FROM ctfzone.solutions WHERE id=$1",
+        )
+        .bind(request.target)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Solution not found"))?;
+        (challenge_id, None)
+    };
+    super::challenges::require_full_challenge_access_in_transaction(
+        &mut transaction,
+        Some(&user),
+        challenge_id,
+    )
+    .await?;
     let existing = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS(SELECT 1 FROM ctfzone.unlocks
@@ -655,16 +720,10 @@ pub(super) async fn unlock(
         return Err(ApiError::conflict("This content is already unlocked"));
     }
     let cost = if request.target_type == "hints" {
-        let hint = sqlx::query_as::<_, (i32, Option<String>, Option<i32>)>(
-            "SELECT challenge_id,title,cost FROM ctfzone.hints WHERE id=$1",
-        )
-        .bind(request.target)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::not_found("Hint not found"))?;
+        let (title, configured_cost) =
+            hint_details.expect("hint details are loaded for hint unlocks");
         let score = account_score(&mut transaction, team_mode, account_id).await?;
-        let cost = hint.2.unwrap_or(0);
+        let cost = configured_cost.unwrap_or(0);
         if score < i64::from(cost) {
             return Err(ApiError::bad_request(
                 "You do not have enough points to unlock this hint",
@@ -680,8 +739,8 @@ pub(super) async fn unlock(
             )
             .bind(user.id)
             .bind(user.team_id)
-            .bind(hint.1.unwrap_or_else(|| format!("Hint {}", request.target)))
-            .bind(format!("Hint for challenge {}", hint.0))
+            .bind(title.unwrap_or_else(|| format!("Hint {}", request.target)))
+            .bind(format!("Hint for challenge {challenge_id}"))
             .bind(-cost)
             .execute(&mut *transaction)
             .await
@@ -689,22 +748,13 @@ pub(super) async fn unlock(
         }
         cost
     } else {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM ctfzone.solutions WHERE id=$1)",
-        )
-        .bind(request.target)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?;
-        if !exists {
-            return Err(ApiError::not_found("Solution not found"));
-        }
         0
     };
     let unlock = sqlx::query_as::<_, UnlockView>(
         r#"
         INSERT INTO ctfzone.unlocks (user_id,team_id,target,date,type)
         VALUES ($1,$2,$3,timezone('utc',now()),$4)
+        ON CONFLICT DO NOTHING
         RETURNING id,user_id,team_id,target,date,type AS unlock_type
         "#,
     )
@@ -712,9 +762,10 @@ pub(super) async fn unlock(
     .bind(user.team_id)
     .bind(request.target)
     .bind(request.target_type)
-    .fetch_one(&mut *transaction)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(ApiError::database)?;
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::conflict("This content is already unlocked"))?;
     transaction.commit().await.map_err(ApiError::database)?;
     let mut data = serde_json::to_value(unlock).expect("unlock is serializable");
     data["cost"] = json!(cost);
@@ -987,6 +1038,19 @@ fn validate_solution_state(state: &str) -> Result<(), ApiError> {
     }
 }
 
+fn validate_solution_parent_patch(
+    current_challenge_id: Option<i32>,
+    requested_challenge_id: Option<i32>,
+) -> Result<(), ApiError> {
+    if requested_challenge_id.is_some() && requested_challenge_id != current_challenge_id {
+        Err(ApiError::conflict(
+            "A solution cannot be moved to another challenge after creation",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 async fn delete_by_id(state: &AppState, table: &str, id: i32) -> Result<Response, ApiError> {
     let allowed = ["hints", "solutions", "notifications"];
     if !allowed.contains(&table) {
@@ -1017,5 +1081,18 @@ fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
         Ok(())
     } else {
         Err(ApiError::forbidden("Administrator access is required"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solution_parent_is_immutable_after_creation() {
+        assert!(validate_solution_parent_patch(Some(7), None).is_ok());
+        assert!(validate_solution_parent_patch(Some(7), Some(7)).is_ok());
+        assert!(validate_solution_parent_patch(Some(7), Some(8)).is_err());
+        assert!(validate_solution_parent_patch(None, Some(7)).is_err());
     }
 }

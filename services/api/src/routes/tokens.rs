@@ -56,7 +56,7 @@ pub(super) async fn list_tokens(
         r#"
         SELECT id, type AS token_type, expiration
         FROM ctfzone.tokens
-        WHERE user_id = $1
+        WHERE user_id = $1 AND type = 'user'
         ORDER BY id
         "#,
     )
@@ -162,6 +162,7 @@ async fn find_visible_token(
             value
         FROM ctfzone.tokens
         WHERE id = $1
+          AND type = 'user'
           AND ($2 OR user_id = $3)
         "#,
     )

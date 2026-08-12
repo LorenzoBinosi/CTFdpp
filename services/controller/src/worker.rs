@@ -4,10 +4,13 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{
-    FromRow, PgPool, Postgres, Transaction,
+    Connection, FromRow, PgConnection, PgPool, Postgres, Transaction,
     postgres::{PgListener, PgPoolOptions},
 };
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::{
+    sync::watch,
+    time::{Instant, sleep_until},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -21,10 +24,12 @@ use crate::{
 const COMMAND_CHANNEL: &str = "ctfzone_runtime_commands";
 const SETTINGS_CHANNEL: &str = "ctfzone_settings_changed";
 const CHALLENGE_CHANNEL: &str = "ctfzone_challenge_runtime_changed";
+const ACTIVE_INSPECTION_BATCH_SIZE: i64 = 64;
 
 #[derive(Debug, FromRow)]
 struct CommandRow {
     id: Uuid,
+    claim_token: Uuid,
     instance_id: Uuid,
     kind: String,
     generation: i64,
@@ -68,18 +73,29 @@ struct RuntimeGate {
     runtime_revision: i64,
 }
 
-pub(crate) async fn run(config: Config, status: SharedStatus, journal: Arc<OperationJournal>) {
+pub(crate) async fn run(
+    config: Config,
+    status: SharedStatus,
+    journal: Arc<OperationJournal>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let remote = RemoteExecutor::new(&config);
     let mut reconnect_delay = StdDuration::from_secs(2);
     loop {
-        let pool = match PgPoolOptions::new()
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let connection = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(StdDuration::from_secs(5))
-            .connect(&config.database_url)
-            .await
-        {
-            Ok(pool) => pool,
-            Err(connection_error) => {
+            .connect(&config.database_url);
+        let pool = match tokio::select! {
+            result = connection => Some(result),
+            () = wait_for_shutdown(&mut shutdown) => None,
+        } {
+            None => return Ok(()),
+            Some(Ok(pool)) => pool,
+            Some(Err(connection_error)) => {
                 status
                     .database_disconnected(connection_error.to_string())
                     .await;
@@ -87,7 +103,9 @@ pub(crate) async fn run(config: Config, status: SharedStatus, journal: Arc<Opera
                 {
                     error!(%journal_error, "degraded journal recovery failed");
                 }
-                sleep(reconnect_delay).await;
+                if sleep_or_shutdown(reconnect_delay, &mut shutdown).await {
+                    return Ok(());
+                }
                 reconnect_delay = min(reconnect_delay * 2, StdDuration::from_secs(60));
                 continue;
             }
@@ -95,8 +113,8 @@ pub(crate) async fn run(config: Config, status: SharedStatus, journal: Arc<Opera
         reconnect_delay = StdDuration::from_secs(2);
         status.database_connected().await;
 
-        match connected_session(&config, &pool, &status, &journal, &remote).await {
-            Ok(()) => return,
+        match connected_session(&config, &pool, &status, &journal, &remote, &mut shutdown).await {
+            Ok(()) => return Ok(()),
             Err(session_error) => {
                 warn!(%session_error, "controller database session ended; reconnecting");
                 status
@@ -107,7 +125,9 @@ pub(crate) async fn run(config: Config, status: SharedStatus, journal: Arc<Opera
                 {
                     error!(%journal_error, "degraded journal recovery failed");
                 }
-                sleep(reconnect_delay).await;
+                if sleep_or_shutdown(reconnect_delay, &mut shutdown).await {
+                    return Ok(());
+                }
             }
         }
     }
@@ -119,9 +139,21 @@ async fn connected_session(
     status: &SharedStatus,
     journal: &OperationJournal,
     remote: &RemoteExecutor,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     require_schema(pool).await?;
-    recover_stale_claims(pool, config.stale_claim_after).await?;
+    let mut leadership_connection = PgConnection::connect(&config.database_url)
+        .await
+        .context("failed to acquire controller leadership connection")?;
+    let leadership =
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended('ctfzone-controller-v1',0))")
+            .execute(&mut leadership_connection);
+    tokio::select! {
+        result = leadership => {
+            result.context("failed to acquire singleton controller lease")?;
+        }
+        () = wait_for_shutdown(shutdown) => return Ok(()),
+    }
 
     let mut listener = PgListener::connect(&config.database_url)
         .await
@@ -130,20 +162,55 @@ async fn connected_session(
     listener.listen(SETTINGS_CHANNEL).await?;
     listener.listen(CHALLENGE_CHANNEL).await?;
 
-    enqueue_policy_terminations(pool).await?;
-    enqueue_overdue_terminations(pool).await?;
-    process_available_commands(pool, config, journal, remote).await?;
+    recover_all_claims_on_startup(pool).await?;
+    journal.reconcile_database_acknowledgements(pool).await?;
+    enqueue_policy_terminations(pool, config.reconciliation_interval).await?;
+    enqueue_overdue_terminations(pool, config.reconciliation_interval).await?;
+    enqueue_active_inspections(pool, None).await?;
+    process_available_commands(
+        pool,
+        config,
+        journal,
+        remote,
+        &mut leadership_connection,
+        shutdown,
+    )
+    .await?;
+    journal.reconcile_database_acknowledgements(pool).await?;
     status.reconciled().await;
     refresh_mode(pool, status).await?;
     info!("controller startup reconciliation completed");
 
     loop {
-        enqueue_policy_terminations(pool).await?;
-        enqueue_overdue_terminations(pool).await?;
-        process_available_commands(pool, config, journal, remote).await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        sqlx::query("SELECT 1")
+            .execute(&mut leadership_connection)
+            .await
+            .context("controller singleton lease connection was lost")?;
+        recover_stale_claims(pool, config.stale_claim_after).await?;
+        enqueue_policy_terminations(pool, config.reconciliation_interval).await?;
+        enqueue_overdue_terminations(pool, config.reconciliation_interval).await?;
+        enqueue_active_inspections(pool, Some(config.reconciliation_interval)).await?;
+        process_available_commands(
+            pool,
+            config,
+            journal,
+            remote,
+            &mut leadership_connection,
+            shutdown,
+        )
+        .await?;
+        journal.reconcile_database_acknowledgements(pool).await?;
         refresh_mode(pool, status).await?;
 
-        let delay = next_wake_delay(pool, config.reconciliation_interval).await?;
+        let delay = next_wake_delay(
+            pool,
+            config.reconciliation_interval,
+            config.stale_claim_after,
+        )
+        .await?;
         let deadline = Instant::now() + delay;
         tokio::select! {
             notification = listener.recv() => {
@@ -154,6 +221,7 @@ async fn connected_session(
                 info!(waited_seconds = delay.as_secs(), "controller woke for deadline/reconciliation work");
                 status.reconciled().await;
             }
+            () = wait_for_shutdown(shutdown) => return Ok(()),
         }
     }
 }
@@ -174,7 +242,7 @@ async fn recover_stale_claims(pool: &PgPool, stale_after: StdDuration) -> Result
     let result = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_commands
-        SET status='pending', claimed_at=NULL,
+        SET status='pending', claimed_at=NULL, claim_token=NULL,
             available_at=now(), last_error='controller claim recovered after restart'
         WHERE status='claimed'
           AND claimed_at < now() - make_interval(secs => $1::double precision)
@@ -187,6 +255,26 @@ async fn recover_stale_claims(pool: &PgPool, stale_after: StdDuration) -> Result
         warn!(
             count = result.rows_affected(),
             "recovered abandoned controller commands"
+        );
+    }
+    Ok(())
+}
+
+async fn recover_all_claims_on_startup(pool: &PgPool) -> Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_commands
+        SET status='pending', claimed_at=NULL, claim_token=NULL, available_at=now(),
+            last_error='controller claim recovered during single-controller startup'
+        WHERE status='claimed'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        warn!(
+            count = result.rows_affected(),
+            "recovered controller claims during startup"
         );
     }
     Ok(())
@@ -215,15 +303,17 @@ async fn refresh_mode(pool: &PgPool, status: &SharedStatus) -> Result<()> {
     Ok(())
 }
 
-async fn enqueue_policy_terminations(pool: &PgPool) -> Result<()> {
-    let ids = sqlx::query_scalar::<_, Uuid>(
+async fn enqueue_policy_terminations(pool: &PgPool, safety_retry_after: StdDuration) -> Result<()> {
+    let safety_retry_seconds = duration_seconds(safety_retry_after);
+    let candidates = sqlx::query_as::<_, (Uuid, String)>(
         r#"
-        SELECT i.id
+        SELECT i.id,i.desired_state
         FROM ctfzone.runtime_instances i
         LEFT JOIN ctfzone.challenge_runtime_configs r ON r.challenge_id=i.challenge_id
         WHERE i.active
           AND (
-              NOT COALESCE((SELECT enabled FROM ctfzone.runtime_settings WHERE key='private_challenges'),false)
+              i.desired_state='stopped'
+              OR NOT COALESCE((SELECT enabled FROM ctfzone.runtime_settings WHERE key='private_challenges'),false)
               OR NOT COALESCE(r.enabled,false)
               OR COALESCE(r.runtime_mode,'static') <> 'managed'
           )
@@ -231,18 +321,33 @@ async fn enqueue_policy_terminations(pool: &PgPool) -> Result<()> {
               SELECT 1 FROM ctfzone.runtime_commands c
               WHERE c.instance_id=i.id AND c.kind='terminate' AND c.status IN ('pending','claimed')
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM ctfzone.runtime_commands c
+              WHERE c.instance_id=i.id AND c.kind='terminate' AND c.status='failed'
+                AND c.completed_at > now() - make_interval(secs => $1::double precision)
+          )
         ORDER BY i.created_at
         "#,
     )
+    .bind(safety_retry_seconds as f64)
     .fetch_all(pool)
     .await?;
-    for id in ids {
-        create_termination_command(pool, id, "runtime_policy_disabled").await?;
+    for (id, desired_state) in candidates {
+        let reason = if desired_state == "stopped" {
+            "cleanup_safety_retry"
+        } else {
+            "runtime_policy_disabled"
+        };
+        create_termination_command(pool, id, reason).await?;
     }
     Ok(())
 }
 
-async fn enqueue_overdue_terminations(pool: &PgPool) -> Result<()> {
+async fn enqueue_overdue_terminations(
+    pool: &PgPool,
+    safety_retry_after: StdDuration,
+) -> Result<()> {
+    let safety_retry_seconds = duration_seconds(safety_retry_after);
     let ids = sqlx::query_scalar::<_, Uuid>(
         r#"
         SELECT i.id FROM ctfzone.runtime_instances i
@@ -251,9 +356,15 @@ async fn enqueue_overdue_terminations(pool: &PgPool) -> Result<()> {
               SELECT 1 FROM ctfzone.runtime_commands c
               WHERE c.instance_id=i.id AND c.kind='terminate' AND c.status IN ('pending','claimed')
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM ctfzone.runtime_commands c
+              WHERE c.instance_id=i.id AND c.kind='terminate' AND c.status='failed'
+                AND c.completed_at > now() - make_interval(secs => $1::double precision)
+          )
         ORDER BY i.expires_at
         "#,
     )
+    .bind(safety_retry_seconds as f64)
     .fetch_all(pool)
     .await?;
     for id in ids {
@@ -262,8 +373,72 @@ async fn enqueue_overdue_terminations(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+async fn enqueue_active_inspections(pool: &PgPool, minimum_age: Option<StdDuration>) -> Result<()> {
+    let minimum_age_seconds = minimum_age.map(duration_seconds).map(|value| value as f64);
+    let command_ids = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        WITH candidates AS (
+            SELECT i.id,i.generation,i.private_challenges_revision,
+                   i.challenge_runtime_revision
+            FROM ctfzone.runtime_instances i
+            WHERE i.active
+              AND i.desired_state='running'
+              AND i.expires_at > now()
+              AND i.remote_server_id IS NOT NULL
+              AND i.observed_state IN ('ready','starting','unknown')
+              AND (
+                  $1::double precision IS NULL
+                  OR COALESCE(i.last_observed_at,i.created_at)
+                     <= now() - make_interval(secs => $1::double precision)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM ctfzone.runtime_commands c
+                  WHERE c.instance_id=i.id AND c.status IN ('pending','claimed')
+              )
+            ORDER BY i.last_observed_at NULLS FIRST,i.created_at,i.id
+            LIMIT $2
+        )
+        INSERT INTO ctfzone.runtime_commands (
+            instance_id,kind,generation,setting_revision,
+            challenge_runtime_revision,payload,status,requested_by_user_id
+        )
+        SELECT id,'inspect',generation,private_challenges_revision,
+               challenge_runtime_revision,'{}'::jsonb,'pending',NULL
+        FROM candidates
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(minimum_age_seconds)
+    .bind(ACTIVE_INSPECTION_BATCH_SIZE)
+    .fetch_all(pool)
+    .await?;
+    if !command_ids.is_empty() {
+        info!(
+            count = command_ids.len(),
+            startup = minimum_age.is_none(),
+            "queued bounded active-instance inspections"
+        );
+    }
+    Ok(())
+}
+
 async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &str) -> Result<()> {
     let mut transaction = pool.begin().await?;
+    let queued =
+        create_termination_command_in_transaction(&mut transaction, instance_id, reason).await?;
+    transaction.commit().await?;
+    if let Some((command_id, owner_user_id)) = queued {
+        info!(%instance_id, %command_id, %reason, owner_user_id, "queued controller safety termination");
+    }
+    Ok(())
+}
+
+async fn create_termination_command_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    instance_id: Uuid,
+    reason: &str,
+) -> Result<Option<(Uuid, i32)>> {
     let row = sqlx::query_as::<_, OverdueRow>(
         r#"
         SELECT id,generation,private_challenges_revision,
@@ -274,11 +449,10 @@ async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &s
         "#,
     )
     .bind(instance_id)
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
     let Some(row) = row else {
-        transaction.commit().await?;
-        return Ok(());
+        return Ok(None);
     };
     let already_queued = sqlx::query_scalar::<_, bool>(
         r#"
@@ -289,11 +463,10 @@ async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &s
         "#,
     )
     .bind(instance_id)
-    .fetch_one(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await?;
     if already_queued {
-        transaction.commit().await?;
-        return Ok(());
+        return Ok(None);
     }
     let generation = row.generation + 1;
     sqlx::query(
@@ -301,7 +474,7 @@ async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &s
     )
     .bind(generation)
     .bind(instance_id)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
     let command_id = sqlx::query_scalar::<_, Uuid>(
         r#"
@@ -318,11 +491,11 @@ async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &s
     .bind(row.private_challenges_revision)
     .bind(row.challenge_runtime_revision)
     .bind(json!({"reason": reason, "deadline": row.expires_at}))
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
     if let Some(command_id) = command_id {
         append_event(
-            &mut transaction,
+            transaction,
             row.id,
             "instance.termination_requested",
             "controller",
@@ -333,12 +506,11 @@ async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &s
         sqlx::query("SELECT pg_notify($1,$2)")
             .bind(COMMAND_CHANNEL)
             .bind(command_id.to_string())
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
-        info!(%instance_id, %command_id, %reason, owner_user_id = row.owner_user_id, "queued controller safety termination");
+        return Ok(Some((command_id, row.owner_user_id)));
     }
-    transaction.commit().await?;
-    Ok(())
+    Ok(None)
 }
 
 async fn process_available_commands(
@@ -346,8 +518,25 @@ async fn process_available_commands(
     config: &Config,
     journal: &OperationJournal,
     remote: &RemoteExecutor,
+    leadership_connection: &mut PgConnection,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<()> {
-    while let Some(command) = claim_command(pool).await? {
+    // Deliberate v1 concurrency bound: one in-flight runtime command globally.
+    // Together with the singleton PostgreSQL lease, this preserves per-instance
+    // ordering and makes select_remote_server -> mark_starting an atomic logical
+    // reservation. Do not add parallelism until placement reservations are a
+    // first-class row/constraint and per-instance ordering remains serialized.
+    while !*shutdown.borrow() {
+        // The advisory lock is bound to this dedicated connection. Check it
+        // before every claim so a worker whose lease connection died cannot
+        // drain more work through its independent pool.
+        sqlx::query("SELECT 1")
+            .execute(&mut *leadership_connection)
+            .await
+            .context("controller singleton lease connection was lost")?;
+        let Some(command) = claim_command(pool).await? else {
+            break;
+        };
         let command_id = command.id;
         let command_kind = command.kind.clone();
         if let Err(command_error) = execute_command(pool, &command, journal, remote).await {
@@ -369,10 +558,11 @@ async fn claim_command(pool: &PgPool) -> Result<Option<CommandRow>> {
             LIMIT 1
         )
         UPDATE ctfzone.runtime_commands c
-        SET status='claimed',claimed_at=now(),attempts=c.attempts+1
+        SET status='claimed',claimed_at=now(),claim_token=gen_random_uuid(),
+            attempts=c.attempts+1
         FROM candidate
         WHERE c.id=candidate.id
-        RETURNING c.id,c.instance_id,c.kind,c.generation,c.setting_revision,
+        RETURNING c.id,c.claim_token,c.instance_id,c.kind,c.generation,c.setting_revision,
                   c.challenge_runtime_revision,c.payload,c.attempts
         "#,
     )
@@ -425,7 +615,7 @@ async fn execute_start(
     if !instance.active || instance.desired_state != "running" {
         return cancel_command(
             pool,
-            command.id,
+            command,
             "instance no longer desires a running workload",
         )
         .await;
@@ -456,9 +646,23 @@ async fn execute_start(
         return reject_start(pool, command, instance, &gate).await;
     }
 
-    let server = select_remote_server(pool, &instance.deployment_snapshot).await?;
+    // `mark_starting` persists placement before the remote call. A reclaimed
+    // command must reuse that host; selecting again could leave one generation
+    // running on two hosts if the first claimant lost leadership in flight.
+    let server = if let Some(server_id) = instance.remote_server_id {
+        load_remote_server(pool, server_id).await?
+    } else {
+        select_remote_server(pool, &instance.deployment_snapshot).await?
+    };
     let payload = remote_payload(command, instance, "start");
-    mark_starting(pool, command, instance, &server).await?;
+    if !mark_starting(pool, command, instance, &server).await? {
+        return cancel_command(
+            pool,
+            command,
+            "instance generation changed before remote workload startup",
+        )
+        .await;
+    }
     let intent = journal_intent(
         command,
         instance,
@@ -470,9 +674,11 @@ async fn execute_start(
     let result = remote
         .execute(&server, RemoteOperation::EnsureInstance, &payload)
         .await?;
+    require_remote_generation(&result, command.generation, "startup")?;
     if result.absent == Some(true) || result.container_id.is_none() {
         bail!("remote helper did not confirm a running workload");
     }
+    require_remote_ready(&result, "startup")?;
     journal
         .remote_result(
             journal_intent(
@@ -511,9 +717,10 @@ async fn execute_start(
                 &cleanup_result,
             )
             .await?;
+        require_remote_removal(&cleanup_result, command.generation)?;
         cancel_command(
             pool,
-            command.id,
+            command,
             "instance generation changed while remote workload was starting",
         )
         .await?;
@@ -547,14 +754,21 @@ async fn execute_terminate(
     remote: &RemoteExecutor,
 ) -> Result<()> {
     if !instance.active {
-        return complete_command(pool, command.id).await;
+        return complete_command(pool, command).await;
     }
     let server = if let Some(server_id) = instance.remote_server_id {
         Some(load_remote_server(pool, server_id).await?)
     } else {
         None
     };
-    mark_stopping(pool, command, instance).await?;
+    if !mark_stopping(pool, command, instance).await? {
+        return cancel_command(
+            pool,
+            command,
+            "instance generation changed before remote workload cleanup",
+        )
+        .await;
+    }
     if let Some(server) = server.as_ref() {
         let payload = remote_payload(command, instance, "terminate");
         journal
@@ -581,7 +795,15 @@ async fn execute_terminate(
                 &result,
             )
             .await?;
-        finish_termination(pool, command, instance).await?;
+        require_remote_removal(&result, command.generation)?;
+        if !finish_termination(pool, command, instance).await? {
+            cancel_command(
+                pool,
+                command,
+                "instance generation changed while remote workload was stopping",
+            )
+            .await?;
+        }
         journal
             .acknowledged(journal_intent(
                 command,
@@ -591,8 +813,13 @@ async fn execute_terminate(
                 &payload,
             ))
             .await?;
-    } else {
-        finish_termination(pool, command, instance).await?;
+    } else if !finish_termination(pool, command, instance).await? {
+        cancel_command(
+            pool,
+            command,
+            "instance generation changed before local cleanup completion",
+        )
+        .await?;
     }
     Ok(())
 }
@@ -606,7 +833,7 @@ async fn execute_extend(
 ) -> Result<()> {
     if !instance.active || instance.desired_state != "running" || instance.expires_at <= Utc::now()
     {
-        return cancel_command(pool, command.id, "instance can no longer be extended").await;
+        return cancel_command(pool, command, "instance can no longer be extended").await;
     }
     let server_id = instance
         .remote_server_id
@@ -637,10 +864,18 @@ async fn execute_extend(
             &result,
         )
         .await?;
+    if result.stale_generation == Some(true) {
+        bail!(
+            "remote helper refused stale deadline generation {} (effective generation {:?})",
+            command.generation,
+            result.effective_generation
+        );
+    }
+    require_remote_generation(&result, command.generation, "deadline update")?;
     if !finish_extension(pool, command, instance, &result).await? {
         cancel_command(
             pool,
-            command.id,
+            command,
             "instance generation changed while its deadline was being extended",
         )
         .await?;
@@ -665,7 +900,7 @@ async fn execute_inspect(
     remote: &RemoteExecutor,
 ) -> Result<()> {
     let Some(server_id) = instance.remote_server_id else {
-        return cancel_command(pool, command.id, "instance has no remote server to inspect").await;
+        return cancel_command(pool, command, "instance has no remote server to inspect").await;
     };
     let server = load_remote_server(pool, server_id).await?;
     let payload = remote_payload(command, instance, "inspect");
@@ -681,6 +916,9 @@ async fn execute_inspect(
     let result = remote
         .execute(&server, RemoteOperation::InspectInstance, &payload)
         .await?;
+    if result.absent != Some(true) {
+        require_remote_generation(&result, command.generation, "inspection")?;
+    }
     journal
         .remote_result(
             journal_intent(
@@ -693,7 +931,14 @@ async fn execute_inspect(
             &result,
         )
         .await?;
-    finish_inspection(pool, command, instance, &result).await?;
+    if !finish_inspection(pool, command, instance, &result).await? {
+        cancel_command(
+            pool,
+            command,
+            "instance generation changed while remote workload was inspected",
+        )
+        .await?;
+    }
     journal
         .acknowledged(journal_intent(
             command,
@@ -719,6 +964,44 @@ fn remote_payload(command: &CommandRow, instance: &InstanceRow, reason: &str) ->
         "command_payload": command.payload,
         "remote_container_id": instance.remote_container_id,
     })
+}
+
+fn require_remote_removal(result: &RemoteResult, generation: i64) -> Result<()> {
+    if result.stale_generation == Some(true) {
+        bail!(
+            "remote helper refused stale cleanup generation {generation} (effective generation {:?})",
+            result.effective_generation
+        );
+    }
+    if result.absent != Some(true) {
+        bail!("remote helper did not confirm workload removal");
+    }
+    Ok(())
+}
+
+fn require_remote_generation(
+    result: &RemoteResult,
+    generation: i64,
+    operation: &str,
+) -> Result<()> {
+    if result.stale_generation == Some(true) || result.effective_generation != Some(generation) {
+        bail!(
+            "remote {operation} generation mismatch: expected {generation}, got {:?}",
+            result.effective_generation
+        );
+    }
+    Ok(())
+}
+
+fn require_remote_ready(result: &RemoteResult, operation: &str) -> Result<()> {
+    if result.ready != Some(true) {
+        bail!(
+            "remote {operation} did not report a ready workload (runtime status {:?}, health status {:?})",
+            result.runtime_status,
+            result.health_status
+        );
+    }
+    Ok(())
 }
 
 fn journal_intent<'a>(
@@ -781,14 +1064,18 @@ async fn mark_starting(
     command: &CommandRow,
     instance: &InstanceRow,
     server: &RemoteServer,
-) -> Result<()> {
+) -> Result<bool> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET observed_state='starting',
             remote_server_id=$1,activated_at=COALESCE(activated_at,now()),
             last_observed_at=now(),failure_code=NULL,failure_message=NULL
-        WHERE id=$2 AND generation=$3
+        WHERE id=$2 AND generation=$3 AND active AND desired_state='running'
         "#,
     )
     .bind(server.id)
@@ -796,6 +1083,10 @@ async fn mark_starting(
     .bind(command.generation)
     .execute(&mut *transaction)
     .await?;
+    if update.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     append_event(
         &mut transaction,
         instance.id,
@@ -806,7 +1097,7 @@ async fn mark_starting(
     )
     .await?;
     transaction.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn finish_start(
@@ -823,6 +1114,10 @@ async fn finish_start(
         bail!("remote helper returned a deadline beyond the maximum lifetime");
     }
     let mut transaction = pool.begin().await?;
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        bail!("runtime command claim lease was lost after remote startup");
+    }
     let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET
@@ -869,19 +1164,32 @@ async fn finish_start(
         }),
     )
     .await?;
-    mark_command_completed(&mut transaction, command.id).await?;
+    mark_command_completed(&mut transaction, command).await?;
     transaction.commit().await?;
     Ok(true)
 }
 
-async fn mark_stopping(pool: &PgPool, command: &CommandRow, instance: &InstanceRow) -> Result<()> {
+async fn mark_stopping(
+    pool: &PgPool,
+    command: &CommandRow,
+    instance: &InstanceRow,
+) -> Result<bool> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
-        "UPDATE ctfzone.runtime_instances SET observed_state='stopping',last_observed_at=now() WHERE id=$1 AND active",
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let update = sqlx::query(
+        "UPDATE ctfzone.runtime_instances SET observed_state='stopping',last_observed_at=now() WHERE id=$1 AND generation=$2 AND active",
     )
     .bind(instance.id)
+    .bind(command.generation)
     .execute(&mut *transaction)
     .await?;
+    if update.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     append_event(
         &mut transaction,
         instance.id,
@@ -892,14 +1200,14 @@ async fn mark_stopping(pool: &PgPool, command: &CommandRow, instance: &InstanceR
     )
     .await?;
     transaction.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn finish_termination(
     pool: &PgPool,
     command: &CommandRow,
     instance: &InstanceRow,
-) -> Result<()> {
+) -> Result<bool> {
     let expired = instance.expires_at <= Utc::now()
         || command.payload.get("reason").and_then(Value::as_str)
             == Some("absolute_deadline_reached");
@@ -910,12 +1218,16 @@ async fn finish_termination(
         "instance.terminated"
     };
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET active=false,desired_state='stopped',
             observed_state=$1,observed_generation=$2,last_observed_at=now(),
             stopped_at=now(),failure_code=NULL,failure_message=NULL
-        WHERE id=$3
+        WHERE id=$3 AND generation=$2 AND active
         "#,
     )
     .bind(observed_state)
@@ -923,6 +1235,10 @@ async fn finish_termination(
     .bind(instance.id)
     .execute(&mut *transaction)
     .await?;
+    if update.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     append_event(
         &mut transaction,
         instance.id,
@@ -941,9 +1257,9 @@ async fn finish_termination(
         json!({"command_id": command.id}),
     )
     .await?;
-    mark_command_completed(&mut transaction, command.id).await?;
+    mark_command_completed(&mut transaction, command).await?;
     transaction.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn finish_extension(
@@ -959,6 +1275,10 @@ async fn finish_extension(
         bail!("remote helper returned an invalid extended deadline");
     }
     let mut transaction = pool.begin().await?;
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET observed_expires_at=$1,expires_at=$1,
@@ -984,7 +1304,7 @@ async fn finish_extension(
         json!({"command_id": command.id, "expires_at": effective}),
     )
     .await?;
-    mark_command_completed(&mut transaction, command.id).await?;
+    mark_command_completed(&mut transaction, command).await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -994,23 +1314,33 @@ async fn finish_inspection(
     command: &CommandRow,
     instance: &InstanceRow,
     result: &RemoteResult,
-) -> Result<()> {
+) -> Result<bool> {
     let absent = result.absent.unwrap_or(false);
     let mut transaction = pool.begin().await?;
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let mut cleanup_queued = None;
     if absent {
         let expired = instance.expires_at <= Utc::now() || instance.desired_state == "stopped";
-        sqlx::query(
+        let update = sqlx::query(
             r#"
             UPDATE ctfzone.runtime_instances SET active=false,
                 observed_state=$1,stopped_at=now(),last_observed_at=now(),
                 failure_code=CASE WHEN $1='failed' THEN 'remote_workload_missing' ELSE NULL END
-            WHERE id=$2
+            WHERE id=$2 AND generation=$3 AND active
             "#,
         )
         .bind(if expired { "expired" } else { "failed" })
         .bind(instance.id)
+        .bind(command.generation)
         .execute(&mut *transaction)
         .await?;
+        if update.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         append_event(
             &mut transaction,
             instance.id,
@@ -1024,14 +1354,63 @@ async fn finish_inspection(
             json!({"command_id": command.id, "reason": "remote_workload_absent"}),
         )
         .await?;
+    } else if result.ready != Some(true) {
+        let message = truncate(
+            &format!(
+                "remote workload is not ready (runtime status {:?}, health status {:?})",
+                result.runtime_status, result.health_status
+            ),
+            1000,
+        );
+        let update = sqlx::query(
+            r#"
+            UPDATE ctfzone.runtime_instances SET observed_state='cleanup_pending',
+                failure_code='remote_workload_not_ready',failure_message=$1,
+                last_observed_at=now()
+            WHERE id=$2 AND generation=$3 AND active
+            "#,
+        )
+        .bind(&message)
+        .bind(instance.id)
+        .bind(command.generation)
+        .execute(&mut *transaction)
+        .await?;
+        if update.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        append_event(
+            &mut transaction,
+            instance.id,
+            "instance.failed",
+            "controller",
+            None,
+            json!({
+                "command_id": command.id,
+                "reason": "remote_workload_not_ready",
+                "runtime_status": result.runtime_status,
+                "health_status": result.health_status,
+            }),
+        )
+        .await?;
+        cleanup_queued = create_termination_command_in_transaction(
+            &mut transaction,
+            instance.id,
+            "remote_workload_not_ready",
+        )
+        .await?;
     } else {
-        sqlx::query(
-            "UPDATE ctfzone.runtime_instances SET observed_state='ready',last_observed_at=now(),observed_generation=$1 WHERE id=$2",
+        let update = sqlx::query(
+            "UPDATE ctfzone.runtime_instances SET observed_state='ready',last_observed_at=now(),observed_generation=$1 WHERE id=$2 AND generation=$1 AND active",
         )
         .bind(command.generation)
         .bind(instance.id)
         .execute(&mut *transaction)
         .await?;
+        if update.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         append_event(
             &mut transaction,
             instance.id,
@@ -1042,9 +1421,17 @@ async fn finish_inspection(
         )
         .await?;
     }
-    mark_command_completed(&mut transaction, command.id).await?;
+    mark_command_completed(&mut transaction, command).await?;
     transaction.commit().await?;
-    Ok(())
+    if let Some((command_id, owner_user_id)) = cleanup_queued {
+        info!(
+            instance_id = %instance.id,
+            %command_id,
+            owner_user_id,
+            "queued cleanup for a non-ready remote workload"
+        );
+    }
+    Ok(true)
 }
 
 async fn reject_start(
@@ -1054,37 +1441,44 @@ async fn reject_start(
     gate: &RuntimeGate,
 ) -> Result<()> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+    let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET active=false,desired_state='stopped',
             observed_state='failed',stopped_at=now(),last_observed_at=now(),
             failure_code='runtime_policy_stale',
             failure_message='Runtime policy changed before launch'
-        WHERE id=$1 AND observed_state='requested'
+        WHERE id=$1 AND generation=$2 AND observed_state='requested' AND active
         "#,
     )
     .bind(instance.id)
+    .bind(command.generation)
     .execute(&mut *transaction)
     .await?;
-    append_event(
+    if update.rows_affected() > 0 {
+        append_event(
+            &mut transaction,
+            instance.id,
+            "instance.failed",
+            "controller",
+            None,
+            json!({
+                "command_id": command.id,
+                "reason": "runtime_policy_stale",
+                "current_setting_revision": gate.setting_revision,
+                "current_runtime_revision": gate.runtime_revision,
+            }),
+        )
+        .await?;
+    }
+    mark_command_cancelled(
         &mut transaction,
-        instance.id,
-        "instance.failed",
-        "controller",
-        None,
-        json!({
-            "command_id": command.id,
-            "reason": "runtime_policy_stale",
-            "current_setting_revision": gate.setting_revision,
-            "current_runtime_revision": gate.runtime_revision,
-        }),
+        command,
+        "runtime policy changed before launch",
     )
-    .await?;
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='cancelled',completed_at=now(),last_error='runtime policy changed before launch' WHERE id=$1",
-    )
-    .bind(command.id)
-    .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
     Ok(())
@@ -1096,33 +1490,34 @@ async fn expire_unstarted_instance(
     instance: &InstanceRow,
 ) -> Result<()> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+    let update = sqlx::query(
         r#"
         UPDATE ctfzone.runtime_instances SET active=false,desired_state='stopped',
             observed_state='expired',observed_generation=$1,stopped_at=now(),
             last_observed_at=now(),failure_code=NULL,failure_message=NULL
-        WHERE id=$2 AND generation=$1 AND observed_state='requested'
+        WHERE id=$2 AND generation=$1 AND observed_state='requested' AND active
         "#,
     )
     .bind(command.generation)
     .bind(instance.id)
     .execute(&mut *transaction)
     .await?;
-    append_event(
-        &mut transaction,
-        instance.id,
-        "instance.expired",
-        "controller",
-        None,
-        json!({"command_id": command.id, "reason": "deadline_elapsed_before_launch"}),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='cancelled',completed_at=now(),last_error='deadline elapsed before launch' WHERE id=$1",
-    )
-    .bind(command.id)
-    .execute(&mut *transaction)
-    .await?;
+    if update.rows_affected() > 0 {
+        append_event(
+            &mut transaction,
+            instance.id,
+            "instance.expired",
+            "controller",
+            None,
+            json!({"command_id": command.id, "reason": "deadline_elapsed_before_launch"}),
+        )
+        .await?;
+    }
+    mark_command_cancelled(&mut transaction, command, "deadline elapsed before launch").await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -1133,12 +1528,11 @@ async fn cancel_stale_command(
     instance: &InstanceRow,
 ) -> Result<()> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='cancelled',completed_at=now(),last_error='stale generation' WHERE id=$1",
-    )
-    .bind(command.id)
-    .execute(&mut *transaction)
-    .await?;
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+    mark_command_cancelled(&mut transaction, command, "stale generation").await?;
     append_event(
         &mut transaction,
         instance.id,
@@ -1152,37 +1546,106 @@ async fn cancel_stale_command(
     Ok(())
 }
 
-async fn cancel_command(pool: &PgPool, command_id: Uuid, reason: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='cancelled',completed_at=now(),last_error=$1 WHERE id=$2",
+async fn cancel_command(pool: &PgPool, command: &CommandRow, reason: &str) -> Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_commands
+        SET status='cancelled',claimed_at=NULL,claim_token=NULL,
+            completed_at=now(),last_error=$1
+        WHERE id=$2 AND status='claimed' AND claim_token=$3
+        "#,
     )
     .bind(reason)
-    .bind(command_id)
+    .bind(command.id)
+    .bind(command.claim_token)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        info!(command_id = %command.id, "ignored cancellation from a stale command claimant");
+    }
     Ok(())
 }
 
-async fn complete_command(pool: &PgPool, command_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='completed',completed_at=now(),last_error=NULL WHERE id=$1",
+async fn complete_command(pool: &PgPool, command: &CommandRow) -> Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_commands
+        SET status='completed',claimed_at=NULL,claim_token=NULL,
+            completed_at=now(),last_error=NULL
+        WHERE id=$1 AND status='claimed' AND claim_token=$2
+        "#,
     )
-    .bind(command_id)
+    .bind(command.id)
+    .bind(command.claim_token)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        info!(command_id = %command.id, "ignored completion from a stale command claimant");
+    }
+    Ok(())
+}
+
+async fn lock_command_claim(
+    transaction: &mut Transaction<'_, Postgres>,
+    command: &CommandRow,
+) -> Result<bool> {
+    let held = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id FROM ctfzone.runtime_commands
+        WHERE id=$1 AND status='claimed' AND claim_token=$2
+        FOR UPDATE
+        "#,
+    )
+    .bind(command.id)
+    .bind(command.claim_token)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(held.is_some())
+}
+
+async fn mark_command_cancelled(
+    transaction: &mut Transaction<'_, Postgres>,
+    command: &CommandRow,
+    reason: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_commands
+        SET status='cancelled',claimed_at=NULL,claim_token=NULL,
+            completed_at=now(),last_error=$1
+        WHERE id=$2 AND status='claimed' AND claim_token=$3
+        "#,
+    )
+    .bind(reason)
+    .bind(command.id)
+    .bind(command.claim_token)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        bail!("runtime command claim lease was lost while cancelling work");
+    }
     Ok(())
 }
 
 async fn mark_command_completed(
     transaction: &mut Transaction<'_, Postgres>,
-    command_id: Uuid,
+    command: &CommandRow,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE ctfzone.runtime_commands SET status='completed',completed_at=now(),last_error=NULL WHERE id=$1",
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_commands
+        SET status='completed',claimed_at=NULL,claim_token=NULL,
+            completed_at=now(),last_error=NULL
+        WHERE id=$1 AND status='claimed' AND claim_token=$2
+        "#,
     )
-    .bind(command_id)
+    .bind(command.id)
+    .bind(command.claim_token)
     .execute(&mut **transaction)
     .await?;
+    if result.rows_affected() != 1 {
+        bail!("runtime command claim lease was lost before completion");
+    }
     Ok(())
 }
 
@@ -1195,50 +1658,82 @@ async fn schedule_retry(
     let message = truncate(message, 1000);
     if command.attempts >= config.max_command_attempts {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            "UPDATE ctfzone.runtime_commands SET status='failed',completed_at=now(),last_error=$1 WHERE id=$2",
+        let failed = sqlx::query(
+            r#"
+            UPDATE ctfzone.runtime_commands
+            SET status='failed',claimed_at=NULL,claim_token=NULL,
+                completed_at=now(),last_error=$1
+            WHERE id=$2 AND status='claimed' AND claim_token=$3
+            "#,
         )
         .bind(&message)
         .bind(command.id)
+        .bind(command.claim_token)
         .execute(&mut *transaction)
         .await?;
+        if failed.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(());
+        }
         let state = match command.kind.as_str() {
             "extend" => "ready",
             "inspect" | "reconcile" => "unknown",
             _ => "cleanup_pending",
         };
-        sqlx::query(
-            "UPDATE ctfzone.runtime_instances SET observed_state=$1,failure_code='command_failed',failure_message=$2,last_observed_at=now() WHERE id=$3 AND active",
+        let instance_update = sqlx::query(
+            "UPDATE ctfzone.runtime_instances SET observed_state=$1,failure_code='command_failed',failure_message=$2,last_observed_at=now() WHERE id=$3 AND generation=$4 AND active",
         )
         .bind(state)
         .bind(&message)
         .bind(command.instance_id)
+        .bind(command.generation)
         .execute(&mut *transaction)
         .await?;
-        append_event(
-            &mut transaction,
-            command.instance_id,
-            "instance.failed",
-            "controller",
-            None,
-            json!({"command_id": command.id, "kind": command.kind, "error": message}),
-        )
-        .await?;
+        let start_cleanup_required = command.kind == "start" && instance_update.rows_affected() > 0;
+        if instance_update.rows_affected() > 0 {
+            append_event(
+                &mut transaction,
+                command.instance_id,
+                "instance.failed",
+                "controller",
+                None,
+                json!({"command_id": command.id, "kind": command.kind, "error": message}),
+            )
+            .await?;
+        }
+        let cleanup_queued = if start_cleanup_required {
+            create_termination_command_in_transaction(
+                &mut transaction,
+                command.instance_id,
+                "start_command_failed",
+            )
+            .await?
+        } else {
+            None
+        };
         transaction.commit().await?;
+        if let Some((command_id, owner_user_id)) = cleanup_queued {
+            info!(
+                instance_id = %command.instance_id,
+                %command_id,
+                owner_user_id,
+                "atomically queued cleanup after terminal start failure"
+            );
+        }
         return Ok(());
     }
-    let exponent = u32::try_from(command.attempts.clamp(1, 6)).unwrap_or(6);
-    let backoff_seconds = min(5_i64 * 2_i64.pow(exponent), 300);
+    let backoff_seconds = retry_backoff_seconds(command.attempts);
     sqlx::query(
         r#"
-        UPDATE ctfzone.runtime_commands SET status='pending',claimed_at=NULL,
+        UPDATE ctfzone.runtime_commands SET status='pending',claimed_at=NULL,claim_token=NULL,
             available_at=now() + make_interval(secs => $1::double precision),last_error=$2
-        WHERE id=$3
+        WHERE id=$3 AND status='claimed' AND claim_token=$4
         "#,
     )
     .bind(backoff_seconds as f64)
     .bind(message)
     .bind(command.id)
+    .bind(command.claim_token)
     .execute(pool)
     .await?;
     Ok(())
@@ -1269,18 +1764,57 @@ async fn append_event(
     Ok(())
 }
 
-async fn next_wake_delay(pool: &PgPool, maximum: StdDuration) -> Result<StdDuration> {
+async fn next_wake_delay(
+    pool: &PgPool,
+    maximum: StdDuration,
+    stale_claim_after: StdDuration,
+) -> Result<StdDuration> {
     let command_time = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
         "SELECT MIN(available_at) FROM ctfzone.runtime_commands WHERE status='pending'",
     )
     .fetch_one(pool)
     .await?;
     let deadline = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT MIN(expires_at) FROM ctfzone.runtime_instances WHERE active",
+        "SELECT MIN(expires_at) FROM ctfzone.runtime_instances WHERE active AND expires_at > now()",
     )
     .fetch_one(pool)
     .await?;
-    let next = [command_time, deadline].into_iter().flatten().min();
+    let safety_retry = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        r#"
+        SELECT MIN(f.last_failed + make_interval(secs => $1::double precision))
+        FROM (
+            SELECT instance_id,MAX(completed_at) AS last_failed
+            FROM ctfzone.runtime_commands
+            WHERE kind='terminate' AND status='failed' AND completed_at IS NOT NULL
+            GROUP BY instance_id
+        ) f
+        JOIN ctfzone.runtime_instances i ON i.id=f.instance_id AND i.active
+        WHERE f.last_failed + make_interval(secs => $1::double precision) > now()
+          AND NOT EXISTS (
+              SELECT 1 FROM ctfzone.runtime_commands c
+              WHERE c.instance_id=f.instance_id AND c.kind='terminate'
+                AND c.status IN ('pending','claimed')
+          )
+        "#,
+    )
+    .bind(duration_seconds(maximum) as f64)
+    .fetch_one(pool)
+    .await?;
+    let stale_claim = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        r#"
+        SELECT MIN(claimed_at + make_interval(secs => $1::double precision))
+        FROM ctfzone.runtime_commands
+        WHERE status='claimed' AND claimed_at IS NOT NULL
+          AND claimed_at + make_interval(secs => $1::double precision) > now()
+        "#,
+    )
+    .bind(duration_seconds(stale_claim_after) as f64)
+    .fetch_one(pool)
+    .await?;
+    let next = [command_time, deadline, safety_retry, stale_claim]
+        .into_iter()
+        .flatten()
+        .min();
     let until_next = next
         .map(|next| {
             (next - Utc::now())
@@ -1289,6 +1823,33 @@ async fn next_wake_delay(pool: &PgPool, maximum: StdDuration) -> Result<StdDurat
         })
         .unwrap_or(maximum);
     Ok(min(until_next, maximum))
+}
+
+fn duration_seconds(duration: StdDuration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn retry_backoff_seconds(attempts: i32) -> i64 {
+    let exponent = u32::try_from(attempts.clamp(1, 6)).unwrap_or(6);
+    min(5_i64 * 2_i64.pow(exponent), 300)
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn sleep_or_shutdown(duration: StdDuration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        () = sleep_until(Instant::now() + duration) => false,
+        () = wait_for_shutdown(shutdown) => true,
+    }
 }
 
 fn truncate(value: &str, maximum: usize) -> String {
@@ -1302,5 +1863,61 @@ mod tests {
     #[test]
     fn truncates_errors_on_character_boundaries() {
         assert_eq!(truncate("aé日", 2), "aé");
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded() {
+        assert_eq!(retry_backoff_seconds(1), 10);
+        assert_eq!(retry_backoff_seconds(2), 20);
+        assert_eq!(retry_backoff_seconds(8), 300);
+        assert_eq!(retry_backoff_seconds(i32::MAX), 300);
+    }
+
+    #[test]
+    fn cleanup_requires_confirmed_absence_and_rejects_stale_generation() {
+        let removed = RemoteResult {
+            absent: Some(true),
+            ..RemoteResult::default()
+        };
+        assert!(require_remote_removal(&removed, 2).is_ok());
+
+        let uncertain = RemoteResult::default();
+        assert!(require_remote_removal(&uncertain, 2).is_err());
+
+        let stale = RemoteResult {
+            absent: Some(false),
+            stale_generation: Some(true),
+            effective_generation: Some(3),
+            ..RemoteResult::default()
+        };
+        assert!(require_remote_removal(&stale, 2).is_err());
+    }
+
+    #[test]
+    fn live_remote_results_require_the_exact_generation() {
+        let exact = RemoteResult {
+            effective_generation: Some(4),
+            ..RemoteResult::default()
+        };
+        assert!(require_remote_generation(&exact, 4, "inspection").is_ok());
+        assert!(require_remote_generation(&exact, 3, "inspection").is_err());
+        assert!(require_remote_generation(&RemoteResult::default(), 4, "inspection").is_err());
+    }
+
+    #[test]
+    fn remote_readiness_must_be_explicit() {
+        let ready = RemoteResult {
+            ready: Some(true),
+            ..RemoteResult::default()
+        };
+        assert!(require_remote_ready(&ready, "startup").is_ok());
+
+        let exited = RemoteResult {
+            ready: Some(false),
+            runtime_status: Some("exited".to_owned()),
+            ..RemoteResult::default()
+        };
+        assert!(require_remote_ready(&exited, "startup").is_err());
+        assert!(require_remote_ready(&RemoteResult::default(), "startup").is_err());
     }
 }

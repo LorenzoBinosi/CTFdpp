@@ -2,6 +2,7 @@ mod config;
 mod journal;
 mod remote;
 mod state;
+mod storage;
 mod worker;
 
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use config::Config;
 use journal::OperationJournal;
 use serde_json::json;
 use state::{ControllerMode, SharedStatus};
-use tokio::{net::TcpListener, signal};
+use tokio::{net::TcpListener, signal, sync::watch};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -33,10 +34,21 @@ struct HttpState {
 async fn main() -> Result<()> {
     init_tracing();
     let config = Config::from_env()?;
+    let storage_config = storage::StorageConfig::from_env(&config)?;
     let status = SharedStatus::new();
     let journal = Arc::new(OperationJournal::open(config.journal_path.clone()).await?);
-
-    tokio::spawn(worker::run(config.clone(), status.clone(), journal));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut worker_task = tokio::spawn(worker::run(
+        config.clone(),
+        status.clone(),
+        journal,
+        shutdown_rx.clone(),
+    ));
+    let mut storage_task = tokio::spawn(storage::run(
+        storage_config,
+        status.clone(),
+        shutdown_rx.clone(),
+    ));
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -52,11 +64,43 @@ async fn main() -> Result<()> {
         remote_driver = ?config.remote_driver,
         "CTFZone controller started"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("controller HTTP server failed")?;
-    Ok(())
+    let mut server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+            .await
+    });
+
+    tokio::select! {
+        () = shutdown_signal() => {
+            info!("controller shutdown requested");
+            shutdown_tx.send(true).ok();
+            server_task.await.context("controller HTTP task panicked")??;
+            worker_task.await.context("controller worker task panicked")??;
+            storage_task.await.context("object maintenance task panicked")??;
+            Ok(())
+        }
+        worker_result = &mut worker_task => {
+            shutdown_tx.send(true).ok();
+            server_task.await.context("controller HTTP task panicked")??;
+            storage_task.await.context("object maintenance task panicked")??;
+            worker_result.context("controller worker task panicked")??;
+            anyhow::bail!("controller worker stopped unexpectedly")
+        }
+        storage_result = &mut storage_task => {
+            shutdown_tx.send(true).ok();
+            server_task.await.context("controller HTTP task panicked")??;
+            worker_task.await.context("controller worker task panicked")??;
+            storage_result.context("object maintenance task panicked")??;
+            anyhow::bail!("object maintenance worker stopped unexpectedly")
+        }
+        server_result = &mut server_task => {
+            shutdown_tx.send(true).ok();
+            worker_task.await.context("controller worker task panicked")??;
+            storage_task.await.context("object maintenance task panicked")??;
+            server_result.context("controller HTTP task panicked")??;
+            anyhow::bail!("controller HTTP server stopped unexpectedly")
+        }
+    }
 }
 
 async fn health(State(state): State<HttpState>) -> Response {
@@ -67,6 +111,7 @@ async fn health(State(state): State<HttpState>) -> Response {
         "version": VERSION,
         "mode": status.mode,
         "database_connected": status.database_connected,
+        "object_storage_connected": status.object_storage_connected,
     }))
     .into_response()
 }
@@ -75,6 +120,8 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     let status = state.status.snapshot().await;
     let ready = status.database_connected
         && status.initial_reconciliation_complete
+        && status.object_storage_connected
+        && status.storage_initial_reconciliation_complete
         && !matches!(
             status.mode,
             ControllerMode::Starting | ControllerMode::Degraded
@@ -92,6 +139,8 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             "mode": status.mode,
             "database_connected": status.database_connected,
             "initial_reconciliation_complete": status.initial_reconciliation_complete,
+            "object_storage_connected": status.object_storage_connected,
+            "storage_initial_reconciliation_complete": status.storage_initial_reconciliation_complete,
         })),
     )
         .into_response()
@@ -136,6 +185,17 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
     }
 }
 

@@ -1,0 +1,15 @@
+{
+  "id": "terminal",
+  "name": "Terminal",
+  "description": "A compact, dark player interface inspired by security terminals.",
+  "version": "1.0.0",
+  "assets": [
+    "css/player.css",
+    "js/app.js",
+    "js/confirm.js",
+    "js/challenges.js",
+    "js/profile.js",
+    "js/scoreboard.js",
+    "js/team.js"
+  ]
+}

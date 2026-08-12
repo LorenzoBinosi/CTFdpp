@@ -1,39 +1,34 @@
 use axum::{
     extract::{FromRequestParts, MatchedPath, Request, State},
-    http::{Method, header, request::Parts},
+    http::{header, request::Parts},
     middleware::Next,
     response::Response,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use sqlx::{FromRow, PgPool};
 use tracing::error;
 use uuid::Uuid;
 
 use crate::{AppState, error::ApiError};
 
-type HmacSha1 = Hmac<Sha1>;
+type HmacSha256 = Hmac<Sha256>;
 
-const SIGNER_SALT: &[u8] = b"itsdangerous.Signer";
+pub(crate) const BACKEND_TOKEN_HEADER: &str = "x-ctfzone-backend-token";
+pub(crate) const SESSION_HEADER: &str = "x-ctfzone-session";
+const SERVICE_TOKEN_COMPARISON_KEY: &[u8] =
+    b"ctfzone/backend-service-token/constant-time-comparison/v1";
 
 #[derive(Clone)]
 pub(crate) struct AuthConfig {
     pub(crate) secret_key: String,
-    pub(crate) session_cookie_name: String,
     pub(crate) session_lifetime_seconds: i64,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum Credential {
-    ApiToken {
-        token_id: i32,
-        label: String,
-    },
-    BrowserSession {
-        session_id: String,
-        csrf_nonce: Option<String>,
-    },
+    ApiToken { token_id: i32, label: String },
+    InternalSession { session_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -60,9 +55,9 @@ impl CurrentUser {
         &self.request_ip
     }
 
-    pub(crate) fn csrf_token(&self) -> Option<&str> {
+    pub(crate) fn internal_session_id(&self) -> Option<&str> {
         match &self.credential {
-            Credential::BrowserSession { csrf_nonce, .. } => csrf_nonce.as_deref(),
+            Credential::InternalSession { session_id } => Some(session_id),
             Credential::ApiToken { .. } => None,
         }
     }
@@ -97,7 +92,6 @@ struct SessionAuthRow {
     change_password: bool,
     team_banned: bool,
     session_id: String,
-    csrf_nonce: Option<String>,
     last_ip: String,
 }
 
@@ -133,7 +127,7 @@ impl FromRequestParts<AppState> for OptionalCurrentUser {
         }
 
         let has_credentials = parts.headers.contains_key(header::AUTHORIZATION)
-            || find_cookie(&parts.headers, &state.auth.session_cookie_name).is_some();
+            || parts.headers.contains_key(SESSION_HEADER);
         if !has_credentials {
             return Ok(Self(None));
         }
@@ -156,7 +150,7 @@ async fn authenticate_current_user(
         )
         .await
     } else {
-        authenticate_browser_session(parts, state).await
+        authenticate_internal_session(parts, state).await
     }
 }
 
@@ -199,7 +193,7 @@ async fn authenticate_api_token(
         FROM ctfzone.tokens
         JOIN ctfzone.users ON users.id = tokens.user_id
         LEFT JOIN ctfzone.teams ON teams.id = users.team_id
-        WHERE tokens.value = $1
+        WHERE tokens.value = $1 AND tokens.type = 'user'
         "#,
     )
     .bind(token)
@@ -241,14 +235,16 @@ async fn authenticate_api_token(
     )
 }
 
-async fn authenticate_browser_session(
+async fn authenticate_internal_session(
     parts: &Parts,
     state: &AppState,
 ) -> Result<CurrentUser, ApiError> {
-    let signed_cookie = find_cookie(&parts.headers, &state.auth.session_cookie_name)
-        .ok_or_else(|| ApiError::forbidden("Authentication required"))?;
-    let session_id = verify_signed_session(&signed_cookie, &state.auth.secret_key)
-        .ok_or_else(|| ApiError::unauthorized("Invalid browser session"))?;
+    let session_id = parts
+        .headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| ApiError::unauthorized("Invalid internal session"))?;
 
     let row = sqlx::query_as::<_, SessionAuthRow>(
         r#"
@@ -263,7 +259,6 @@ async fn authenticate_browser_session(
             COALESCE(users.change_password, false) AS change_password,
             COALESCE(teams.banned, false) AS team_banned,
             user_sessions.id AS session_id,
-            user_sessions.csrf_nonce,
             user_sessions.last_ip
         FROM ctfzone.user_sessions
         JOIN ctfzone.users ON users.id = user_sessions.user_id
@@ -275,25 +270,12 @@ async fn authenticate_browser_session(
               - ($2::double precision * INTERVAL '1 second')
         "#,
     )
-    .bind(&session_id)
+    .bind(session_id)
     .bind(state.auth.session_lifetime_seconds)
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::unauthorized("This session has expired or been revoked"))?;
-
-    if !is_safe_method(&parts.method) {
-        let supplied_nonce = parts
-            .headers
-            .get("csrf-token")
-            .and_then(|value| value.to_str().ok());
-        if row.csrf_nonce.as_deref().is_none()
-            || supplied_nonce.is_none()
-            || row.csrf_nonce.as_deref() != supplied_nonce
-        {
-            return Err(ApiError::forbidden("Invalid CSRF token"));
-        }
-    }
 
     let request_ip = client_ip(parts).unwrap_or("unknown").to_owned();
     let ip_changed = row.last_ip != request_ip;
@@ -303,10 +285,16 @@ async fn authenticate_browser_session(
         SET last_seen = CURRENT_TIMESTAMP AT TIME ZONE 'UTC',
             last_ip = COALESCE($2, last_ip)
         WHERE id = $1
+          AND (
+              last_seen < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                  - (LEAST(60.0, GREATEST(1.0, $3::double precision / 2.0)) * INTERVAL '1 second')
+              OR last_ip IS DISTINCT FROM $2
+          )
         "#,
     )
     .bind(&row.session_id)
     .bind(&request_ip)
+    .bind(state.auth.session_lifetime_seconds)
     .execute(&state.database)
     .await
     .map_err(ApiError::database)?;
@@ -321,9 +309,8 @@ async fn authenticate_browser_session(
         row.banned,
         row.team_banned,
         row.change_password,
-        Credential::BrowserSession {
+        Credential::InternalSession {
             session_id: row.session_id,
-            csrf_nonce: row.csrf_nonce,
         },
         request_ip,
         ip_changed,
@@ -377,7 +364,7 @@ pub(crate) async fn optional_authenticated_activity(
 ) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
     let has_credentials = parts.headers.contains_key(header::AUTHORIZATION)
-        || find_cookie(&parts.headers, &state.auth.session_cookie_name).is_some();
+        || parts.headers.contains_key(SESSION_HEADER);
     if !has_credentials {
         return Ok(next.run(Request::from_parts(parts, body)).await);
     }
@@ -419,10 +406,10 @@ async fn record_activity(
         Credential::ApiToken { token_id, label } => {
             (None, Some(*token_id), "api_token", label.clone())
         }
-        Credential::BrowserSession { session_id, .. } => (
+        Credential::InternalSession { session_id } => (
             Some(session_id.as_str()),
             None,
-            "browser",
+            "internal_session",
             format!("Session {}", &session_id[..8]),
         ),
     };
@@ -473,53 +460,32 @@ async fn record_activity(
     Ok(())
 }
 
-fn find_cookie(headers: &axum::http::HeaderMap, wanted_name: &str) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .filter_map(|cookie| cookie.trim().split_once('='))
-        .find_map(|(name, value)| (name == wanted_name).then(|| value.to_owned()))
+pub(crate) async fn require_backend_service(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let provided = request
+        .headers()
+        .get(BACKEND_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !service_token_matches(&state.backend_service_token, provided) {
+        return Err(ApiError::forbidden("Backend authentication failed"));
+    }
+    Ok(next.run(request).await)
 }
 
-pub(crate) fn verify_signed_session(signed_value: &str, secret_key: &str) -> Option<String> {
-    let (value, encoded_signature) = signed_value.rsplit_once('.')?;
-    Uuid::parse_str(value).ok()?;
+fn service_token_matches(expected: &str, provided: &str) -> bool {
+    let mut expected_mac = HmacSha256::new_from_slice(SERVICE_TOKEN_COMPARISON_KEY)
+        .expect("HMAC-SHA256 accepts comparison keys of every length");
+    expected_mac.update(expected.as_bytes());
+    let expected_tag = expected_mac.finalize().into_bytes();
 
-    let mut key_digest = Sha1::new();
-    key_digest.update(SIGNER_SALT);
-    key_digest.update(b"signer");
-    key_digest.update(secret_key.as_bytes());
-    let derived_key = key_digest.finalize();
-
-    let supplied_signature = URL_SAFE_NO_PAD.decode(encoded_signature).ok()?;
-    let mut signer = HmacSha1::new_from_slice(&derived_key).ok()?;
-    signer.update(value.as_bytes());
-    signer.verify_slice(&supplied_signature).ok()?;
-
-    Some(value.to_owned())
-}
-
-pub(crate) fn sign_session(session_id: &str, secret_key: &str) -> String {
-    let mut key_digest = Sha1::new();
-    key_digest.update(SIGNER_SALT);
-    key_digest.update(b"signer");
-    key_digest.update(secret_key.as_bytes());
-    let derived_key = key_digest.finalize();
-
-    let mut signer =
-        HmacSha1::new_from_slice(&derived_key).expect("HMAC-SHA1 accepts keys of every length");
-    signer.update(session_id.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes());
-    format!("{session_id}.{signature}")
-}
-
-fn is_safe_method(method: &Method) -> bool {
-    matches!(
-        *method,
-        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
-    )
+    let mut provided_mac = HmacSha256::new_from_slice(SERVICE_TOKEN_COMPARISON_KEY)
+        .expect("HMAC-SHA256 accepts comparison keys of every length");
+    provided_mac.update(provided.as_bytes());
+    provided_mac.verify_slice(&expected_tag).is_ok()
 }
 
 fn client_ip(parts: &Parts) -> Option<&str> {
@@ -561,47 +527,10 @@ pub(crate) async fn require_verified_email(
 mod tests {
     use super::*;
 
-    const SECRET: &str = "development-only-change-me";
-    const SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
-    const SIGNED_SESSION: &str = "00000000-0000-4000-8000-000000000000.Udd5DKGcJnULVKik_eRs_KyIq_c";
-
     #[test]
-    fn verifies_python_itsdangerous_signer_output() {
-        assert_eq!(
-            verify_signed_session(SIGNED_SESSION, SECRET).as_deref(),
-            Some(SESSION_ID)
-        );
-    }
-
-    #[test]
-    fn rejects_modified_or_wrongly_signed_sessions() {
-        assert!(verify_signed_session(SIGNED_SESSION, "wrong-secret").is_none());
-        assert!(
-            verify_signed_session(
-                "10000000-0000-4000-8000-000000000000.Udd5DKGcJnULVKik_eRs_KyIq_c",
-                SECRET
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn parses_named_cookie_from_combined_header() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            "language=it; session=signed-value; theme=dark"
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            find_cookie(&headers, "session").as_deref(),
-            Some("signed-value")
-        );
-    }
-
-    #[test]
-    fn creates_python_itsdangerous_signer_output() {
-        assert_eq!(sign_session(SESSION_ID, SECRET), SIGNED_SESSION);
+    fn backend_service_token_requires_an_exact_constant_time_match() {
+        assert!(service_token_matches("backend-secret", "backend-secret"));
+        assert!(!service_token_matches("backend-secret", ""));
+        assert!(!service_token_matches("backend-secret", "backend-secret-x"));
     }
 }

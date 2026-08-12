@@ -6,9 +6,21 @@ use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::{AppState, auth::CurrentUser, error::ApiError, routes::Success};
+use crate::{
+    AppState,
+    auth::{Credential, CurrentUser},
+    error::ApiError,
+    routes::Success,
+};
 
 const MAX_ACTIVITY_EVENTS: i64 = 10_000;
+const SESSION_LIST_QUERY: &str = r#"
+    SELECT id, management_id, created, last_seen, initial_ip, last_ip, revoked_at
+    FROM ctfzone.user_sessions
+    WHERE user_id = $1
+      AND (revoked_at IS NULL OR (created <= $2 AND last_seen >= $3))
+    ORDER BY created DESC, management_id DESC
+"#;
 
 #[derive(Deserialize, Default)]
 pub(super) struct UserSearch {
@@ -34,6 +46,7 @@ pub(super) struct SessionUser {
 #[derive(FromRow)]
 struct BrowserSessionRow {
     id: String,
+    management_id: uuid::Uuid,
     created: NaiveDateTime,
     last_seen: NaiveDateTime,
     initial_ip: String,
@@ -58,12 +71,14 @@ struct ActivityRow {
 #[derive(Serialize)]
 struct BrowserSessionData {
     fingerprint: String,
+    management_id: uuid::Uuid,
     created: String,
     last_seen: String,
     initial_ip: String,
     last_ip: String,
     revoked_at: Option<String>,
     active: bool,
+    current: bool,
 }
 
 #[derive(Serialize)]
@@ -98,6 +113,7 @@ pub(super) struct SessionListData {
 #[derive(Serialize)]
 pub(super) struct RevocationData {
     revoked: u64,
+    current_session_revoked: bool,
 }
 
 pub(super) async fn users(
@@ -150,26 +166,20 @@ pub(super) async fn list(
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("User not found"))?;
 
-    let sessions = sqlx::query_as::<_, BrowserSessionRow>(
-        r#"
-        SELECT id, created, last_seen, initial_ip, last_ip, revoked_at
-        FROM ctfzone.user_sessions
-        WHERE user_id = $1 AND created <= $2 AND last_seen >= $3
-        ORDER BY created
-        "#,
-    )
-    .bind(query.user_id)
-    .bind(end)
-    .bind(start)
-    .fetch_all(&state.database)
-    .await
-    .map_err(ApiError::database)?;
+    let sessions = sqlx::query_as::<_, BrowserSessionRow>(SESSION_LIST_QUERY)
+        .bind(query.user_id)
+        .bind(end)
+        .bind(start)
+        .fetch_all(&state.database)
+        .await
+        .map_err(ApiError::database)?;
 
     let activity_count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
         FROM ctfzone.session_activity
         WHERE user_id = $1 AND date >= $2 AND date <= $3
+          AND endpoint <> 'browser.request'
         "#,
     )
     .bind(query.user_id)
@@ -194,7 +204,8 @@ pub(super) async fn list(
             date
         FROM ctfzone.session_activity
         WHERE user_id = $1 AND date >= $2 AND date <= $3
-        ORDER BY date
+          AND endpoint <> 'browser.request'
+        ORDER BY date DESC, id DESC
         LIMIT $4
         "#,
     )
@@ -217,12 +228,17 @@ pub(super) async fn list(
             .into_iter()
             .map(|session| BrowserSessionData {
                 fingerprint: session.id.chars().take(12).collect(),
+                management_id: session.management_id,
                 created: utc_iso(session.created),
                 last_seen: utc_iso(session.last_seen),
                 initial_ip: session.initial_ip,
                 last_ip: session.last_ip,
                 revoked_at: session.revoked_at.map(utc_iso),
                 active: session.revoked_at.is_none() && session.last_seen >= active_cutoff,
+                current: matches!(
+                    &user.credential,
+                    Credential::InternalSession { session_id } if session_id == &session.id
+                ),
             })
             .collect(),
         activities: activities.into_iter().map(serialize_activity).collect(),
@@ -242,18 +258,17 @@ pub(super) async fn revoke_all(
         SET revoked_at = CURRENT_TIMESTAMP AT TIME ZONE 'UTC',
             revoked_by_user_id = $1
         WHERE revoked_at IS NULL
-          AND last_seen >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
-              - ($2::double precision * INTERVAL '1 second')
         "#,
     )
     .bind(user.id)
-    .bind(state.auth.session_lifetime_seconds)
     .execute(&state.database)
     .await
     .map_err(ApiError::database)?;
 
+    let revoked = result.rows_affected();
     Ok(Json(Success::new(RevocationData {
-        revoked: result.rows_affected(),
+        revoked,
+        current_session_revoked: revoked > 0 && current_session_matches(&user, None, None),
     })))
 }
 
@@ -287,9 +302,67 @@ pub(super) async fn revoke_user(
     .await
     .map_err(ApiError::database)?;
 
+    let revoked = result.rows_affected();
     Ok(Json(Success::new(RevocationData {
-        revoked: result.rows_affected(),
+        revoked,
+        current_session_revoked: revoked > 0 && current_session_matches(&user, Some(user_id), None),
     })))
+}
+
+pub(super) async fn revoke_one(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(management_id): Path<uuid::Uuid>,
+) -> Result<Json<Success<RevocationData>>, ApiError> {
+    require_admin(&user)?;
+    let session = sqlx::query_as::<_, (String, i32)>(
+        r#"
+        SELECT id, user_id
+        FROM ctfzone.user_sessions
+        WHERE management_id = $1
+        "#,
+    )
+    .bind(management_id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE ctfzone.user_sessions
+        SET revoked_at = CURRENT_TIMESTAMP AT TIME ZONE 'UTC',
+            revoked_by_user_id = $1
+        WHERE management_id = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(user.id)
+    .bind(management_id)
+    .execute(&state.database)
+    .await
+    .map_err(ApiError::database)?;
+    let revoked = result.rows_affected();
+
+    Ok(Json(Success::new(RevocationData {
+        revoked,
+        current_session_revoked: revoked > 0
+            && current_session_matches(&user, Some(session.1), Some(&session.0)),
+    })))
+}
+
+fn current_session_matches(
+    user: &CurrentUser,
+    target_user_id: Option<i32>,
+    target_session_id: Option<&str>,
+) -> bool {
+    if target_user_id.is_some_and(|target_user_id| target_user_id != user.id) {
+        return false;
+    }
+    match (user.internal_session_id(), target_session_id) {
+        (Some(_), None) => true,
+        (Some(session_id), Some(target)) => session_id == target,
+        (None, _) => false,
+    }
 }
 
 fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
@@ -321,11 +394,11 @@ fn parse_timestamp(value: Option<f64>, label: &str) -> Result<Option<NaiveDateTi
 }
 
 fn serialize_activity(activity: ActivityRow) -> ActivityData {
-    let (credential_key, credential_label) = if activity.credential_type == "browser" {
+    let (credential_key, credential_label) = if activity.credential_type == "internal_session" {
         if let Some(session_id) = &activity.session_id {
             (
                 format!(
-                    "browser:{}",
+                    "internal_session:{}",
                     session_id.chars().take(12).collect::<String>()
                 ),
                 format!("Session {}", session_id.chars().take(8).collect::<String>()),
@@ -390,5 +463,53 @@ mod tests {
     #[test]
     fn rejects_non_finite_timestamp() {
         assert!(parse_timestamp(Some(f64::NAN), "end").is_err());
+    }
+
+    #[test]
+    fn serializes_internal_session_activity_as_a_session_credential() {
+        let activity = serialize_activity(ActivityRow {
+            session_id: Some("12345678-1234-4234-8234-123456789abc".to_owned()),
+            api_token_id: None,
+            credential_type: "internal_session".to_owned(),
+            credential_label: "stored label".to_owned(),
+            method: "GET".to_owned(),
+            endpoint: "/api/v1/challenges".to_owned(),
+            status_code: 200,
+            ip: "127.0.0.1".to_owned(),
+            ip_changed: false,
+            date: DateTime::<Utc>::UNIX_EPOCH.naive_utc(),
+        });
+
+        assert_eq!(activity.credential_key, "internal_session:12345678-123");
+        assert_eq!(activity.credential_label, "Session 12345678");
+        assert_eq!(activity.credential_type, "internal_session");
+    }
+
+    #[test]
+    fn session_management_data_never_serializes_the_bearer_id() {
+        let management_id =
+            uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").expect("valid UUID");
+        let value = serde_json::to_value(BrowserSessionData {
+            fingerprint: "12345678-123".to_owned(),
+            management_id,
+            created: "1970-01-01T00:00:00+00:00".to_owned(),
+            last_seen: "1970-01-01T00:00:00+00:00".to_owned(),
+            initial_ip: "127.0.0.1".to_owned(),
+            last_ip: "127.0.0.1".to_owned(),
+            revoked_at: None,
+            active: true,
+            current: true,
+        })
+        .expect("session data serializes");
+
+        assert_eq!(value["management_id"], management_id.to_string());
+        assert_eq!(value["current"], true);
+        assert!(value.get("id").is_none());
+    }
+
+    #[test]
+    fn session_management_query_keeps_unrevoked_sessions_outside_activity_range() {
+        assert!(SESSION_LIST_QUERY.contains("revoked_at IS NULL"));
+        assert!(SESSION_LIST_QUERY.contains("created <= $2 AND last_seen >= $3"));
     }
 }

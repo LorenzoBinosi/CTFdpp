@@ -1,0 +1,62 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Review participant access, visibility, and email verification state.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel">
+    <div class="admin-user-directory-toolbar">
+      <form class="admin-directory-search" action="{{ url_for('web.admin_users') }}" method="get">
+        <label class="sr-only" for="user-directory-field">Search field</label>
+        <select id="user-directory-field" name="field">
+          <option value="name" {{ 'selected' if user_query_field == 'name' }}>Name</option>
+          <option value="email" {{ 'selected' if user_query_field == 'email' }}>Email</option>
+        </select>
+        <label class="admin-search" for="user-directory-query">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><use href="#admin-icon-search"></use></svg>
+          <input id="user-directory-query" name="q" type="search" value="{{ user_query }}" placeholder="Search all users…">
+        </label>
+        <button class="secondary-button button-small" type="submit">Search</button>
+        {% if user_query %}<a class="quiet-button" href="{{ url_for('web.admin_users') }}">Clear</a>{% endif %}
+      </form>
+      <span class="muted mono">{{ pagination.total }} total</span>
+    </div>
+    <div class="admin-list-toolbar admin-user-page-toolbar">
+      <label class="admin-search">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><use href="#admin-icon-search"></use></svg>
+        <input type="search" placeholder="Filter this page…" aria-label="Filter users on this page" data-admin-table-search>
+      </label>
+      <nav class="admin-pagination" aria-label="User pages">
+        {% if pagination.prev %}
+          <a class="quiet-button" href="{{ url_for('web.admin_users', page=pagination.prev, q=user_query, field=user_query_field) }}">← Previous</a>
+        {% else %}
+          <span class="quiet-button disabled" aria-disabled="true">← Previous</span>
+        {% endif %}
+        <span>Page {{ pagination.page }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %} · {{ users | length }} loaded</span>
+        {% if pagination.next %}
+          <a class="quiet-button" href="{{ url_for('web.admin_users', page=pagination.next, q=user_query, field=user_query_field) }}">Next →</a>
+        {% else %}
+          <span class="quiet-button disabled" aria-disabled="true">Next →</span>
+        {% endif %}
+      </nav>
+    </div>
+    <div class="admin-table-wrap">
+      <table class="admin-table" data-admin-table>
+        <thead>
+          <tr><th>User</th><th>Email</th><th>Role</th><th>Hidden</th><th>Verified</th><th class="table-actions">Action</th></tr>
+        </thead>
+        <tbody>
+          {% for record in users %}
+            <tr>
+              <td><a class="admin-primary-link" href="{{ url_for('web.admin_user_edit', user_id=record.id) }}">{{ record.name or 'Unnamed user' }}</a><small class="admin-cell-detail mono">#{{ record.id }}</small></td>
+              <td class="mono">{{ record.email or '—' }}</td>
+              <td><span class="status-pill {{ 'good' if record.type == 'admin' }}">{{ record.type or 'user' }}</span></td>
+              <td><span class="status-pill {{ 'bad' if record.hidden }}">{{ 'yes' if record.hidden else 'no' }}</span></td>
+              <td><span class="status-pill {{ 'good' if record.verified else 'bad' }}">{{ 'verified' if record.verified else 'pending' }}</span></td>
+              <td class="table-actions"><a class="secondary-button button-small" href="{{ url_for('web.admin_user_edit', user_id=record.id) }}">Edit</a></td>
+            </tr>
+          {% else %}
+            <tr><td class="admin-empty-row" colspan="6">{{ 'No users matched this search.' if user_query else 'No users were returned by the API.' }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

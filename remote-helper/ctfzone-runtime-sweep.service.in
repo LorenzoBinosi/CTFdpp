@@ -1,0 +1,13 @@
+[Unit]
+Description=CTFZone runtime expiry recovery sweep
+Wants=user@@RUNTIME_UID@.service
+After=network.target user@@RUNTIME_UID@.service
+
+[Service]
+Type=oneshot
+User=@RUNTIME_USER@
+Group=@RUNTIME_GROUP@
+Environment=HOME=@RUNTIME_HOME@
+Environment=XDG_RUNTIME_DIR=/run/user/@RUNTIME_UID@
+Environment=CTFZONE_HELPER_CONFIG=/etc/ctfzone/runtime-helper.env
+ExecStart=/usr/local/libexec/ctfzone-runtime-helper sweep-instances

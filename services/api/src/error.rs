@@ -14,6 +14,7 @@ pub(crate) struct ApiError {
 
 #[derive(Serialize)]
 struct ErrorBody<'a> {
+    success: bool,
     message: &'a str,
 }
 
@@ -54,6 +55,22 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn conflict_or_database(
+        error: sqlx::Error,
+        conflict_message: impl Into<String>,
+    ) -> Self {
+        if error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref()
+            == Some("23505")
+        {
+            Self::conflict(conflict_message)
+        } else {
+            Self::database(error)
+        }
+    }
+
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -67,6 +84,7 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(ErrorBody {
+                success: false,
                 message: &self.message,
             }),
         )

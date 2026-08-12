@@ -2,14 +2,18 @@ name: ctfzone
 
 services:
   caddy:
-    image: caddy:2
+    image: caddy:2.11.4@sha256:844f60b64e4724a5aa8245e019dace0d3f199f7433ce6c57676cb30a920dbad9
     restart: unless-stopped
     environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:?Set CADDY_SITE_ADDRESS in .env}
+      CADDY_STORAGE_ADDRESS: ${CADDY_STORAGE_ADDRESS:?Set CADDY_STORAGE_ADDRESS in .env}
+      MAX_PROXY_BODY_BYTES: ${MAX_PROXY_BODY_BYTES:-6291456}
+      OBJECT_STORAGE_MAX_UPLOAD_BYTES: ${OBJECT_STORAGE_MAX_UPLOAD_BYTES:-536870912}
+      OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS: ${OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS:-900}
     ports:
-      - "${HTTP_PORT:-80}:80"
-      - "${HTTPS_PORT:-443}:443"
-      - "${HTTPS_PORT:-443}:443/udp"
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -17,7 +21,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-      api:
+      storage:
         condition: service_healthy
     healthcheck:
       test:
@@ -35,6 +39,7 @@ services:
     networks:
       - edge
       - web
+      - objects
 
   backend:
     build:
@@ -44,10 +49,19 @@ services:
     environment:
       ACCESS_LOG: "-"
       API_BASE_URL: http://api:8080
+      API_EMAIL_TIMEOUT_SECONDS: ${BACKEND_EMAIL_API_TIMEOUT_SECONDS:-20}
       API_TIMEOUT_SECONDS: ${BACKEND_API_TIMEOUT_SECONDS:-5}
+      API_STORAGE_TIMEOUT_SECONDS: ${BACKEND_STORAGE_API_TIMEOUT_SECONDS:-60}
+      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:?Set BACKEND_SERVICE_TOKEN in .env}
+      BROWSER_SESSION_COOKIE_NAME: ${BROWSER_SESSION_COOKIE_NAME:-ctfzone_browser_session}
+      BROWSER_SESSION_COOKIE_SECURE: ${BROWSER_SESSION_COOKIE_SECURE:-true}
+      BROWSER_SESSION_LIFETIME_SECONDS: ${BROWSER_SESSION_LIFETIME_SECONDS:-604800}
       ERROR_LOG: "-"
-      MAX_PROXY_BODY_BYTES: ${MAX_PROXY_BODY_BYTES:-16777216}
+      MAX_PROXY_BODY_BYTES: ${MAX_PROXY_BODY_BYTES:-6291456}
+      OBJECT_STORAGE_PUBLIC_URL: ${CADDY_STORAGE_ADDRESS:?Set CADDY_STORAGE_ADDRESS in .env}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
       THREADS: ${BACKEND_THREADS:-4}
+      TIMEOUT: ${BACKEND_WORKER_TIMEOUT_SECONDS:-75}
       WORKERS: ${BACKEND_WORKERS:-2}
     expose:
       - "8000"
@@ -56,6 +70,7 @@ services:
         condition: service_healthy
     networks:
       - web
+      - application
 
   api:
     build:
@@ -64,25 +79,38 @@ services:
     restart: unless-stopped
     environment:
       CTFZONE_API_BIND: 0.0.0.0:8080
+      API_SIGNING_KEY: ${API_SIGNING_KEY:?Set API_SIGNING_KEY in .env}
+      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:?Set BACKEND_SERVICE_TOKEN in .env}
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:?Set CADDY_SITE_ADDRESS in .env}
       DATABASE_MAX_CONNECTIONS: ${API_DATABASE_MAX_CONNECTIONS:-10}
       DATABASE_URL: postgres://${POSTGRES_USER:-ctfzone}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-ctfzone}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://localhost}
+      EMAIL_VERIFICATION_TTL_SECONDS: ${EMAIL_VERIFICATION_TTL_SECONDS:-1800}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:?Set OBJECT_STORAGE_ACCESS_KEY in .env}
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-ctfzone}
+      OBJECT_STORAGE_INTERNAL_URL: http://storage:8333
+      OBJECT_STORAGE_MAX_UPLOAD_BYTES: ${OBJECT_STORAGE_MAX_UPLOAD_BYTES:-536870912}
+      OBJECT_STORAGE_MAX_PENDING_OBJECTS_PER_PRINCIPAL: ${OBJECT_STORAGE_MAX_PENDING_OBJECTS_PER_PRINCIPAL:-8}
+      OBJECT_STORAGE_MAX_PENDING_BYTES_PER_PRINCIPAL: ${OBJECT_STORAGE_MAX_PENDING_BYTES_PER_PRINCIPAL:-1073741824}
+      OBJECT_STORAGE_MAX_RETAINED_BYTES_PER_PRINCIPAL: ${OBJECT_STORAGE_MAX_RETAINED_BYTES_PER_PRINCIPAL:-10737418240}
+      OBJECT_STORAGE_MAX_UPLOADS_PER_HOUR_PER_PRINCIPAL: ${OBJECT_STORAGE_MAX_UPLOADS_PER_HOUR_PER_PRINCIPAL:-60}
+      OBJECT_STORAGE_PUBLIC_URL: ${CADDY_STORAGE_ADDRESS:?Set CADDY_STORAGE_ADDRESS in .env}
+      OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:?Set OBJECT_STORAGE_SECRET_KEY in .env}
+      PRESIGNED_URL_TTL_SECONDS: ${PRESIGNED_URL_TTL_SECONDS:-900}
       RUST_LOG: ${RUST_LOG:-ctfzone_api=info,tower_http=info}
-      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
       SETUP_TOKEN: ${SETUP_TOKEN:?Set SETUP_TOKEN in .env}
-      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-session}
-      SESSION_LIFETIME_SECONDS: ${SESSION_LIFETIME_SECONDS:-604800}
-      UPLOAD_FOLDER: /var/lib/ctfzone/uploads
+      SESSION_LIFETIME_SECONDS: ${BROWSER_SESSION_LIFETIME_SECONDS:-604800}
     expose:
       - "8080"
-    volumes:
-      - api_uploads:/var/lib/ctfzone/uploads
     depends_on:
       db:
         condition: service_healthy
+      storage:
+        condition: service_healthy
     networks:
-      - web
+      - application
       - data
+      - objects
       - egress
 
   controller:
@@ -95,6 +123,12 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-ctfzone}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-ctfzone}
       JOURNAL_PATH: /var/lib/ctfzone-controller/operations.jsonl
       MAX_COMMAND_ATTEMPTS: ${MAX_COMMAND_ATTEMPTS:-8}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:?Set OBJECT_STORAGE_ACCESS_KEY in .env}
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-ctfzone}
+      OBJECT_STORAGE_INTERNAL_URL: http://storage:8333
+      OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS: ${OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS:-900}
+      OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:?Set OBJECT_STORAGE_SECRET_KEY in .env}
       RECONCILIATION_INTERVAL_SECONDS: ${RECONCILIATION_INTERVAL_SECONDS:-300}
       REMOTE_DRIVER: ${CONTROLLER_REMOTE_DRIVER:-ssh}
       REMOTE_OPERATION_TIMEOUT_SECONDS: ${REMOTE_OPERATION_TIMEOUT_SECONDS:-60}
@@ -109,9 +143,58 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      storage:
+        condition: service_healthy
     networks:
       - data
+      - objects
       - egress
+
+  storage:
+    image: chrislusf/seaweedfs:4.41@sha256:43b768cd62b00d132439cda881b93fd1adebf1b315e996e794087743821d771d
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - mini
+      - -dir=/data
+      - -master.telemetry=false
+      - -admin.ui=false
+      - -webdav=false
+      - -s3.iam=false
+      - -s3.allowDeleteBucketNotEmpty=false
+      - -s3.concurrentFileUploadLimit=${OBJECT_STORAGE_UPLOAD_CONCURRENCY:-16}
+      - -s3.concurrentUploadLimitMB=${OBJECT_STORAGE_CONCURRENT_UPLOAD_MB:-2048}
+      - -filer.disableDirListing=true
+      - -filer.exposeDirectoryData=false
+      - -bucket=${OBJECT_STORAGE_BUCKET:-ctfzone}
+      - -s3.allowedOrigins=${CADDY_SITE_ADDRESS:?Set CADDY_SITE_ADDRESS in .env}
+    environment:
+      AWS_ACCESS_KEY_ID: ${OBJECT_STORAGE_ACCESS_KEY:?Set OBJECT_STORAGE_ACCESS_KEY in .env}
+      AWS_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_SECRET_KEY:?Set OBJECT_STORAGE_SECRET_KEY in .env}
+      S3_BUCKET: ${OBJECT_STORAGE_BUCKET:-ctfzone}
+    expose:
+      - "8333"
+    volumes:
+      - object_storage_data:/data
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1777
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS --max-time 3 http://127.0.0.1:9333/cluster/status >/dev/null &&
+          curl -sS --max-time 3 --output /dev/null http://127.0.0.1:8333/
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - objects
 
   db:
     image: postgres:16-alpine
@@ -137,7 +220,10 @@ services:
           )
           AND to_regclass('ctfzone.users') IS NOT NULL
           AND to_regclass('ctfzone.challenges') IS NOT NULL
-          AND to_regclass('ctfzone.runtime_instances') IS NOT NULL"
+          AND to_regclass('ctfzone.runtime_instances') IS NOT NULL
+          AND to_regclass('ctfzone.email_verification_tokens') IS NOT NULL
+          AND to_regclass('ctfzone.stored_objects') IS NOT NULL
+          AND to_regclass('ctfzone.object_operations') IS NOT NULL"
           | grep -qx 1
       interval: 5s
       timeout: 5s
@@ -150,13 +236,17 @@ networks:
   edge:
   web:
     internal: true
+  application:
+    internal: true
   data:
+    internal: true
+  objects:
     internal: true
   egress:
 
 volumes:
-  api_uploads:
   caddy_config:
   caddy_data:
   controller_journal:
+  object_storage_data:
   postgres_data:

@@ -1,4 +1,4 @@
-use std::{fs::File, io::Cursor, path::Path, time::Duration};
+use std::{io::Cursor, time::Duration};
 
 use axum::{
     Json,
@@ -93,8 +93,7 @@ pub(super) async fn raw(
     for table_name in table_names {
         tables.push(load_table(&state, &table_name).await?);
     }
-    let upload_folder = state.upload_folder.clone();
-    let bytes = tokio::task::spawn_blocking(move || build_archive(tables, &upload_folder))
+    let bytes = tokio::task::spawn_blocking(move || build_archive(tables))
         .await
         .map_err(|_| ApiError::upstream("Backup worker failed"))??;
     download_response(
@@ -172,7 +171,7 @@ fn csv_value(value: Option<&Value>) -> String {
     }
 }
 
-fn build_archive(tables: Vec<ExportTable>, upload_root: &Path) -> Result<Vec<u8>, ApiError> {
+fn build_archive(tables: Vec<ExportTable>) -> Result<Vec<u8>, ApiError> {
     let mut output = Cursor::new(Vec::new());
     {
         let mut archive = ZipWriter::new(&mut output);
@@ -187,69 +186,11 @@ fn build_archive(tables: Vec<ExportTable>, upload_root: &Path) -> Result<Vec<u8>
             serde_json::to_writer(&mut archive, &document)
                 .map_err(|_| ApiError::upstream("Unable to serialize backup data"))?;
         }
-        if upload_root.is_dir() {
-            add_upload_directory(&mut archive, upload_root, upload_root, options)?;
-        }
         archive
             .finish()
             .map_err(|_| ApiError::upstream("Unable to finalize backup archive"))?;
     }
     Ok(output.into_inner())
-}
-
-fn add_upload_directory(
-    archive: &mut ZipWriter<&mut Cursor<Vec<u8>>>,
-    root: &Path,
-    directory: &Path,
-    options: SimpleFileOptions,
-) -> Result<(), ApiError> {
-    for entry in std::fs::read_dir(directory)
-        .map_err(|_| ApiError::upstream("Unable to read upload storage"))?
-    {
-        let entry = entry.map_err(|_| ApiError::upstream("Unable to read upload storage"))?;
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| ApiError::upstream("Upload path is invalid"))?;
-        if relative
-            .components()
-            .next()
-            .is_some_and(|value| value.as_os_str() == ".incoming")
-        {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|_| ApiError::upstream("Unable to inspect upload storage"))?;
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        if metadata.is_dir() {
-            add_upload_directory(archive, root, &path, options)?;
-        } else if metadata.is_file() {
-            let relative = zip_path(relative)?;
-            archive
-                .start_file(format!("uploads/{relative}"), options)
-                .map_err(|_| ApiError::upstream("Unable to add an upload to the backup"))?;
-            let mut source = File::open(&path)
-                .map_err(|_| ApiError::upstream("Unable to read an uploaded file"))?;
-            std::io::copy(&mut source, archive)
-                .map_err(|_| ApiError::upstream("Unable to add an upload to the backup"))?;
-        }
-    }
-    Ok(())
-}
-
-fn zip_path(path: &Path) -> Result<String, ApiError> {
-    path.components()
-        .map(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| ApiError::upstream("Upload filename is not valid UTF-8"))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|parts| parts.join("/"))
 }
 
 fn download_response(

@@ -1,0 +1,30 @@
+{% extends player_template('base.html') %}
+{% block title %}Verify email · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="auth-shell">
+    <div class="auth-copy">
+      <span class="eyebrow">EMAIL VERIFICATION</span>
+      <h1>Confirm your address.</h1>
+      <p>Verification links are single-use and expire automatically. Confirming connects this email address to your participant account.</p>
+    </div>
+    <div class="auth-card" data-confirm-card>
+      <div class="panel-heading"><span class="status-dot {{ 'off' if confirmation_state == 'error' }}"></span><span>VERIFY EMAIL</span></div>
+      {% if confirmation_state %}
+        <div class="form-message {{ confirmation_state }}" role="{{ 'status' if confirmation_state == 'success' else 'alert' }}">{{ confirmation_message }}</div>
+        <a class="button button-wide" href="{{ url_for('web.login') if not bootstrap.authenticated else url_for('web.challenges') }}">{{ 'Log in' if not bootstrap.authenticated else 'Continue to challenges' }}</a>
+      {% else %}
+        <div class="form-message error" role="alert" hidden data-confirm-error>This verification link is invalid or incomplete.</div>
+        <form action="{{ url_for('web.confirm_email') }}" method="post" class="stack-form" data-confirm-form>
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="token" value="" disabled data-confirm-token>
+          <p class="confirmation-note">The address will be marked verified only after the platform accepts this link.</p>
+          <button class="button button-wide" type="submit" disabled data-confirm-submit>Confirm email address</button>
+        </form>
+        <noscript><div class="form-message warning">JavaScript is required to safely read this verification link.</div></noscript>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}
+{% block scripts %}
+  {% if not confirmation_state %}<script type="module" src="{{ player_asset('js/confirm.js') }}"></script>{% endif %}
+{% endblock %}

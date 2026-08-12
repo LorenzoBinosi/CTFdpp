@@ -1,0 +1,115 @@
+{% macro admin_icon(name, class_name='admin-nav-icon') -%}
+  <svg class="{{ class_name }}" viewBox="0 0 16 16" aria-hidden="true"><use href="#admin-icon-{{ name }}"></use></svg>
+{%- endmacro %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f4f6f8">
+    <meta name="csrf-token" content="{{ csrf_token | default('') }}">
+    <meta name="object-storage-origin" content="{{ storage_origin | default('') }}">
+    <title>{% block title %}{{ admin_title }} · {{ site.name }} administration{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('frontend_assets.admin_asset', filename='css/admin.css', v=frontend_asset_version) }}">
+  </head>
+  <body class="admin-body" data-admin-module="{{ admin_module }}" data-authenticated="{{ 'true' if bootstrap.authenticated else 'false' }}">
+    <a class="admin-skip-link" href="#main-content">Skip to main content</a>
+    <svg class="admin-icon-sprite" aria-hidden="true">
+      <symbol id="admin-icon-home" viewBox="0 0 16 16"><path d="M3 8.4 8 4l5 4.4M4.6 7.6V13h6.8V7.6"></path></symbol>
+      <symbol id="admin-icon-check" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"></circle><path d="m5.6 8.3 1.7 1.6 3.1-3.6"></path></symbol>
+      <symbol id="admin-icon-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"></circle><path d="M8 5.1V8l1.9 1.3"></path></symbol>
+      <symbol id="admin-icon-flag" viewBox="0 0 16 16"><path d="M4.5 13.5V3.4m0 .5c2.2-1.1 4.3 1 6.9-.1v4.8c-2.6 1.1-4.7-1-6.9.1"></path></symbol>
+      <symbol id="admin-icon-user" viewBox="0 0 16 16"><circle cx="8" cy="5.2" r="2.4"></circle><path d="M3.6 13.4c.6-2.5 2.3-3.8 4.4-3.8s3.8 1.3 4.4 3.8"></path></symbol>
+      <symbol id="admin-icon-team" viewBox="0 0 16 16"><circle cx="5.9" cy="5.6" r="2.1"></circle><path d="M2.6 13.2c.5-2.2 1.8-3.3 3.3-3.3 1.6 0 2.9 1.1 3.4 3.3M10.4 4.1a2 2 0 1 1 .8 3.9M11.4 9.8c1.4.3 2.3 1.4 2.7 3.2"></path></symbol>
+      <symbol id="admin-icon-server" viewBox="0 0 16 16"><rect x="2.8" y="3" width="10.4" height="4.2" rx="1.2"></rect><rect x="2.8" y="8.8" width="10.4" height="4.2" rx="1.2"></rect><path d="M5.2 5.1h.01M5.2 10.9h.01"></path></symbol>
+      <symbol id="admin-icon-settings" viewBox="0 0 16 16"><circle cx="9.7" cy="5" r="1.7"></circle><circle cx="5.7" cy="11" r="1.7"></circle><path d="M2.8 5h5.1M11.5 5h1.7M2.8 11h1.1M7.5 11h5.7"></path></symbol>
+      <symbol id="admin-icon-external" viewBox="0 0 16 16"><path d="M6.5 3.5h-3v9h9v-3M9.8 3H13v3.2M12.6 3.4 7.8 8.2"></path></symbol>
+      <symbol id="admin-icon-logout" viewBox="0 0 16 16"><path d="M6.5 3h-3v10h3M10.5 5.5 13 8l-2.5 2.5M13 8H6.5"></path></symbol>
+      <symbol id="admin-icon-menu" viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"></path></symbol>
+      <symbol id="admin-icon-search" viewBox="0 0 16 16"><circle cx="7.3" cy="7.3" r="3.9"></circle><path d="m10.2 10.2 2.8 2.8"></path></symbol>
+    </svg>
+
+    {% set onboarding = admin_module == 'setup' %}
+    <div class="admin-shell {{ 'admin-shell-onboarding' if onboarding }}">
+      {% if not onboarding %}
+        <aside class="admin-sidebar" data-admin-sidebar>
+          <a class="admin-brand" href="{{ url_for('web.admin_overview') }}" aria-label="{{ site.name }} administration" title="{{ site.name }} administration">
+            <span class="admin-brand-mark">{{ (site.name or 'C')[:1] | upper }}</span>
+            <span class="admin-brand-copy"><span class="admin-brand-name">{{ site.name }}</span><span>Administration</span></span>
+          </a>
+          <nav aria-label="Administration navigation">
+            <p class="admin-nav-label">Monitor</p>
+            <a class="{{ 'active' if admin_module == 'overview' }}" href="{{ url_for('web.admin_overview') }}"{% if admin_module == 'overview' %} aria-current="page"{% endif %}>{{ admin_icon('home') }}<span>Overview</span></a>
+            <a class="{{ 'active' if admin_module == 'submissions' }}" href="{{ url_for('web.admin_submissions') }}"{% if admin_module == 'submissions' %} aria-current="page"{% endif %}>{{ admin_icon('check') }}<span>Submissions</span></a>
+            <a class="{{ 'active' if admin_module == 'sessions' }}" href="{{ url_for('web.admin_sessions') }}"{% if admin_module == 'sessions' %} aria-current="page"{% endif %}>{{ admin_icon('clock') }}<span>Sessions</span></a>
+
+            <p class="admin-nav-label">Competition</p>
+            <a class="{{ 'active' if admin_module == 'challenges' }}" href="{{ url_for('web.admin_challenges') }}"{% if admin_module == 'challenges' %} aria-current="page"{% endif %}>{{ admin_icon('flag') }}<span>Challenges</span></a>
+            <a class="{{ 'active' if admin_module == 'users' }}" href="{{ url_for('web.admin_users') }}"{% if admin_module == 'users' %} aria-current="page"{% endif %}>{{ admin_icon('user') }}<span>Users</span></a>
+            <a class="{{ 'active' if admin_module == 'teams' }}" href="{{ url_for('web.admin_teams') }}"{% if admin_module == 'teams' %} aria-current="page"{% endif %}>{{ admin_icon('team') }}<span>Teams</span></a>
+
+            <p class="admin-nav-label">System</p>
+            <a class="{{ 'active' if admin_module == 'runtime' }}" href="{{ url_for('web.admin_runtime') }}"{% if admin_module == 'runtime' %} aria-current="page"{% endif %}>{{ admin_icon('server') }}<span>Managed instances</span></a>
+            <a class="{{ 'active' if admin_module == 'config' }}" href="{{ url_for('web.admin_config') }}"{% if admin_module == 'config' %} aria-current="page"{% endif %}>{{ admin_icon('settings') }}<span>Configuration</span></a>
+          </nav>
+          <div class="admin-sidebar-footer">
+            <div class="admin-connection-state"><span class="status-dot {{ 'off' if not bootstrap.available }}"></span><span>{{ 'API connected through BFF' if bootstrap.available else 'API unavailable' }}</span></div>
+            {% if bootstrap.authenticated and user %}
+              <form class="admin-account-card" action="{{ url_for('web.logout') }}" method="post">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+                <span class="admin-avatar">{{ (user.name or 'AD')[:2] | upper }}</span>
+                <span class="admin-account-copy"><strong>{{ user.name }}</strong><small>Administrator</small></span>
+                <button type="submit" title="Log out" aria-label="Log out">{{ admin_icon('logout', 'admin-account-icon') }}</button>
+              </form>
+            {% endif %}
+          </div>
+        </aside>
+        <button class="admin-sidebar-backdrop" type="button" aria-label="Close administration navigation" data-admin-backdrop></button>
+      {% endif %}
+
+      <section class="admin-workspace">
+        <header class="admin-topbar {{ 'admin-topbar-onboarding' if onboarding }}">
+          {% if not onboarding %}
+            <button class="admin-menu-button" type="button" aria-label="Toggle administration navigation" aria-expanded="false" data-admin-menu>{{ admin_icon('menu', 'admin-menu-icon') }}</button>
+            <span class="admin-mobile-brand" title="{{ site.name }}">{{ site.name }}</span>
+            <div class="admin-breadcrumb"><span>Administration</span><i>/</i><strong>{{ admin_title }}</strong></div>
+          {% else %}
+            <a class="admin-onboarding-brand" href="{{ url_for('web.setup') }}" aria-label="{{ site.name }} administration">
+              <span class="admin-brand-mark">{{ (site.name or 'C')[:1] | upper }}</span>
+              <span class="admin-brand-copy"><span class="admin-brand-name">{{ site.name }}</span><span>Administration</span></span>
+            </a>
+          {% endif %}
+          <div class="admin-topbar-actions">
+            <span class="admin-control-state"><span class="status-dot {{ 'off' if not bootstrap.available }}"></span>{{ 'Control plane' if bootstrap.available else 'API unavailable' }}</span>
+            {% if bootstrap.authenticated %}
+              <span class="admin-topbar-divider"></span>
+              <a href="{{ url_for('web.challenges') }}">View portal {{ admin_icon('external', 'admin-inline-icon') }}</a>
+              <form class="admin-topbar-logout" action="{{ url_for('web.logout') }}" method="post">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+                <button type="submit">Log out</button>
+              </form>
+            {% endif %}
+          </div>
+        </header>
+
+        <main class="admin-main {{ 'admin-main-onboarding' if onboarding }}" id="main-content">
+          <header class="admin-page-heading">
+            <div>
+              <h1>{{ admin_title }}</h1>
+              {% block description %}{% endblock %}
+            </div>
+            <div class="admin-heading-actions">{% block actions %}{% endblock %}</div>
+          </header>
+          {% if module_error %}
+            <div class="admin-alert danger" role="status">This module could not load all data from the API. Existing controls remain available; try refreshing before making changes.</div>
+          {% endif %}
+          {% block admin_content %}{% endblock %}
+        </main>
+      </section>
+    </div>
+
+    <div class="toast-region" aria-live="polite" aria-atomic="true" data-toast-region></div>
+    <script type="module" src="{{ url_for('frontend_assets.admin_asset', filename='js/admin.js', v=frontend_asset_version) }}"></script>
+  </body>
+</html>

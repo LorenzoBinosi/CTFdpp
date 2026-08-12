@@ -35,10 +35,10 @@ pub(super) async fn create(
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::database)?
-    .is_none_or(|value| {
-        !matches!(
+    .is_some_and(|value| {
+        matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "false" | "0" | "off"
+            "true" | "1" | "yes" | "on"
         )
     });
     if !social_shares {
@@ -71,12 +71,9 @@ pub(super) async fn create(
         .map_err(|_| ApiError::upstream("Share signing is unavailable"))?;
     signer.update(message.as_bytes());
     let mac = hex::encode(signer.finalize().into_bytes());
-    let mut url = state.public_base_url.clone();
-    url.set_path("/share/solve");
-    url.set_query(None);
-    url.query_pairs_mut()
-        .append_pair("user_id", &user.id.to_string())
-        .append_pair("challenge_id", &request.challenge_id.to_string())
-        .append_pair("mac", &mac);
-    Ok(Json(Success::new(json!({"url": url.as_str()}))).into_response())
+    let path = format!(
+        "/share/solve?user_id={}&challenge_id={}&mac={mac}",
+        user.id, request.challenge_id
+    );
+    Ok(Json(Success::new(json!({"url": path}))).into_response())
 }

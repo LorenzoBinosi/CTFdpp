@@ -51,18 +51,14 @@ pub(crate) async fn lock_invariant(
 pub(crate) async fn mark_complete(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), ApiError> {
-    let updated = sqlx::query("UPDATE ctfzone.config SET value='true' WHERE key=$1")
-        .bind(COMPLETED_MARKER_KEY)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::database)?;
-    if updated.rows_affected() == 0 {
-        sqlx::query("INSERT INTO ctfzone.config (key,value) VALUES ($1,'true')")
-            .bind(COMPLETED_MARKER_KEY)
-            .execute(&mut **transaction)
-            .await
-            .map_err(ApiError::database)?;
-    }
+    sqlx::query(
+        "INSERT INTO ctfzone.config (key,value) VALUES ($1,'true') \
+         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+    )
+    .bind(COMPLETED_MARKER_KEY)
+    .execute(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?;
     Ok(())
 }
 

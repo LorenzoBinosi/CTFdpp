@@ -56,6 +56,11 @@ pub(crate) struct RemoteResult {
     pub(crate) endpoint_url: Option<String>,
     pub(crate) effective_expires_at: Option<DateTime<Utc>>,
     pub(crate) absent: Option<bool>,
+    pub(crate) ready: Option<bool>,
+    pub(crate) runtime_status: Option<String>,
+    pub(crate) health_status: Option<String>,
+    pub(crate) stale_generation: Option<bool>,
+    pub(crate) effective_generation: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -114,6 +119,8 @@ impl RemoteExecutor {
                     .get("expires_at")
                     .and_then(Value::as_str)
                     .and_then(|value| value.parse().ok()),
+                effective_generation: payload.get("generation").and_then(Value::as_i64),
+                ready: Some(true),
                 ..RemoteResult::default()
             },
             RemoteOperation::StopInstance => RemoteResult {
@@ -125,6 +132,7 @@ impl RemoteExecutor {
                     .get("expires_at")
                     .and_then(Value::as_str)
                     .and_then(|value| value.parse().ok()),
+                effective_generation: payload.get("generation").and_then(Value::as_i64),
                 ..RemoteResult::default()
             },
         })
@@ -137,6 +145,7 @@ impl RemoteExecutor {
         payload: &Value,
     ) -> Result<RemoteResult> {
         validate_remote_server(server)?;
+        validate_startup_timeout(operation, payload, self.operation_timeout)?;
         let identity_file = server
             .identity_file
             .as_ref()
@@ -205,6 +214,26 @@ impl RemoteExecutor {
     }
 }
 
+fn validate_startup_timeout(
+    operation: RemoteOperation,
+    payload: &Value,
+    operation_timeout: std::time::Duration,
+) -> Result<()> {
+    if !matches!(operation, RemoteOperation::EnsureInstance) {
+        return Ok(());
+    }
+    let startup_seconds = payload
+        .pointer("/deployment/healthcheck/startup_timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(45);
+    if std::time::Duration::from_secs(startup_seconds.saturating_add(5)) > operation_timeout {
+        bail!(
+            "challenge startup timeout {startup_seconds}s must leave at least 5s within REMOTE_OPERATION_TIMEOUT_SECONDS"
+        );
+    }
+    Ok(())
+}
+
 fn validate_remote_server(server: &RemoteServer) -> Result<()> {
     if server.ssh_port <= 0 || server.ssh_port > 65535 {
         bail!("remote server has an invalid SSH port");
@@ -256,5 +285,28 @@ mod tests {
         assert!(!safe_user("bad@host"));
         assert!(safe_host_component("challenge-1.internal"));
         assert!(safe_user("ctfzone_runtime"));
+    }
+
+    #[test]
+    fn startup_wait_must_fit_inside_remote_operation_timeout() {
+        let payload = serde_json::json!({
+            "deployment": {"healthcheck": {"startup_timeout_seconds": 56}}
+        });
+        assert!(
+            validate_startup_timeout(
+                RemoteOperation::EnsureInstance,
+                &payload,
+                std::time::Duration::from_secs(60),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_startup_timeout(
+                RemoteOperation::EnsureInstance,
+                &payload,
+                std::time::Duration::from_secs(61),
+            )
+            .is_ok()
+        );
     }
 }

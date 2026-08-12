@@ -1,7 +1,7 @@
 # CTFZone future implementation
 
-Status: Proposed roadmap beyond the 1.0.0 private-instance baseline
-Last updated: 2026-08-11
+Status: Proposed roadmap beyond the 1.0.0 private-instance and object-storage baseline
+Last updated: 2026-08-12
 
 This document summarizes the planned architecture for scheduled events, King of
 the Hill, attack/defense simulations, and speedrun challenges. It extends the
@@ -29,14 +29,11 @@ The controller is a low-frequency orchestration plane. It must not carry player
 traffic, score updates, PCAP bodies, game ticks, or live browser subscriptions.
 
 ```text
-Browser -- Caddy --> Python pages
-              \----> Rust API ------> PostgreSQL
-                         ^                 |
-                         | signed facts    | durable commands/jobs
-                         |                 v
-                   remote agent <---- Controller service
-                         |
-                  arenas and judges
+Browser -- portal --> Caddy site --> Python BFF --> private Rust API --> PostgreSQL
+   `-- signed PUT/GET --> Caddy storage --> S3-compatible object store
+
+PostgreSQL -- durable work --> Controller --> remote agent --> arenas and judges
+future machine facts -- scoped integration ingress --> private Rust API
 ```
 
 ## 2. Responsibility boundaries
@@ -51,12 +48,15 @@ Browser -- Caddy --> Python pages
 | Arena, judge, and patch execution | Remote host/agent |
 | Challenge observations and results | Remote agent to Rust API |
 | PCAP generation | Remote host |
-| Artifact and PCAP download authorization | Rust API |
-| Live page updates | Rust API through a page-scoped SSE stream |
+| Artifact and PCAP metadata/authorization | Rust API and PostgreSQL |
+| Artifact and PCAP bytes | S3-compatible object storage data plane |
+| Live page updates | Initially explicit/bounded refresh; SSE is a postponed improvement |
 
-Participants continue to use the public Caddy origin. They never connect to the
-controller and cannot select images, hosts, commands, limits, or deployment
-operations.
+Participants continue to use the Caddy site origin and Python BFF for every
+portal/API action. The only narrow exception is a short-lived signed transfer to
+the separate Caddy storage origin. There is no public generic Rust `/api/v1` or
+`/files` route. Participants never connect to the controller and cannot select
+images, hosts, commands, limits, storage keys, or deployment operations.
 
 ## 3. Controller shape
 
@@ -104,7 +104,8 @@ The remote agent will:
 - manage local arenas, jobs, participant slots, and deadlines;
 - keep a disk-backed outbox for unacknowledged facts and results;
 - push signed observations directly to the Rust API;
-- generate and upload artifacts such as judge output and PCAPs;
+- obtain scoped object grants and upload artifacts such as judge output and
+  PCAPs without proxying bodies through Python;
 - enforce host-local expiry when CTFZone is unavailable.
 
 Expensive and continuous work stays remote. The controller only dispatches,
@@ -147,8 +148,10 @@ speedrun attempt per participant and event.
 
 ## 6. Signed remote facts
 
-Remote systems push observations to a versioned Rust API ingestion endpoint.
-An event envelope includes:
+Remote systems will push observations to a versioned Rust ingestion endpoint.
+That requires a deliberately exposed, machine-authenticated integration ingress
+(for example private networking or an mTLS-only Caddy route); it must not expose
+the generic private API used by the BFF. An event envelope includes:
 
 ```text
 schema version
@@ -198,11 +201,39 @@ only through an explicit final conversion or award.
 
 ## 8. Artifacts and execution jobs
 
-Programs, Git diffs, build results, logs, and PCAPs use immutable,
-content-addressed artifact metadata with SHA-256, size, ownership, retention,
-and authorization policy. Large bodies do not belong in PostgreSQL. The first
-version may use the existing shared upload volume behind a storage abstraction;
-object storage can be added later without changing the domain model.
+Programs, Git diffs, build results, logs, and PCAPs use the implemented immutable
+object model: PostgreSQL owns SHA-256, size, ownership, purpose, retention,
+authorization, lifecycle, and audit metadata, while an S3-compatible service
+stores bytes. Neither presigned URLs nor storage credentials are durable domain
+records.
+
+The browser transfer protocol remains the baseline for future artifact types:
+
+1. The browser sends filename, size, content type, required SHA-256, purpose,
+   and owning entity through Python's CSRF-protected BFF.
+2. Rust inserts a `pending` object record and returns a short-lived signed PUT
+   for a staging key on `CADDY_STORAGE_ADDRESS`.
+3. The browser sends bytes directly to that URL with the exact signed headers;
+   Python and Rust never buffer the object body.
+4. The browser posts the returned completion path through the BFF. Rust verifies
+   storage metadata and checksum, promotes the staged body to its immutable
+   final key, then atomically marks metadata `ready` and associates it with the
+   domain record.
+5. Downloads begin at Python `/downloads/<object-id>`. Rust reauthorizes the
+   ready object and Python redirects only to a short-lived URL on the configured
+   storage origin.
+
+The durable `object_operations` queue lets the controller reconcile expired
+pending uploads and process idempotent deletion/cleanup after restarts. The
+default maintenance scan is bounded to 30 seconds; database rows are claimed
+with leases rather than relying on in-memory timers. Backup and restore must
+treat PostgreSQL metadata and S3 objects as one recovery set.
+
+The initial admin browser uses WebCrypto's whole-buffer digest and therefore
+caps each selected file at 64 MiB. Supporting larger interactive uploads is a
+future UI improvement that requires a reviewed incremental/streaming SHA-256
+implementation (preferably off the main thread); the higher API-side object
+limit must not be used to justify unbounded browser memory.
 
 Asynchronous work uses durable execution jobs, separate from personal runtime
 commands:
@@ -296,8 +327,11 @@ The design does not require one-second polling:
 - PostgreSQL notifications wake controller queues;
 - exact timers wake scheduled event and expiry work;
 - remote agents push fact/result batches and occasional heartbeats;
-- a dedicated SSE connection exists only while a live event page is visible;
-- `Last-Event-ID` permits replay after browser reconnection.
+- pages use explicit refreshes and bounded transition checks where needed.
+
+Page-scoped Server-Sent Events are deliberately outside the current delivery
+scope. Their proposed Python-to-Rust relay, replay, and scaling requirements are
+recorded in [`POSSIBLE_IMPROVEMENTS.md`](POSSIBLE_IMPROVEMENTS.md).
 
 ## 13. Failure behavior
 
@@ -319,7 +353,8 @@ The design does not require one-second polling:
 1. Event, participant, challenge-kind, and event-page foundations.
 2. Scoped participant credentials and signed remote fact ingestion.
 3. Immutable fact store, score ledger, projections, and event scoreboards.
-4. Artifact storage abstraction and generic execution-job queue.
+4. Extend the implemented object-storage baseline with event retention policies
+   and a generic execution-job queue.
 5. Submitted-program and live KOTH support.
 6. Speedrun attempts, personal bests, and scheduled heats.
 7. Shared arenas, rounds, services, flags, and A/D scoring.

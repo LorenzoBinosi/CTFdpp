@@ -23,6 +23,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.86.0"
           components: clippy,rustfmt
 
       - name: Cache Rust build artifacts
@@ -71,6 +72,10 @@ jobs:
         working-directory: .
         run: python -m py_compile remote-helper/ctfzone-runtime-helper
 
+      - name: Run remote helper tests
+        working-directory: .
+        run: python -m unittest remote-helper/test_runtime_helper.py -v
+
       - name: Check remote helper installer
         working-directory: .
         run: sh -n remote-helper/install.sh
@@ -79,9 +84,15 @@ jobs:
     name: Compose configuration
     runs-on: ubuntu-latest
     env:
+      API_SIGNING_KEY: compose-check-api-signing-key
+      BACKEND_SERVICE_TOKEN: compose-check-backend-token
+      CADDY_SITE_ADDRESS: https://ctf.example.test
+      CADDY_STORAGE_ADDRESS: https://files.ctf.example.test
+      OBJECT_STORAGE_ACCESS_KEY: compose-check-storage-access
+      OBJECT_STORAGE_SECRET_KEY: compose-check-storage-secret
       POSTGRES_PASSWORD: compose-check-only
-      SECRET_KEY: compose-check-only
-      SETUP_TOKEN: compose-check-only
+      SECRET_KEY: compose-check-browser-key
+      SETUP_TOKEN: compose-check-setup-token
     steps:
       - name: Check out repository
         uses: actions/checkout@v5

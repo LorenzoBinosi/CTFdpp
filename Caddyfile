@@ -1,26 +1,38 @@
-{$SITE_ADDRESS:localhost} {
-	request_body {
-		# Match the Rust API's 512 MiB file ceiling plus multipart overhead.
-		max_size 513MiB
+{
+	servers {
+		timeouts {
+			# A finite body-read window makes staging cleanup provable: once a
+			# signed PUT has expired and this window has elapsed, no accepted
+			# upload can still commit behind the controller's final DELETE.
+			read_body {$OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS:900}s
+			read_header 10s
+		}
 	}
+}
 
+{$CADDY_SITE_ADDRESS:https://localhost} {
 	encode zstd gzip
 
-	# Rust exposes the stable machine API. The browser UI uses the Python BFF's
-	# /bff boundary, while integrations may call /api/v1 directly.
-	@api path /api/v1 /api/v1/*
-	handle @api {
-		reverse_proxy api:8080
+	# The browser can reach only the Python web boundary. Rust is intentionally
+	# absent from Caddy's application routes and accepts service-authenticated
+	# traffic on an internal Docker network.
+	# Portal bodies are small metadata/forms. Buffering the same bounded body
+	# before opening an upstream request prevents slow clients from occupying a
+	# finite Gunicorn worker during the storage-sized edge upload window.
+	request_body {
+		max_size {$MAX_PROXY_BODY_BYTES:6291456}
+	}
+	reverse_proxy backend:8000 {
+		request_buffers {$MAX_PROXY_BODY_BYTES:6291456}
+	}
+}
+
+{$CADDY_STORAGE_ADDRESS:https://files.localhost} {
+	request_body {
+		max_size {$OBJECT_STORAGE_MAX_UPLOAD_BYTES:536870912}
 	}
 
-	# Uploaded content is authorized and streamed by the Rust API.
-	handle /files* {
-		reverse_proxy api:8080
-	}
-
-	# Python owns every human-facing route, including authentication forms and
-	# their server-to-server calls into the Rust API.
-	handle {
-		reverse_proxy backend:8000
-	}
+	# Every useful request is authorized by a short-lived S3 signature. Caddy
+	# does not rewrite paths, hosts, or query strings because they are signed.
+	reverse_proxy storage:8333
 }

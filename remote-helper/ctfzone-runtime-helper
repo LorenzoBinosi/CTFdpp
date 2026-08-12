@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -12,6 +13,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from typing import Any
 
 
@@ -67,6 +70,7 @@ def load_config() -> dict[str, str]:
 CONFIG = load_config()
 STATE_DIRECTORY = pathlib.Path(CONFIG["CTFZONE_STATE_DIRECTORY"])
 INSTANCES_DIRECTORY = STATE_DIRECTORY / "instances"
+TOMBSTONES_DIRECTORY = STATE_DIRECTORY / "tombstones"
 
 
 def run(
@@ -155,6 +159,28 @@ def state_path(identifier: str) -> pathlib.Path:
     return INSTANCES_DIRECTORY / f"{identifier}.json"
 
 
+def tombstone_path(identifier: str) -> pathlib.Path:
+    return TOMBSTONES_DIRECTORY / f"{identifier}.json"
+
+
+@contextmanager
+def instance_lock(identifier: str):
+    if not INSTANCE_RE.fullmatch(identifier):
+        raise HelperError("instance_id is invalid")
+    locks_directory = INSTANCES_DIRECTORY.parent / "locks"
+    locks_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(locks_directory / f"{identifier}.lock", flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def read_state(identifier: str) -> dict[str, Any] | None:
     path = state_path(identifier)
     try:
@@ -195,29 +221,122 @@ def remove_state(identifier: str) -> None:
     state_path(identifier).unlink(missing_ok=True)
 
 
+def read_tombstone(identifier: str) -> dict[str, Any] | None:
+    try:
+        tombstone = json.loads(tombstone_path(identifier).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise HelperError("instance tombstone is unreadable") from error
+    generation_value = tombstone.get("generation") if isinstance(tombstone, dict) else None
+    if (
+        not isinstance(tombstone, dict)
+        or tombstone.get("instance_id") != identifier
+        or tombstone.get("blocked") is not True
+        or not isinstance(generation_value, int)
+        or isinstance(generation_value, bool)
+        or generation_value <= 0
+    ):
+        raise HelperError("instance tombstone is corrupt")
+    return tombstone
+
+
+def write_tombstone(identifier: str, stopped_generation: int) -> None:
+    if stopped_generation <= 0:
+        raise HelperError("tombstone generation is invalid")
+    try:
+        existing = read_tombstone(identifier)
+    except HelperError:
+        # A corrupt tombstone must never reopen the UUID. Replacing it with a
+        # valid blocked record preserves the fail-closed policy.
+        existing = None
+    highest_generation = max(
+        stopped_generation,
+        int((existing or {}).get("generation") or 0),
+    )
+    TOMBSTONES_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{identifier}.", dir=TOMBSTONES_DIRECTORY
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "instance_id": identifier,
+                    "generation": highest_generation,
+                    "blocked": True,
+                    "stopped_at": dt.datetime.now(dt.timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+                handle,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, tombstone_path(identifier))
+        directory_fd = os.open(TOMBSTONES_DIRECTORY, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def container_name(identifier: str) -> str:
     return f"ctfzone-{identifier}"
 
 
-def timer_base(identifier: str) -> str:
-    return f"ctfzone-expire-{identifier.replace('-', '')}"
+def network_name(identifier: str) -> str:
+    prefix = CONFIG["CTFZONE_NETWORK"]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,29}", prefix):
+        raise HelperError("challenge network prefix is invalid or too long")
+    return f"{prefix}-{identifier.replace('-', '')}"
 
 
-def cancel_timer(identifier: str) -> None:
-    base = timer_base(identifier)
+def timer_base(identifier: str, expected_generation: int | None = None) -> str:
+    base = f"ctfzone-expire-{identifier.replace('-', '')}"
+    return base if expected_generation is None else f"{base}-g{expected_generation}"
+
+
+def cancel_timer(identifier: str, expected_generation: int | None = None) -> None:
+    base = timer_base(identifier, expected_generation)
     systemctl("stop", f"{base}.timer", f"{base}.service", check=False)
     systemctl("reset-failed", f"{base}.service", check=False)
 
 
-def schedule_timer(identifier: str, expected_generation: int, expires_at: dt.datetime) -> None:
-    cancel_timer(identifier)
+def timer_is_active(identifier: str, expected_generation: int) -> bool:
+    completed = systemctl(
+        "is-active", "--quiet", f"{timer_base(identifier, expected_generation)}.timer", check=False
+    )
+    return completed.returncode == 0
+
+
+def schedule_timer(
+    identifier: str,
+    expected_generation: int,
+    expires_at: dt.datetime,
+    previous_generation: int | None = None,
+) -> None:
     if expires_at <= dt.datetime.now(dt.timezone.utc):
-        expire_instance(identifier, expected_generation)
+        # Never acknowledge a new generation without a live fail-closed TTL.
+        # Callers either retain the previous generation's timer or remove a
+        # just-created workload; the periodic sweeper remains the final guard.
+        raise HelperError("cannot schedule an elapsed expiry deadline")
+    if timer_is_active(identifier, expected_generation):
+        if previous_generation is not None and previous_generation != expected_generation:
+            cancel_timer(identifier, previous_generation)
+        cancel_timer(identifier)
         return
     calendar = expires_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     helper_path = str(pathlib.Path(__file__).resolve())
     systemd_run(
-        f"--unit={timer_base(identifier)}",
+        f"--unit={timer_base(identifier, expected_generation)}",
         f"--on-calendar={calendar}",
         "--timer-property=AccuracySec=1s",
         "--property=Type=oneshot",
@@ -230,6 +349,12 @@ def schedule_timer(identifier: str, expected_generation: int, expires_at: dt.dat
         identifier,
         str(expected_generation),
     )
+    if not timer_is_active(identifier, expected_generation):
+        raise HelperError("expiry timer was not activated")
+    if previous_generation is not None and previous_generation != expected_generation:
+        cancel_timer(identifier, previous_generation)
+    # Remove the pre-1.0 generation-less unit only after the replacement exists.
+    cancel_timer(identifier)
 
 
 def inspect_raw(identifier: str) -> dict[str, Any] | None:
@@ -253,12 +378,27 @@ def inspect_raw(identifier: str) -> dict[str, Any] | None:
 
 def inspect_result(identifier: str) -> dict[str, Any]:
     inspection = inspect_raw(identifier)
-    state = read_state(identifier)
     if inspection is None:
         return {"absent": True}
+    try:
+        state = read_state(identifier)
+    except HelperError:
+        state = None
     labels = inspection.get("Config", {}).get("Labels", {}) or {}
     if labels.get("ctfzone.instance_id") != identifier:
         raise HelperError("container identity label does not match")
+    if state is None:
+        effective_generation = state_generation(None, inspection) or 1
+        remove_irrecoverable_instance_unlocked(identifier, inspection)
+        return {
+            "absent": True,
+            "stale_generation": True,
+            "effective_generation": effective_generation,
+            "ready": False,
+        }
+    runtime_state = inspection.get("State", {}) or {}
+    runtime_status = str(runtime_state.get("Status") or "").lower() or None
+    running = runtime_state.get("Running") is True
     network_settings = inspection.get("NetworkSettings", {}) or {}
     networks = network_settings.get("Networks", {}) or {}
     remote_ip = next(
@@ -270,6 +410,13 @@ def inspect_result(identifier: str) -> dict[str, Any]:
         None,
     )
     deployment = (state or {}).get("deployment", {})
+    healthcheck = deployment.get("healthcheck", {}) or {}
+    expects_health = bool(healthcheck.get("command"))
+    health_status = (
+        str((runtime_state.get("Health") or {}).get("Status") or "").lower()
+        or None
+    )
+    ready = running and (not expects_health or health_status == "healthy")
     container_port = deployment.get("container_port")
     bindings = (network_settings.get("Ports", {}) or {}).get(
         f"{container_port}/tcp", []
@@ -294,8 +441,217 @@ def inspect_result(identifier: str) -> dict[str, Any]:
         "public_hostname": public_hostname,
         "endpoint_url": endpoint_url,
         "effective_expires_at": (state or {}).get("expires_at"),
+        "effective_generation": state_generation(state, inspection),
         "absent": False,
+        "ready": ready,
+        "runtime_status": runtime_status,
+        "health_status": health_status,
     }
+
+
+def state_generation(
+    state: dict[str, Any] | None, inspection: dict[str, Any] | None = None
+) -> int | None:
+    value = (state or {}).get("generation")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    labels = (inspection or {}).get("Config", {}).get("Labels", {}) or {}
+    labelled = labels.get("ctfzone.generation")
+    try:
+        parsed = int(labelled)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def remove_container_verified(identifier: str) -> None:
+    engine("rm", "--force", container_name(identifier), check=False)
+    if inspect_raw(identifier) is not None:
+        raise HelperError("container still exists after forced removal")
+
+
+def remove_network_verified(identifier: str) -> None:
+    network = network_name(identifier)
+    engine("network", "rm", network, check=False)
+    if network_exists(identifier):
+        raise HelperError("per-instance challenge network still exists after removal")
+
+
+def remove_workload_verified(identifier: str) -> None:
+    remove_container_verified(identifier)
+    remove_network_verified(identifier)
+
+
+def wait_for_startup(identifier: str, healthcheck: dict[str, Any]) -> None:
+    timeout_seconds = int(healthcheck.get("startup_timeout_seconds") or 45)
+    deadline = time.monotonic() + timeout_seconds
+    expects_health = bool(healthcheck.get("command"))
+    while True:
+        inspection = inspect_raw(identifier)
+        if inspection is None:
+            raise HelperError("container disappeared during startup")
+        runtime_state = inspection.get("State", {}) or {}
+        running = runtime_state.get("Running") is True
+        status = str(runtime_state.get("Status") or "").lower()
+        if not running and status in {"dead", "exited", "removing"}:
+            raise HelperError(f"container entered terminal startup state: {status}")
+        if running:
+            if not expects_health:
+                return
+            health_status = str((runtime_state.get("Health") or {}).get("Status") or "")
+            if health_status.lower() == "healthy":
+                return
+        if time.monotonic() >= deadline:
+            expectation = "healthy" if expects_health else "running"
+            raise HelperError(
+                f"container did not become {expectation} within {timeout_seconds} seconds"
+            )
+        time.sleep(1)
+
+
+def managed_container_identifiers() -> set[str]:
+    completed = engine(
+        "ps",
+        "--all",
+        "--filter",
+        "label=ctfzone.instance_id",
+        "--format",
+        "{{.Names}}",
+    )
+    identifiers: set[str] = set()
+    for encoded_name in completed.stdout.decode("utf-8", "replace").splitlines():
+        name = encoded_name.strip()
+        if not name.startswith("ctfzone-"):
+            continue
+        identifier = name.removeprefix("ctfzone-")
+        if INSTANCE_RE.fullmatch(identifier):
+            identifiers.add(identifier)
+    return identifiers
+
+
+def network_exists(identifier: str) -> bool:
+    completed = engine("network", "inspect", network_name(identifier), check=False)
+    if completed.returncode == 0:
+        return True
+    diagnostic = completed.stderr.decode("utf-8", "replace").lower()
+    if any(
+        marker in diagnostic
+        for marker in ("no such", "not found", "does not exist", "no network")
+    ):
+        return False
+    raise HelperError(diagnostic[:1000] or "challenge network inspection failed")
+
+
+def managed_network_identifiers() -> set[str]:
+    completed = engine("network", "ls", "--format", "{{.Name}}")
+    prefix = f"{CONFIG['CTFZONE_NETWORK']}-"
+    identifiers: set[str] = set()
+    for encoded_name in completed.stdout.decode("utf-8", "replace").splitlines():
+        name = encoded_name.strip()
+        compact = name.removeprefix(prefix) if name.startswith(prefix) else ""
+        if not re.fullmatch(r"[0-9a-f]{32}", compact):
+            continue
+        identifier = (
+            f"{compact[:8]}-{compact[8:12]}-{compact[12:16]}-"
+            f"{compact[16:20]}-{compact[20:]}"
+        )
+        if INSTANCE_RE.fullmatch(identifier):
+            identifiers.add(identifier)
+    return identifiers
+
+
+def remove_irrecoverable_instance_unlocked(
+    identifier: str, inspection: dict[str, Any]
+) -> None:
+    # Without a trustworthy generation and absolute deadline, preserving the
+    # workload would be fail-open. Persist a permanent UUID fence before
+    # verified removal so neither a crash nor a delayed request can resurrect it.
+    blocked_generation = state_generation(None, inspection) or 1
+    write_tombstone(identifier, blocked_generation)
+    remove_workload_verified(identifier)
+    cancel_timer(identifier, blocked_generation)
+    cancel_timer(identifier)
+    remove_state(identifier)
+
+
+def sweep_instances() -> dict[str, int]:
+    INSTANCES_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    identifiers = {
+        path.stem
+        for path in INSTANCES_DIRECTORY.glob("*.json")
+        if INSTANCE_RE.fullmatch(path.stem)
+    }
+    identifiers.update(managed_container_identifiers())
+    identifiers.update(managed_network_identifiers())
+    checked = 0
+    removed = 0
+    rearmed = 0
+    failures: list[str] = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for identifier in sorted(identifiers):
+        checked += 1
+        try:
+            with instance_lock(identifier):
+                inspection = inspect_raw(identifier)
+                try:
+                    state = read_state(identifier)
+                except HelperError:
+                    # Immutable labels cannot recover extensions or health policy.
+                    state = None
+                try:
+                    tombstone = read_tombstone(identifier)
+                except HelperError:
+                    blocked_generation = state_generation(state, inspection) or 1
+                    write_tombstone(identifier, blocked_generation)
+                    tombstone = {"generation": blocked_generation}
+                if tombstone is not None:
+                    remove_workload_verified(identifier)
+                    cancel_timer(identifier, tombstone["generation"])
+                    if state_generation(state) not in (None, tombstone["generation"]):
+                        cancel_timer(identifier, state_generation(state))
+                    cancel_timer(identifier)
+                    remove_state(identifier)
+                    if inspection is not None:
+                        removed += 1
+                    continue
+                if inspection is None:
+                    if state_generation(state) is not None:
+                        write_tombstone(identifier, state_generation(state))
+                    remove_network_verified(identifier)
+                    remove_state(identifier)
+                    if state_generation(state) is not None:
+                        cancel_timer(identifier, state_generation(state))
+                    cancel_timer(identifier)
+                    continue
+                labels = inspection.get("Config", {}).get("Labels", {}) or {}
+                if labels.get("ctfzone.instance_id") != identifier:
+                    raise HelperError("managed container has an invalid identity label")
+                if state is None:
+                    remove_irrecoverable_instance_unlocked(identifier, inspection)
+                    removed += 1
+                    continue
+                effective_generation = state_generation(state, inspection)
+                if effective_generation is None:
+                    remove_irrecoverable_instance_unlocked(identifier, inspection)
+                    removed += 1
+                    continue
+                try:
+                    expires_at = parse_deadline(state.get("expires_at"))
+                except HelperError:
+                    remove_irrecoverable_instance_unlocked(identifier, inspection)
+                    removed += 1
+                    continue
+                if expires_at <= now:
+                    expire_instance_unlocked(identifier, effective_generation)
+                    removed += 1
+                elif not timer_is_active(identifier, effective_generation):
+                    schedule_timer(identifier, effective_generation, expires_at)
+                    rearmed += 1
+        except (HelperError, OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{identifier}: {error}")
+    if failures:
+        raise HelperError("runtime sweep failures: " + "; ".join(failures[:10]))
+    return {"checked": checked, "removed": removed, "rearmed": rearmed}
 
 
 def validate_deployment(request: dict[str, Any]) -> dict[str, Any]:
@@ -359,22 +715,61 @@ def validate_deployment(request: dict[str, Any]) -> dict[str, Any]:
     return deployment
 
 
-def ensure_network() -> None:
-    network = CONFIG["CTFZONE_NETWORK"]
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", network):
-        raise HelperError("challenge network name is invalid")
-    if engine("network", "inspect", network, check=False).returncode != 0:
-        engine("network", "create", network)
+def ensure_network(identifier: str) -> str:
+    network = network_name(identifier)
+    if not network_exists(identifier):
+        created = engine(
+            "network",
+            "create",
+            "--label",
+            f"ctfzone.instance_id={identifier}",
+            network,
+            check=False,
+        )
+        if created.returncode != 0 and not network_exists(identifier):
+            diagnostic = created.stderr.decode("utf-8", "replace").strip()
+            raise HelperError(diagnostic[:1000] or "challenge network creation failed")
+    return network
 
 
 def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
     identifier = instance_id(request)
     requested_generation = generation(request)
+    tombstone = read_tombstone(identifier)
+    if tombstone is not None:
+        return {
+            "absent": inspect_raw(identifier) is None,
+            "stale_generation": True,
+            "effective_generation": tombstone["generation"],
+        }
     expires_at = parse_deadline(request.get("expires_at"))
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        raise HelperError("cannot start an instance with an elapsed deadline")
     deployment = validate_deployment(request)
     existing = inspect_raw(identifier)
+    try:
+        previous_state = read_state(identifier)
+    except HelperError:
+        previous_state = None
+    if existing is not None and previous_state is None:
+        effective_generation = state_generation(None, existing) or requested_generation
+        remove_irrecoverable_instance_unlocked(identifier, existing)
+        return {
+            "absent": True,
+            "stale_generation": True,
+            "effective_generation": effective_generation,
+        }
+    previous_generation = state_generation(previous_state, existing)
+    if previous_generation is not None and previous_generation > requested_generation:
+        return {
+            "absent": False,
+            "stale_generation": True,
+            "effective_generation": previous_generation,
+        }
+    created = existing is None
     if existing is None:
-        ensure_network()
+        network = ensure_network(identifier)
+        labelled_expiry = expires_at.isoformat().replace("+00:00", "Z")
         arguments = [
             "run",
             "--detach",
@@ -386,11 +781,15 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
             f"ctfzone.owner_user_id={request.get('owner_user_id')}",
             "--label",
             f"ctfzone.challenge_id={request.get('challenge_id')}",
+            "--label",
+            f"ctfzone.generation={requested_generation}",
+            "--label",
+            f"ctfzone.expires_at={labelled_expiry}",
             "--restart=no",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--network",
-            CONFIG["CTFZONE_NETWORK"],
+            network,
             "--publish",
             f"{CONFIG['CTFZONE_PUBLISH_IP']}::{deployment['container_port']}/tcp",
             "--tmpfs",
@@ -423,7 +822,11 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
             if healthcheck.get("retries"):
                 arguments.extend(["--health-retries", str(int(healthcheck["retries"]))])
         arguments.append(deployment["image_digest"])
-        engine(*arguments)
+        try:
+            engine(*arguments)
+        except Exception:
+            remove_network_verified(identifier)
+            raise
     else:
         labels = existing.get("Config", {}).get("Labels", {}) or {}
         if labels.get("ctfzone.instance_id") != identifier:
@@ -434,36 +837,129 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
         "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
         "deployment": deployment,
     }
-    write_state(identifier, state)
-    schedule_timer(identifier, requested_generation, expires_at)
-    return inspect_result(identifier)
+    try:
+        # The new generation has its own unit. Install it before retiring the
+        # previous unit, then make the generation switch durable in the state file.
+        schedule_timer(identifier, requested_generation, expires_at)
+        write_state(identifier, state)
+        if previous_generation is not None and previous_generation != requested_generation:
+            cancel_timer(identifier, previous_generation)
+        wait_for_startup(identifier, deployment.get("healthcheck", {}))
+        result = inspect_result(identifier)
+        result["effective_generation"] = requested_generation
+        return result
+    except Exception:
+        if created:
+            # Preserve the timer and state if removal cannot be confirmed.
+            remove_workload_verified(identifier)
+            cancel_timer(identifier, requested_generation)
+            remove_state(identifier)
+        raise
 
 
 def stop_instance(request: dict[str, Any]) -> dict[str, Any]:
     identifier = instance_id(request)
+    requested_generation = generation(request)
+    inspection = inspect_raw(identifier)
+    try:
+        state = read_state(identifier)
+    except HelperError:
+        state = None
+    if inspection is not None and state is None:
+        effective_generation = state_generation(None, inspection) or requested_generation
+        remove_irrecoverable_instance_unlocked(identifier, inspection)
+        return {
+            "absent": True,
+            "stale_generation": False,
+            "effective_generation": effective_generation,
+        }
+    effective_generation = state_generation(state, inspection)
+    if effective_generation is not None and effective_generation > requested_generation:
+        return {
+            "absent": False,
+            "stale_generation": True,
+            "effective_generation": effective_generation,
+        }
+    # The UUID is never reusable. Fence it durably before removal so a crash
+    # after removing the workload cannot let a delayed ensure recreate it.
+    write_tombstone(
+        identifier,
+        max(requested_generation, effective_generation or requested_generation),
+    )
+    remove_workload_verified(identifier)
+    if effective_generation is not None:
+        cancel_timer(identifier, effective_generation)
     cancel_timer(identifier)
-    engine("rm", "--force", container_name(identifier), check=False)
-    if inspect_raw(identifier) is not None:
-        raise HelperError("container still exists after forced removal")
     remove_state(identifier)
-    return {"absent": True}
+    return {
+        "absent": True,
+        "stale_generation": False,
+        "effective_generation": effective_generation or requested_generation,
+    }
 
 
 def update_deadline(request: dict[str, Any]) -> dict[str, Any]:
     identifier = instance_id(request)
     requested_generation = generation(request)
     expires_at = parse_deadline(request.get("expires_at"))
-    state = read_state(identifier)
-    if state is None or inspect_raw(identifier) is None:
+    tombstone = read_tombstone(identifier)
+    if tombstone is not None:
+        return {
+            "effective_expires_at": None,
+            "effective_generation": tombstone["generation"],
+            "stale_generation": True,
+            "absent": inspect_raw(identifier) is None,
+        }
+    inspection = inspect_raw(identifier)
+    try:
+        state = read_state(identifier)
+    except HelperError:
+        state = None
+    if inspection is not None and state is None:
+        effective_generation = state_generation(None, inspection) or requested_generation
+        remove_irrecoverable_instance_unlocked(identifier, inspection)
+        return {
+            "effective_expires_at": None,
+            "effective_generation": effective_generation,
+            "stale_generation": True,
+            "absent": True,
+        }
+    if state is None or inspection is None:
         raise HelperError("cannot extend an absent instance")
+    previous_generation = state_generation(state, inspection)
+    if previous_generation is None:
+        raise HelperError("cannot extend an instance with invalid generation state")
+    if previous_generation > requested_generation:
+        return {
+            "effective_expires_at": state.get("expires_at"),
+            "effective_generation": previous_generation,
+            "stale_generation": True,
+            "absent": False,
+        }
+    if expires_at <= dt.datetime.now(dt.timezone.utc):
+        raise HelperError("cannot extend an instance to an elapsed deadline")
+    # Install the replacement before changing durable generation state or
+    # cancelling the previous deadline. A failed install leaves the old TTL live.
+    schedule_timer(identifier, requested_generation, expires_at)
     state["generation"] = requested_generation
     state["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
-    write_state(identifier, state)
-    schedule_timer(identifier, requested_generation, expires_at)
-    return {"effective_expires_at": state["expires_at"], "absent": False}
+    try:
+        write_state(identifier, state)
+    except Exception:
+        if requested_generation != previous_generation:
+            cancel_timer(identifier, requested_generation)
+        raise
+    if previous_generation != requested_generation:
+        cancel_timer(identifier, previous_generation)
+    return {
+        "effective_expires_at": state["expires_at"],
+        "effective_generation": requested_generation,
+        "stale_generation": False,
+        "absent": False,
+    }
 
 
-def expire_instance(identifier: str, expected_generation: int) -> None:
+def expire_instance_unlocked(identifier: str, expected_generation: int) -> None:
     if not INSTANCE_RE.fullmatch(identifier) or expected_generation <= 0:
         raise HelperError("timer invocation is invalid")
     state = read_state(identifier)
@@ -473,9 +969,14 @@ def expire_instance(identifier: str, expected_generation: int) -> None:
     if expires_at > dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1):
         schedule_timer(identifier, expected_generation, expires_at)
         return
-    engine("rm", "--force", container_name(identifier), check=False)
-    if inspect_raw(identifier) is None:
-        remove_state(identifier)
+    write_tombstone(identifier, expected_generation)
+    remove_workload_verified(identifier)
+    remove_state(identifier)
+
+
+def expire_instance(identifier: str, expected_generation: int) -> None:
+    with instance_lock(identifier):
+        expire_instance_unlocked(identifier, expected_generation)
 
 
 def dispatch_ssh_original_command() -> str:
@@ -506,17 +1007,25 @@ def main() -> int:
             raise HelperError("timer generation is invalid") from error
         expire_instance(sys.argv[2], expected_generation)
         return 0
+    if operation == "sweep-instances":
+        if len(sys.argv) != 2:
+            raise HelperError("sweep invocation is invalid")
+        json.dump(sweep_instances(), sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return 0
     if operation not in ALLOWED_OPERATIONS or len(sys.argv) != 2:
         raise HelperError("operation is not allowed")
     request = read_request()
-    if operation == "ensure-instance":
-        result = ensure_instance(request)
-    elif operation == "inspect-instance":
-        result = inspect_result(instance_id(request))
-    elif operation == "stop-instance":
-        result = stop_instance(request)
-    else:
-        result = update_deadline(request)
+    identifier = instance_id(request)
+    with instance_lock(identifier):
+        if operation == "ensure-instance":
+            result = ensure_instance(request)
+        elif operation == "inspect-instance":
+            result = inspect_result(identifier)
+        elif operation == "stop-instance":
+            result = stop_instance(request)
+        else:
+            result = update_deadline(request)
     json.dump(result, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")
     return 0

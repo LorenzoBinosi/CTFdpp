@@ -1,18 +1,20 @@
 # CTFZone Controller: Three Alternative Configurations
 
 Status: Alternative 1 selected and implemented for CTFZone 1.0.0
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
-All three configurations keep exactly four long-running CTFZone services:
+All three configurations keep four core long-running CTFZone services:
 
 1. Python backend.
 2. Rust API.
 3. PostgreSQL.
 4. Controller.
 
-Caddy provides one browser-facing origin: page routes go to Python and
-`/api/v1/*` goes directly to Rust. Challenge workloads run on remote hosts and
-are not additional CTFZone platform services.
+Caddy and S3-compatible storage are supporting infrastructure. Caddy's portal
+origin routes only to Python; Python calls the private Rust API with a service
+credential. Caddy's separate storage origin accepts only short-lived signed S3
+transfers. Challenge workloads run on remote hosts and are not additional
+CTFZone platform services.
 
 ## Shared requirements
 
@@ -39,8 +41,7 @@ This is the architecture implemented in 1.0.0.
 ### Topology
 
 ```text
-Browser ──► Caddy ──► Rust API ──transaction──► PostgreSQL
-                └──► Python pages
+Browser ──► Caddy ──► Python BFF ──► Rust API ──transaction──► PostgreSQL
                                           │
                                           │ LISTEN/NOTIFY
                                           ▼
@@ -54,9 +55,10 @@ Controller ──restricted SQL──► PostgreSQL
 
 ### Command flow
 
-1. Caddy routes an authenticated activation, termination, or extension request
-   to the Rust API.
-2. The API authorizes it.
+1. Caddy routes an activation, termination, or extension request to Python.
+2. Python validates its browser session, same-origin and CSRF boundary, then
+   calls Rust with its service credential and opaque user session. The API
+   authorizes the operation.
 3. In one transaction, the API updates desired state, appends history, inserts a
    durable `runtime_commands` row, and calls `pg_notify`.
 4. The controller receives the notification and claims the command with
@@ -131,8 +133,7 @@ bidirectional stream to the Rust API using gRPC, WebSocket, or HTTP/2.
 ### Topology
 
 ```text
-Browser ──► Caddy ──► Rust API ◄════ persistent command/event stream ════► Controller
-                └──► Python pages
+Browser ──► Caddy ──► Python BFF ──► Rust API ◄═══ persistent stream ═══► Controller
                  │                                                  │
                  ▼                                                  ▼
             PostgreSQL                                         Remote host
@@ -140,7 +141,8 @@ Browser ──► Caddy ──► Rust API ◄════ persistent command/ev
 
 ### Command flow
 
-1. Caddy routes the action to the Rust API.
+1. Caddy routes the action to Python, which validates the browser boundary and
+   calls the private Rust API.
 2. The API authorizes it and commits desired state, history, and an outbox command
    to PostgreSQL.
 3. After commit, the API dispatcher sends the command through the persistent
@@ -236,16 +238,14 @@ The controller still never receives arbitrary user-selected runtime parameters.
 ### Topology
 
 ```text
-                        ┌──────────────► Rust API ──► PostgreSQL
-                        │                   ▲
-Browser ──► Caddy ──────┤                   │ results/history
-                        │                   │
-                        └──────────────► Controller ──► Remote host
-                               instance operations
+Browser ──► Caddy ──► Python BFF ──┬──► Rust API ──► PostgreSQL
+                                      │        ▲
+                                      └──► Controller ──► Remote host
+                                         instance operations/results
 ```
 
-The browser still sees only Caddy. Caddy or a backend-for-frontend chooses its
-internal target:
+The browser still sees only Caddy and Python. The BFF chooses its internal
+target:
 
 - Normal CTFZone operation → Rust API.
 - Instance status/activate/terminate/extend → Controller.
@@ -321,7 +321,7 @@ very fresh operational status is more important than a simple consistency model.
 |---|---|---|---|
 | Controller accesses DB | Yes, restricted | No | No |
 | Only API writes DB | No | Yes | Yes |
-| Browser-facing entry | Caddy | Caddy | Caddy |
+| Browser-facing entry | Caddy → Python BFF | Caddy → Python BFF | Caddy → Python BFF |
 | Durable command source | PostgreSQL command table | API outbox in PostgreSQL | API reservation/lease |
 | Normal command delivery | PostgreSQL `NOTIFY` | Persistent API stream | Backend request to controller |
 | Runtime result path | Controller → DB | Controller → API → DB | Controller → API → DB |

@@ -214,7 +214,7 @@ ALTER SEQUENCE ctfzone.comments_id_seq OWNED BY ctfzone.comments.id;
 
 CREATE TABLE ctfzone.config (
     id integer NOT NULL,
-    key text,
+    key text NOT NULL,
     value text
 );
 
@@ -895,10 +895,10 @@ ALTER SEQUENCE ctfzone.unlocks_id_seq OWNED BY ctfzone.unlocks.id;
 
 CREATE TABLE ctfzone.user_sessions (
     id character varying(36) NOT NULL,
+    management_id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id integer NOT NULL,
     created timestamp without time zone NOT NULL,
     last_seen timestamp without time zone NOT NULL,
-    csrf_nonce character varying(64),
     initial_ip character varying(46) NOT NULL,
     last_ip character varying(46) NOT NULL,
     revoked_at timestamp without time zone,
@@ -925,7 +925,7 @@ CREATE TABLE ctfzone.users (
     bracket_id integer,
     hidden boolean,
     banned boolean,
-    verified boolean,
+    verified boolean DEFAULT false NOT NULL,
     language character varying(32),
     change_password boolean,
     team_id integer,
@@ -1177,6 +1177,14 @@ ALTER TABLE ONLY ctfzone.config
 
 
 --
+-- Name: config config_key_key; Type: CONSTRAINT; Schema: ctfzone; Owner: -
+--
+
+ALTER TABLE ONLY ctfzone.config
+    ADD CONSTRAINT config_key_key UNIQUE (key);
+
+
+--
 -- Name: dynamic_challenge dynamic_challenge_pkey; Type: CONSTRAINT; Schema: ctfzone; Owner: -
 --
 
@@ -1425,6 +1433,14 @@ ALTER TABLE ONLY ctfzone.user_sessions
 
 
 --
+-- Name: user_sessions user_sessions_management_id_key; Type: CONSTRAINT; Schema: ctfzone; Owner: -
+--
+
+ALTER TABLE ONLY ctfzone.user_sessions
+    ADD CONSTRAINT user_sessions_management_id_key UNIQUE (management_id);
+
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: ctfzone; Owner: -
 --
 
@@ -1474,6 +1490,108 @@ CREATE INDEX idx_session_activity_user_date ON ctfzone.session_activity USING bt
 --
 
 CREATE INDEX idx_user_sessions_user_active ON ctfzone.user_sessions USING btree (user_id, revoked_at, last_seen);
+
+
+-- Hot portal access paths and invariants used by the native API.
+
+CREATE UNIQUE INDEX idx_users_name_unique
+    ON ctfzone.users USING btree (name)
+    WHERE name IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_registration_email_allowlist_normalized_unique
+    ON ctfzone.registration_email_allowlist USING btree (lower(email));
+
+CREATE UNIQUE INDEX idx_users_email_normalized_unique
+    ON ctfzone.users USING btree (lower(email))
+    WHERE email IS NOT NULL;
+
+CREATE INDEX idx_users_team_id
+    ON ctfzone.users USING btree (team_id)
+    WHERE team_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_teams_name_unique
+    ON ctfzone.teams USING btree (name)
+    WHERE name IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_teams_email_normalized_unique
+    ON ctfzone.teams USING btree (lower(email))
+    WHERE email IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_unlocks_user_target_unique
+    ON ctfzone.unlocks USING btree (type, target, user_id)
+    WHERE user_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_unlocks_team_target_unique
+    ON ctfzone.unlocks USING btree (type, target, team_id)
+    WHERE team_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_tracking_challenge_open_unique
+    ON ctfzone.tracking USING btree (user_id, target)
+    WHERE type = 'challenges.open' AND user_id IS NOT NULL AND target IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_field_entries_user_field_unique
+    ON ctfzone.field_entries USING btree (field_id, user_id)
+    WHERE user_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_field_entries_team_field_unique
+    ON ctfzone.field_entries USING btree (field_id, team_id)
+    WHERE team_id IS NOT NULL;
+
+CREATE INDEX idx_submissions_user_type_date
+    ON ctfzone.submissions USING btree (user_id, type, date DESC)
+    WHERE user_id IS NOT NULL;
+
+CREATE INDEX idx_submissions_team_type_date
+    ON ctfzone.submissions USING btree (team_id, type, date DESC)
+    WHERE team_id IS NOT NULL;
+
+CREATE INDEX idx_submissions_user_challenge_type_date
+    ON ctfzone.submissions USING btree (user_id, challenge_id, type, date DESC)
+    WHERE user_id IS NOT NULL;
+
+CREATE INDEX idx_submissions_team_challenge_type_date
+    ON ctfzone.submissions USING btree (team_id, challenge_id, type, date DESC)
+    WHERE team_id IS NOT NULL;
+
+CREATE INDEX idx_solves_user_challenge
+    ON ctfzone.solves USING btree (user_id, challenge_id)
+    WHERE user_id IS NOT NULL;
+
+CREATE INDEX idx_solves_team_challenge
+    ON ctfzone.solves USING btree (team_id, challenge_id)
+    WHERE team_id IS NOT NULL;
+
+CREATE INDEX idx_awards_user_date
+    ON ctfzone.awards USING btree (user_id, date DESC)
+    WHERE user_id IS NOT NULL;
+
+CREATE INDEX idx_awards_team_date
+    ON ctfzone.awards USING btree (team_id, date DESC)
+    WHERE team_id IS NOT NULL;
+
+CREATE INDEX idx_ratings_challenge
+    ON ctfzone.ratings USING btree (challenge_id);
+
+CREATE INDEX idx_tags_challenge
+    ON ctfzone.tags USING btree (challenge_id, id);
+
+CREATE INDEX idx_hints_challenge
+    ON ctfzone.hints USING btree (challenge_id, cost, id);
+
+CREATE INDEX idx_flags_challenge
+    ON ctfzone.flags USING btree (challenge_id, id);
+
+CREATE INDEX idx_files_challenge
+    ON ctfzone.files USING btree (challenge_id, id)
+    WHERE challenge_id IS NOT NULL;
+
+CREATE INDEX idx_files_page
+    ON ctfzone.files USING btree (page_id, id)
+    WHERE page_id IS NOT NULL;
+
+CREATE INDEX idx_files_solution
+    ON ctfzone.files USING btree (solution_id, id)
+    WHERE solution_id IS NOT NULL;
 
 
 --
