@@ -4,18 +4,21 @@ mod bootstrap;
 mod challenges;
 mod configuration;
 mod content;
+mod create_idempotency;
 mod exports;
-mod files;
+mod flag_policy;
 mod mail;
+mod objects;
 mod participant_tokens;
 mod runtimes;
 mod scoreboard;
 mod sessions;
-mod shares;
+pub(crate) mod ssh_hosts;
 mod statistics;
 mod team_accounts;
 mod tokens;
 mod user_accounts;
+pub(crate) mod user_mode_transition;
 mod users;
 mod views;
 
@@ -52,6 +55,10 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/v1/views/admin/configuration",
             get(views::admin_configuration),
+        )
+        .route(
+            "/api/v1/views/admin/user-mode-transition",
+            get(user_mode_transition::preview),
         )
         .route(
             "/api/v1/challenges",
@@ -151,6 +158,10 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
                 .post(administration::create_registration_email),
         )
         .route(
+            "/api/v1/configs/user-mode-transition",
+            post(user_mode_transition::execute),
+        )
+        .route(
             "/api/v1/configs/registration-emails/import",
             post(administration::import_registration_emails)
                 .layer(DefaultBodyLimit::max(5 * 1024 * 1024 + 64 * 1024)),
@@ -171,9 +182,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/v1/configs/{config_key}",
-            get(administration::get_config)
-                .patch(administration::update_config)
-                .delete(administration::delete_config),
+            get(administration::get_config).patch(administration::update_config),
         )
         .route(
             "/api/v1/pages",
@@ -197,6 +206,15 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             "/api/v1/brackets/{bracket_id}",
             axum::routing::patch(administration::update_bracket)
                 .delete(administration::delete_bracket),
+        )
+        .route(
+            "/api/v1/admin/challenge-categories",
+            get(administration::list_challenge_categories)
+                .post(administration::create_challenge_category),
+        )
+        .route(
+            "/api/v1/admin/challenge-categories/{category_id}",
+            axum::routing::delete(administration::delete_challenge_category),
         )
         .route(
             "/api/v1/flags",
@@ -260,32 +278,22 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
                 .delete(administration::delete_submission),
         )
         .route("/api/v1/exports/raw", post(exports::raw))
-        .route("/api/v1/shares", post(shares::create))
-        .route(
-            "/api/v1/files",
-            get(files::list)
-                .post(files::upload)
-                .layer(DefaultBodyLimit::max(files::MAX_UPLOAD_BODY_BYTES)),
-        )
-        .route(
-            "/api/v1/files/{file_id}",
-            get(files::detail).delete(files::delete),
-        )
         .route(
             "/api/v1/storage/uploads",
-            post(files::initiate_upload).layer(DefaultBodyLimit::max(files::MAX_UPLOAD_BODY_BYTES)),
+            post(objects::initiate_upload)
+                .layer(DefaultBodyLimit::max(objects::MAX_UPLOAD_BODY_BYTES)),
         )
         .route(
             "/api/v1/storage/objects/{object_id}",
-            get(files::object_detail).delete(files::delete_object),
+            get(objects::object_detail).delete(objects::delete_object),
         )
         .route(
             "/api/v1/storage/objects/{object_id}/complete",
-            post(files::complete_upload),
+            post(objects::complete_upload),
         )
         .route(
             "/api/v1/storage/objects/{object_id}/download",
-            get(files::download_grant),
+            get(objects::download_grant),
         )
         .route(
             "/api/v1/users/me",
@@ -479,6 +487,26 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/v1/admin/runtime/instances/{instance_id}/reconcile",
             post(runtimes::reconcile_instance),
+        )
+        .route(
+            "/api/v1/admin/ssh/hosts",
+            get(ssh_hosts::list_hosts).post(ssh_hosts::create_host),
+        )
+        .route(
+            "/api/v1/admin/ssh/hosts/{host_id}",
+            get(ssh_hosts::get_host).delete(ssh_hosts::delete_host),
+        )
+        .route(
+            "/api/v1/admin/ssh/hosts/{host_id}/identity/retry",
+            post(ssh_hosts::retry_identity),
+        )
+        .route(
+            "/api/v1/admin/ssh/hosts/{host_id}/host-key/trust",
+            post(ssh_hosts::trust_host_key),
+        )
+        .route(
+            "/api/v1/admin/ssh/hosts/{host_id}/tickets",
+            post(ssh_hosts::issue_ticket),
         )
         .route_layer(middleware::from_fn_with_state(
             state,

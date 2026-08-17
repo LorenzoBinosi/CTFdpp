@@ -13,6 +13,9 @@ services:
     environment:
       CADDY_SITE_ADDRESS: http://localhost
       OBJECT_STORAGE_PUBLIC_URL: http://files.localhost
+  ssh-gateway:
+    environment:
+      SSH_ALLOWED_ORIGINS: http://localhost
   storage:
     command:
       - mini

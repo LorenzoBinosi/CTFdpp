@@ -11,8 +11,6 @@
     <div class="config-setting-copy">
       <label for="config-{{ section.id }}-{{ setting.key }}">{{ setting.label }}</label>
       {% if setting.help %}<p>{{ setting.help }}</p>{% endif %}
-      {% if setting.warning %}<p class="config-warning" role="note">⚠ {{ setting.warning }}</p>{% endif %}
-      {% if setting.danger %}<p class="config-danger" role="note">⚠ {{ setting.danger }}</p>{% endif %}
     </div>
     <div class="config-setting-control">
       {% if setting.type == 'secret' %}
@@ -36,7 +34,7 @@
           <option value="false" {{ 'selected' if setting.input_value == 'false' }}>Disabled</option>
         </select>
       {% elif setting.type == 'select' %}
-        <select id="config-{{ section.id }}-{{ setting.key }}" data-config-input data-config-key="{{ setting.key }}" data-value-type="string" data-initial="{{ setting.value | tojson | forceescape }}"{% if setting.force_dirty %} data-force-dirty="true"{% endif %}{% if setting.required %} required{% endif %}{% if setting.read_only %} data-static-disabled="true" disabled{% endif %}>
+        <select id="config-{{ section.id }}-{{ setting.key }}" data-config-input data-config-key="{{ setting.key }}" data-value-type="string" data-initial="{{ setting.value | tojson | forceescape }}"{% if setting.key == 'user_mode' %} data-user-mode-input{% endif %}{% if setting.force_dirty %} data-force-dirty="true"{% endif %}{% if setting.required %} required{% endif %}{% if setting.read_only %} data-static-disabled="true" disabled{% endif %}>
           {% if not setting.required %}<option value="">Not set</option>{% endif %}
           {% for option in setting.options %}<option value="{{ option.value }}" {{ 'selected' if setting.input_value == option.value }}>{{ option.label }}</option>{% endfor %}
         </select>
@@ -54,15 +52,21 @@
       {% endif %}
       {% if setting.read_only %}<small class="config-read-only">Read-only in this version</small>{% endif %}
     </div>
+    {% if setting.warning or setting.danger %}
+      <div class="config-setting-notices">
+        {% if setting.warning %}<p class="config-warning" role="note">⚠ {{ setting.warning }}</p>{% endif %}
+        {% if setting.danger %}<p class="config-danger" role="note">⚠ {{ setting.danger }}</p>{% endif %}
+      </div>
+    {% endif %}
     {% if setting.key == 'registration_access_mode' %}
       <div class="registration-policy-guide" data-registration-policy-guide aria-label="Registration access policies">
         <p class="registration-policy-summary" aria-live="polite"><strong>Active policy:</strong> <span data-registration-policy-summary>{{ setting.input_value | replace('_', ' ') | title }}</span></p>
-        <p class="registration-policy-retention">Changing policy does not erase the saved code, domain rules, or email invitations.</p>
+        <p class="registration-policy-retention">Policy changes affect future registrations only. Existing accounts remain unchanged, and saved access codes, domain rules, and email invitations are retained.</p>
         <ul>
           <li data-registration-policy="open" {% if setting.input_value == 'open' %}class="active" aria-current="true"{% endif %}><strong>Open</strong><span>Anyone can create an account while public registration is enabled.</span></li>
           <li data-registration-policy="domain_rules" {% if setting.input_value == 'domain_rules' %}class="active" aria-current="true"{% endif %}><strong>Domain rules</strong><span>Email domains are checked against the configured allow and deny rules.</span></li>
           <li data-registration-policy="access_code" {% if setting.input_value == 'access_code' %}class="active" aria-current="true"{% endif %}><strong>Access code</strong><span>Participants must enter the private registration code.</span></li>
-          <li data-registration-policy="email_allowlist" {% if setting.input_value == 'email_allowlist' %}class="active" aria-current="true"{% endif %}><strong>Email allowlist</strong><span>Only exact invited email addresses can register; manage invitations below.</span></li>
+          <li data-registration-policy="email_allowlist" {% if setting.input_value == 'email_allowlist' %}class="active" aria-current="true"{% endif %}><strong>Email allowlist</strong><span>Only exact invited email addresses can register; invitations bypass the participant limit.</span></li>
         </ul>
       </div>
     {% endif %}
@@ -139,7 +143,7 @@
                    data-allowlist-total="{{ registration_email_count }}"
                    data-depends-key="registration_access_mode" data-depends-values="[&quot;email_allowlist&quot;]" data-depends-negate="false">
             <header class="admin-panel-heading">
-              <div><span class="eyebrow">REGISTRATION ACCESS</span><h2>Email allowlist</h2><p>Available when registration access is set to Email allowlist. Switching policies keeps these invitations.</p></div>
+              <div><span class="eyebrow">REGISTRATION ACCESS</span><h2>Email allowlist</h2><p>Available when registration access is set to Email allowlist. Policy changes affect future registrations only; existing accounts and these invitations are retained.</p></div>
               <span class="status-pill"><span data-allowlist-count>{{ registration_email_count }}</span> addresses</span>
             </header>
             <fieldset class="allowlist-manager" data-conditional-fieldset>
@@ -193,4 +197,79 @@
       <section class="admin-panel"><div class="admin-empty-card"><span class="empty-glyph">!</span><h2>No configuration catalog</h2><p>The API did not return editable settings. Refresh after the API becomes available.</p></div></section>
     {% endfor %}
   </div>
+
+  <dialog class="user-mode-transition-dialog"
+          data-user-mode-transition-dialog
+          aria-labelledby="user-mode-transition-title"
+          aria-describedby="user-mode-transition-summary">
+    <div class="user-mode-transition-card">
+      <header class="user-mode-transition-heading">
+        <div>
+          <span class="eyebrow">DESTRUCTIVE ACCOUNT TRANSITION</span>
+          <h2 id="user-mode-transition-title" data-user-mode-transition-title>Switch account mode</h2>
+        </div>
+        <button class="user-mode-transition-close" type="button" aria-label="Close account-mode transition" data-user-mode-transition-close>&times;</button>
+      </header>
+
+      <div class="user-mode-transition-body">
+        <p id="user-mode-transition-summary" class="user-mode-transition-summary" data-user-mode-transition-summary>
+          Loading the exact impact of this account-mode change&hellip;
+        </p>
+
+        <div class="user-mode-transition-status" role="status" aria-live="polite" data-user-mode-transition-status>
+          Preparing a fresh transition preview&hellip;
+        </div>
+
+        <section class="user-mode-transition-blockers" data-user-mode-transition-blockers hidden>
+          <h3>This transition is currently blocked</h3>
+          <ul data-user-mode-transition-blocker-list></ul>
+        </section>
+
+        <div class="user-mode-transition-logic-warning" role="note" data-user-mode-transition-logic-warning hidden>
+          <strong>Manual challenge review required</strong>
+          <span data-user-mode-transition-logic-message>Team-specific challenge definitions are preserved, but must be reviewed after switching to individual users.</span>
+        </div>
+
+        <section class="user-mode-transition-impact" aria-labelledby="user-mode-transition-impact-title">
+          <div class="user-mode-transition-section-heading">
+            <h3 id="user-mode-transition-impact-title">Exact database impact</h3>
+            <span class="status-pill" data-user-mode-transition-expiry>Preview loading</span>
+          </div>
+          <div class="admin-table-wrap">
+            <table class="admin-table">
+              <caption class="sr-only">Records affected by the account-mode transition</caption>
+              <thead><tr><th>Record type</th><th class="table-actions">Count</th></tr></thead>
+              <tbody data-user-mode-transition-counts>
+                <tr><td colspan="2" class="admin-empty-row">Loading affected record counts&hellip;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <details class="user-mode-transition-backup">
+          <summary>Backup guidance</summary>
+          <p>Export or snapshot PostgreSQL and object storage before continuing. The administration panel cannot restore deleted competition history, teams, or retired participant/team competition objects.</p>
+        </details>
+
+        <div class="user-mode-transition-confirmation" data-user-mode-transition-confirmation>
+          <label for="user-mode-transition-confirmation">
+            Type <code data-user-mode-transition-phrase></code> to confirm
+          </label>
+          <input id="user-mode-transition-confirmation"
+                 type="text"
+                 autocomplete="off"
+                 autocapitalize="characters"
+                 spellcheck="false"
+                 data-user-mode-transition-confirmation-input>
+          <small>This transition changes only the account mode. Save every other account setting separately before or after switching.</small>
+        </div>
+      </div>
+
+      <footer class="user-mode-transition-actions">
+        <button class="quiet-button" type="button" data-user-mode-transition-cancel>Cancel</button>
+        <button class="secondary-button" type="button" data-user-mode-transition-retry hidden>Refresh preview</button>
+        <button class="danger-button" type="button" data-user-mode-transition-confirm disabled>Switch account mode</button>
+      </footer>
+    </div>
+  </dialog>
 {% endblock %}

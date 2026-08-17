@@ -1,4 +1,5 @@
 mod config;
+mod configuration_lock;
 mod journal;
 mod remote;
 mod state;
@@ -34,7 +35,7 @@ struct HttpState {
 async fn main() -> Result<()> {
     init_tracing();
     let config = Config::from_env()?;
-    let storage_config = storage::StorageConfig::from_env(&config)?;
+    let storage_config = storage::StorageConfig::from_env()?;
     let status = SharedStatus::new();
     let journal = Arc::new(OperationJournal::open(config.journal_path.clone()).await?);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

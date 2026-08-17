@@ -6,7 +6,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use std::time::Duration;
 use tracing::error;
 use uuid::Uuid;
 
@@ -15,9 +16,14 @@ use crate::{AppState, error::ApiError};
 type HmacSha256 = Hmac<Sha256>;
 
 pub(crate) const BACKEND_TOKEN_HEADER: &str = "x-ctfzone-backend-token";
+pub(crate) const SSH_GATEWAY_TOKEN_HEADER: &str = "x-ctfzone-ssh-gateway-token";
 pub(crate) const SESSION_HEADER: &str = "x-ctfzone-session";
 const SERVICE_TOKEN_COMPARISON_KEY: &[u8] =
     b"ctfzone/backend-service-token/constant-time-comparison/v1";
+const SSH_GATEWAY_TOKEN_COMPARISON_KEY: &[u8] =
+    b"ctfzone/ssh-gateway-service-token/constant-time-comparison/v1";
+pub(crate) const TRANSITION_AUTH_TIMEOUT_SECONDS: u64 = 4;
+pub(crate) const TRANSITION_ACTIVITY_TIMEOUT_SECONDS: u64 = 2;
 
 #[derive(Clone)]
 pub(crate) struct AuthConfig {
@@ -357,38 +363,144 @@ fn authorize_identity(
     })
 }
 
+/// Revalidates the exact credential used to authenticate a request while the
+/// caller still holds its transaction-level configuration fence.
+///
+/// A user-mode transition revokes participant sessions and deletes participant
+/// API tokens. Requests authenticated before the transition can otherwise wait
+/// for the fence and resume with a credential that no longer exists.
+pub(crate) async fn revalidate_current_credential(
+    transaction: &mut Transaction<'_, Postgres>,
+    user: &CurrentUser,
+    session_lifetime_seconds: i64,
+) -> Result<(), ApiError> {
+    let valid = match &user.credential {
+        Credential::ApiToken { token_id, .. } => sqlx::query_scalar::<_, i32>(
+            r#"
+                SELECT token.id
+                FROM ctfzone.tokens AS token
+                JOIN ctfzone.users AS account ON account.id=token.user_id
+                LEFT JOIN ctfzone.teams AS team ON team.id=account.team_id
+                WHERE token.id = $1
+                  AND token.user_id = $2
+                  AND token.type = 'user'
+                  AND token.expiration > (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                  AND COALESCE(account.type, 'user') = $3
+                  AND NOT COALESCE(account.banned, false)
+                  AND NOT COALESCE(account.change_password, false)
+                  AND NOT COALESCE(team.banned, false)
+                "#,
+        )
+        .bind(token_id)
+        .bind(user.id)
+        .bind(&user.user_type)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?
+        .is_some(),
+        Credential::InternalSession { session_id } => sqlx::query_scalar::<_, String>(
+            r#"
+                SELECT session.id
+                FROM ctfzone.user_sessions AS session
+                JOIN ctfzone.users AS account ON account.id=session.user_id
+                LEFT JOIN ctfzone.teams AS team ON team.id=account.team_id
+                WHERE session.id = $1
+                  AND session.user_id = $2
+                  AND session.revoked_at IS NULL
+                  AND session.last_seen >=
+                      (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
+                      - ($4::double precision * INTERVAL '1 second')
+                  AND COALESCE(account.type, 'user') = $3
+                  AND NOT COALESCE(account.banned, false)
+                  AND NOT COALESCE(account.change_password, false)
+                  AND NOT COALESCE(team.banned, false)
+                "#,
+        )
+        .bind(session_id)
+        .bind(user.id)
+        .bind(&user.user_type)
+        .bind(session_lifetime_seconds)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?
+        .is_some(),
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(
+            "This credential has expired or been revoked",
+        ))
+    }
+}
+
 pub(crate) async fn optional_authenticated_activity(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
-    let has_credentials = parts.headers.contains_key(header::AUTHORIZATION)
-        || parts.headers.contains_key(SESSION_HEADER);
-    if !has_credentials {
-        return Ok(next.run(Request::from_parts(parts, body)).await);
-    }
-
-    let user = authenticate_current_user(&mut parts, &state).await?;
-    parts.extensions.insert(user.clone());
-
     let method = parts.method.as_str().to_owned();
     let endpoint = parts
         .extensions
         .get::<MatchedPath>()
         .map(|path| path.as_str().to_owned())
         .unwrap_or_else(|| parts.uri.path().to_owned());
+    let is_mode_transition = crate::routes::user_mode_transition::is_transition_route(&endpoint);
+    let has_credentials = parts.headers.contains_key(header::AUTHORIZATION)
+        || parts.headers.contains_key(SESSION_HEADER);
+    if !has_credentials {
+        return Ok(next.run(Request::from_parts(parts, body)).await);
+    }
+
+    let user = if is_mode_transition {
+        tokio::time::timeout(
+            Duration::from_secs(TRANSITION_AUTH_TIMEOUT_SECONDS),
+            authenticate_current_user(&mut parts, &state),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::service_unavailable(
+                "Competition-mode transition authentication exceeded its safe time window",
+            )
+        })??
+    } else {
+        authenticate_current_user(&mut parts, &state).await?
+    };
+    parts.extensions.insert(user.clone());
+
     let response = next.run(Request::from_parts(parts, body)).await;
 
-    if let Err(error) = record_activity(
+    let activity = record_activity(
         &state.database,
         &user,
         &method,
         &endpoint,
         i32::from(response.status().as_u16()),
-    )
-    .await
-    {
+    );
+    if is_mode_transition {
+        match tokio::time::timeout(
+            Duration::from_secs(TRANSITION_ACTIVITY_TIMEOUT_SECONDS),
+            activity,
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(%error, user_id = user.id, %method, %endpoint, "failed to record API activity");
+            }
+            Err(_) => {
+                error!(
+                    user_id = user.id,
+                    %method,
+                    %endpoint,
+                    timeout_seconds = TRANSITION_ACTIVITY_TIMEOUT_SECONDS,
+                    "timed out while recording transition API activity"
+                );
+            }
+        }
+    } else if let Err(error) = activity.await {
         error!(%error, user_id = user.id, %method, %endpoint, "failed to record API activity");
     }
 
@@ -476,6 +588,22 @@ pub(crate) async fn require_backend_service(
     Ok(next.run(request).await)
 }
 
+pub(crate) async fn require_ssh_gateway_service(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let provided = request
+        .headers()
+        .get(SSH_GATEWAY_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !ssh_gateway_token_matches(&state.ssh_gateway_service_token, provided) {
+        return Err(ApiError::forbidden("SSH gateway authentication failed"));
+    }
+    Ok(next.run(request).await)
+}
+
 fn service_token_matches(expected: &str, provided: &str) -> bool {
     let mut expected_mac = HmacSha256::new_from_slice(SERVICE_TOKEN_COMPARISON_KEY)
         .expect("HMAC-SHA256 accepts comparison keys of every length");
@@ -483,6 +611,18 @@ fn service_token_matches(expected: &str, provided: &str) -> bool {
     let expected_tag = expected_mac.finalize().into_bytes();
 
     let mut provided_mac = HmacSha256::new_from_slice(SERVICE_TOKEN_COMPARISON_KEY)
+        .expect("HMAC-SHA256 accepts comparison keys of every length");
+    provided_mac.update(provided.as_bytes());
+    provided_mac.verify_slice(&expected_tag).is_ok()
+}
+
+fn ssh_gateway_token_matches(expected: &str, provided: &str) -> bool {
+    let mut expected_mac = HmacSha256::new_from_slice(SSH_GATEWAY_TOKEN_COMPARISON_KEY)
+        .expect("HMAC-SHA256 accepts comparison keys of every length");
+    expected_mac.update(expected.as_bytes());
+    let expected_tag = expected_mac.finalize().into_bytes();
+
+    let mut provided_mac = HmacSha256::new_from_slice(SSH_GATEWAY_TOKEN_COMPARISON_KEY)
         .expect("HMAC-SHA256 accepts comparison keys of every length");
     provided_mac.update(provided.as_bytes());
     provided_mac.verify_slice(&expected_tag).is_ok()
@@ -532,5 +672,49 @@ mod tests {
         assert!(service_token_matches("backend-secret", "backend-secret"));
         assert!(!service_token_matches("backend-secret", ""));
         assert!(!service_token_matches("backend-secret", "backend-secret-x"));
+    }
+
+    #[test]
+    fn ssh_gateway_token_is_distinct_and_requires_an_exact_match() {
+        assert!(ssh_gateway_token_matches(
+            "gateway-secret",
+            "gateway-secret"
+        ));
+        assert!(!ssh_gateway_token_matches("gateway-secret", ""));
+        assert!(!ssh_gateway_token_matches(
+            "gateway-secret",
+            "gateway-secret-x"
+        ));
+        assert_ne!(
+            SERVICE_TOKEN_COMPARISON_KEY,
+            SSH_GATEWAY_TOKEN_COMPARISON_KEY
+        );
+    }
+
+    #[test]
+    fn transactional_revalidation_checks_exact_credential_and_current_role() {
+        let source = include_str!("auth.rs");
+        let helper = source
+            .split_once("pub(crate) async fn revalidate_current_credential(")
+            .expect("credential revalidation helper exists")
+            .1
+            .split_once("pub(crate) async fn optional_authenticated_activity(")
+            .expect("credential revalidation helper has a boundary")
+            .0;
+        for marker in [
+            "token.id = $1",
+            "token.user_id = $2",
+            "token.expiration >",
+            "session.id = $1",
+            "session.user_id = $2",
+            "session.revoked_at IS NULL",
+            "COALESCE(account.type, 'user') = $3",
+            "NOT COALESCE(account.banned, false)",
+        ] {
+            assert!(
+                helper.contains(marker),
+                "missing credential check: {marker}"
+            );
+        }
     }
 }

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use axum::{
     Json,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::NaiveDateTime;
@@ -17,8 +17,6 @@ use crate::{
     error::ApiError,
     routes::Success,
 };
-
-const SETTINGS_CHANNEL: &str = "ctfzone_settings_changed";
 
 #[derive(Deserialize, Default)]
 pub(super) struct AdminQuery {
@@ -119,12 +117,18 @@ pub(super) struct BracketInput {
 }
 
 #[derive(Deserialize)]
+pub(super) struct ChallengeCategoryInput {
+    name: String,
+}
+
+#[derive(Deserialize)]
 pub(super) struct FlagInput {
     challenge_id: i32,
     #[serde(rename = "type")]
     flag_type: String,
     content: String,
-    data: Option<String>,
+    #[serde(default)]
+    data: Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -133,7 +137,7 @@ pub(super) struct FlagPatch {
     #[serde(rename = "type")]
     flag_type: Option<String>,
     content: Option<String>,
-    data: Option<String>,
+    data: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -240,13 +244,20 @@ struct BracketView {
 }
 
 #[derive(FromRow, Serialize)]
+struct ChallengeCategoryView {
+    id: i32,
+    name: String,
+}
+
+#[derive(FromRow, Serialize)]
 struct FlagView {
     id: i32,
-    challenge_id: Option<i32>,
+    challenge_id: i32,
     #[serde(rename = "type")]
-    flag_type: Option<String>,
-    content: Option<String>,
-    data: Option<String>,
+    flag_type: String,
+    content: String,
+    data: Value,
+    revision: i64,
 }
 
 #[derive(FromRow, Serialize)]
@@ -319,7 +330,12 @@ pub(super) async fn list_configs(
     Ok(Json(Success::new(
         configs
             .into_iter()
-            .filter(|config| config.key.as_deref() != Some(crate::setup::COMPLETED_MARKER_KEY))
+            .filter(|config| {
+                config
+                    .key
+                    .as_deref()
+                    .is_some_and(super::configuration::is_known_setting)
+            })
             .map(super::configuration::PublicConfig::from)
             .collect::<Vec<_>>(),
     ))
@@ -332,8 +348,8 @@ pub(super) async fn create_config(
     Json(request): Json<ConfigInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if request.key == "private_challenges" {
-        return set_private_challenges(&state, &user, value_bool(&request.value)?).await;
+    if request.key == "user_mode" {
+        return Err(direct_user_mode_change_error());
     }
     let key = request.key;
     let values = Map::from_iter([(key.clone(), request.value)]);
@@ -365,31 +381,14 @@ pub(super) async fn create_config(
 pub(super) async fn patch_configs(
     State(state): State<AppState>,
     user: CurrentUser,
-    Json(mut request): Json<Map<String, Value>>,
+    Json(request): Json<Map<String, Value>>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    request.remove("clear_registration_access_modes");
-    let private_value = request.remove("private_challenges");
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     let normalized = super::configuration::normalize_mutations(&mut transaction, &request).await?;
+    reject_direct_user_mode_change(&mut transaction, &normalized).await?;
     for (key, value) in normalized {
         super::configuration::upsert_normalized(&mut transaction, &key, value).await?;
-    }
-    if let Some(value) = private_value {
-        let enabled = value_bool(&value)?;
-        let revision = sqlx::query_scalar::<_, i64>(
-            r#"
-            UPDATE ctfzone.runtime_settings SET enabled=$1,revision=revision+1,
-                updated_at=now(),updated_by_user_id=$2 WHERE key='private_challenges'
-            RETURNING revision
-            "#,
-        )
-        .bind(enabled)
-        .bind(user.id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?;
-        notify(&mut transaction, SETTINGS_CHANNEL, &revision.to_string()).await?;
     }
     transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(json!({"success": true})).into_response())
@@ -401,21 +400,8 @@ pub(super) async fn get_config(
     Path(config_key): Path<String>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if config_key == "private_challenges" {
-        let (enabled, revision) = sqlx::query_as::<_, (bool, i64)>(
-            "SELECT enabled,revision FROM ctfzone.runtime_settings WHERE key='private_challenges'",
-        )
-        .fetch_one(&state.database)
-        .await
-        .map_err(ApiError::database)?;
-        return Ok(Json(Success::new(super::configuration::PublicConfig::from(
-            super::configuration::StoredConfig {
-                id: i32::try_from(revision).unwrap_or(i32::MAX),
-                key: Some(config_key),
-                value: Some(enabled.to_string()),
-            },
-        )))
-        .into_response());
+    if !super::configuration::is_known_setting(&config_key) {
+        return Err(ApiError::not_found("Configuration setting not found"));
     }
     let config = load_config(&state, &config_key).await?;
     Ok(Json(Success::new(super::configuration::PublicConfig::from(
@@ -431,13 +417,11 @@ pub(super) async fn update_config(
     Json(request): Json<ConfigValueInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if config_key == "private_challenges" {
-        return set_private_challenges(&state, &user, value_bool(&request.value)?).await;
-    }
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     let values = Map::from_iter([(config_key.clone(), request.value)]);
-    let stored_value = super::configuration::normalize_mutations(&mut transaction, &values)
-        .await?
+    let normalized = super::configuration::normalize_mutations(&mut transaction, &values).await?;
+    reject_direct_user_mode_change(&mut transaction, &normalized).await?;
+    let stored_value = normalized
         .into_iter()
         .next()
         .map(|(_, value)| value)
@@ -448,36 +432,6 @@ pub(super) async fn update_config(
         config,
     )))
     .into_response())
-}
-
-pub(super) async fn delete_config(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    Path(config_key): Path<String>,
-) -> Result<Response, ApiError> {
-    require_admin(&user)?;
-    if config_key == crate::setup::COMPLETED_MARKER_KEY {
-        return Err(ApiError::bad_request(
-            "The setup completion marker cannot be deleted",
-        ));
-    }
-    if config_key == "private_challenges" {
-        return Err(ApiError::bad_request(
-            "The private challenge setting cannot be deleted",
-        ));
-    }
-    if config_key == "player_frontend" || config_key == "ctf_name" {
-        return Err(ApiError::bad_request(
-            "Required site identity settings cannot be deleted",
-        ));
-    }
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    let deleted = super::configuration::delete_legacy(&mut transaction, &config_key).await?;
-    transaction.commit().await.map_err(ApiError::database)?;
-    if deleted == 0 {
-        return Err(ApiError::not_found("Configuration not found"));
-    }
-    Ok(Json(json!({"success": true})).into_response())
 }
 
 pub(super) async fn list_registration_emails(
@@ -829,7 +783,7 @@ pub(super) async fn delete_field(
     Path(field_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "fields", field_id).await
+    delete_integer_id(&state, &user, "fields", field_id).await
 }
 
 pub(super) async fn list_pages(
@@ -959,7 +913,7 @@ pub(super) async fn delete_page(
     Path(page_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "pages", page_id).await
+    delete_integer_id(&state, &user, "pages", page_id).await
 }
 
 pub(super) async fn list_brackets(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -968,6 +922,105 @@ pub(super) async fn list_brackets(State(state): State<AppState>) -> Result<Respo
         .await
         .map_err(ApiError::database)?;
     Ok(Json(Success::new(rows)).into_response())
+}
+
+pub(super) async fn list_challenge_categories(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let rows = sqlx::query_as::<_, ChallengeCategoryView>(
+        "SELECT id,name FROM ctfzone.challenge_categories ORDER BY lower(name),id",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::database)?;
+    Ok(Json(Success::new(rows)).into_response())
+}
+
+pub(super) async fn create_challenge_category(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    headers: HeaderMap,
+    Json(request): Json<ChallengeCategoryInput>,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let name = validate_short_text(&request.name, "Category")?;
+    if name.len() > 80 {
+        return Err(ApiError::bad_request("Category value is invalid"));
+    }
+    let request_data = json!({"name": &name});
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let (idempotency, replay) = super::create_idempotency::CreateRequest::lock_and_replay(
+        &mut transaction,
+        &headers,
+        user.id,
+        super::create_idempotency::CATEGORY_CREATE,
+        &request_data,
+    )
+    .await?;
+    if let Some(response_data) = replay {
+        transaction.commit().await.map_err(ApiError::database)?;
+        return Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response());
+    }
+    let row = sqlx::query_as::<_, ChallengeCategoryView>(
+        "INSERT INTO ctfzone.challenge_categories (name) VALUES ($1) RETURNING id,name",
+    )
+    .bind(name)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| ApiError::conflict_or_database(error, "Challenge category already exists"))?;
+    let response_data = json!({"id": row.id, "name": row.name});
+    idempotency
+        .complete(&mut transaction, row.id, &response_data)
+        .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response())
+}
+
+pub(super) async fn delete_challenge_category(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(category_id): Path<i32>,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let exists = sqlx::query_scalar::<_, i32>(
+        "SELECT id FROM ctfzone.challenge_categories WHERE id=$1 FOR UPDATE",
+    )
+    .bind(category_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .is_some();
+    if !exists {
+        return Err(ApiError::not_found("Challenge category not found"));
+    }
+    let in_use = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM ctfzone.challenges WHERE category_id=$1)",
+    )
+    .bind(category_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if in_use {
+        return Err(ApiError::conflict(
+            "Challenge category is still used by a challenge",
+        ));
+    }
+    sqlx::query("DELETE FROM ctfzone.challenge_categories WHERE id=$1")
+        .bind(category_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    super::create_idempotency::forget_resource(
+        &mut transaction,
+        super::create_idempotency::CATEGORY_CREATE,
+        category_id,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 pub(super) async fn create_bracket(
@@ -1017,7 +1070,7 @@ pub(super) async fn delete_bracket(
     Path(bracket_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "brackets", bracket_id).await
+    delete_integer_id(&state, &user, "brackets", bracket_id).await
 }
 
 pub(super) async fn flag_types(user: CurrentUser) -> Result<Response, ApiError> {
@@ -1045,7 +1098,7 @@ pub(super) async fn list_flags(
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
     let flags = sqlx::query_as::<_, FlagView>(
-        "SELECT id,challenge_id,type AS flag_type,content,data FROM ctfzone.flags WHERE ($1::integer IS NULL OR challenge_id=$1) ORDER BY id",
+        "SELECT id,challenge_id,type AS flag_type,content,data,revision FROM ctfzone.flags WHERE ($1::integer IS NULL OR challenge_id=$1) ORDER BY id",
     )
     .bind(query.challenge_id)
     .fetch_all(&state.database)
@@ -1066,23 +1119,43 @@ pub(super) async fn get_flag(
 pub(super) async fn create_flag(
     State(state): State<AppState>,
     user: CurrentUser,
-    Json(mut request): Json<FlagInput>,
+    Json(request): Json<FlagInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    validate_flag(&request.flag_type, &request.content)?;
-    if matches!(request.flag_type.as_str(), "static" | "regex") {
-        request.content = request.content.trim().to_owned();
-    }
-    let flag = sqlx::query_as::<_, FlagView>(
-        "INSERT INTO ctfzone.flags (challenge_id,type,content,data) VALUES ($1,$2,$3,$4) RETURNING id,challenge_id,type AS flag_type,content,data",
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::flag_policy::lock_challenge_definition(&mut transaction, request.challenge_id).await?;
+    let exposure = sqlx::query_scalar::<_, String>(
+        "SELECT exposure FROM ctfzone.challenges WHERE id=$1 FOR KEY SHARE",
     )
     .bind(request.challenge_id)
-    .bind(request.flag_type)
-    .bind(request.content)
-    .bind(request.data)
-    .fetch_one(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(ApiError::database)?;
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge not found"))?;
+    if challenge_has_active_runtime(&mut transaction, request.challenge_id).await? {
+        return Err(ApiError::conflict(
+            "Stop the active challenge instances before changing flags",
+        ));
+    }
+    let (flag_type, content, data) = super::flag_policy::normalize_definition(
+        &request.flag_type,
+        &request.content,
+        request.data,
+        &exposure,
+    )?;
+    let flag = sqlx::query_as::<_, FlagView>(
+        "INSERT INTO ctfzone.flags (challenge_id,type,content,data) VALUES ($1,$2,$3,$4) RETURNING id,challenge_id,type AS flag_type,content,data,revision",
+    )
+    .bind(request.challenge_id)
+    .bind(flag_type)
+    .bind(content)
+    .bind(data)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| {
+        ApiError::conflict_or_database(error, "The challenge already has a generated flag")
+    })?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(Success::new(flag))).into_response())
 }
 
@@ -1090,28 +1163,117 @@ pub(super) async fn update_flag(
     State(state): State<AppState>,
     user: CurrentUser,
     Path(flag_id): Path<i32>,
-    Json(mut request): Json<FlagPatch>,
+    Json(request): Json<FlagPatch>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if let Some(content) = request.content.as_mut() {
-        *content = content.trim().to_owned();
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let initial_challenge_id =
+        sqlx::query_scalar::<_, i32>("SELECT challenge_id FROM ctfzone.flags WHERE id=$1")
+            .bind(flag_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("Flag not found"))?;
+    let requested_challenge_id = request.challenge_id.unwrap_or(initial_challenge_id);
+    for challenge_id in if initial_challenge_id == requested_challenge_id {
+        vec![initial_challenge_id]
+    } else {
+        let mut ids = vec![initial_challenge_id, requested_challenge_id];
+        ids.sort_unstable();
+        ids
+    } {
+        super::flag_policy::lock_challenge_definition(&mut transaction, challenge_id).await?;
     }
-    let flag = sqlx::query_as::<_, FlagView>(
-        r#"
-        UPDATE ctfzone.flags SET challenge_id=COALESCE($1,challenge_id),type=COALESCE($2,type),
-            content=COALESCE($3,content),data=COALESCE($4,data) WHERE id=$5
-        RETURNING id,challenge_id,type AS flag_type,content,data
-        "#,
+    let current = sqlx::query_as::<_, FlagView>(
+        "SELECT id,challenge_id,type AS flag_type,content,data,revision FROM ctfzone.flags WHERE id=$1 FOR UPDATE",
     )
-    .bind(request.challenge_id)
-    .bind(request.flag_type)
-    .bind(request.content)
-    .bind(request.data)
     .bind(flag_id)
-    .fetch_optional(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Flag not found"))?;
+    if current.challenge_id != initial_challenge_id {
+        return Err(ApiError::conflict(
+            "The flag changed concurrently; reload it and try again",
+        ));
+    }
+    let challenge_id = request.challenge_id.unwrap_or(current.challenge_id);
+    let flag_type = request
+        .flag_type
+        .unwrap_or_else(|| current.flag_type.clone());
+    let content = request.content.unwrap_or_else(|| current.content.clone());
+    let data = request.data.unwrap_or_else(|| current.data.clone());
+    let exposure = sqlx::query_scalar::<_, String>(
+        "SELECT exposure FROM ctfzone.challenges WHERE id=$1 FOR KEY SHARE",
+    )
+    .bind(challenge_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge not found"))?;
+    let (flag_type, content, data) =
+        super::flag_policy::normalize_definition(&flag_type, &content, data, &exposure)?;
+    let changed = challenge_id != current.challenge_id
+        || flag_type != current.flag_type
+        || content != current.content
+        || data != current.data;
+    if changed {
+        if challenge_id != current.challenge_id {
+            let source_flag_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ctfzone.flags WHERE challenge_id=$1",
+            )
+            .bind(current.challenge_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+            if source_flag_count <= 1 {
+                return Err(ApiError::conflict(
+                    "A challenge must retain at least one flag definition",
+                ));
+            }
+        }
+        let assignments = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ctfzone.user_challenge_flags WHERE flag_id=$1)",
+        )
+        .bind(flag_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if assignments {
+            return Err(ApiError::conflict(
+                "Generated flag definitions cannot change after allocation",
+            ));
+        }
+        if challenge_has_active_runtime(&mut transaction, current.challenge_id).await?
+            || (challenge_id != current.challenge_id
+                && challenge_has_active_runtime(&mut transaction, challenge_id).await?)
+        {
+            return Err(ApiError::conflict(
+                "Stop the active challenge instances before changing flags",
+            ));
+        }
+    }
+    let flag = sqlx::query_as::<_, FlagView>(
+        r#"
+        UPDATE ctfzone.flags SET challenge_id=$1,type=$2,content=$3,data=$4,
+            revision=CASE WHEN challenge_id IS DISTINCT FROM $1 OR type IS DISTINCT FROM $2
+                OR content IS DISTINCT FROM $3 OR data IS DISTINCT FROM $4
+                THEN revision+1 ELSE revision END
+        WHERE id=$5
+        RETURNING id,challenge_id,type AS flag_type,content,data,revision
+        "#,
+    )
+    .bind(challenge_id)
+    .bind(flag_type)
+    .bind(content)
+    .bind(data)
+    .bind(flag_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| {
+        ApiError::conflict_or_database(error, "The challenge already has a generated flag")
+    })?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(flag)).into_response())
 }
 
@@ -1121,7 +1283,63 @@ pub(super) async fn delete_flag(
     Path(flag_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "flags", flag_id).await
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let initial_challenge_id =
+        sqlx::query_scalar::<_, i32>("SELECT challenge_id FROM ctfzone.flags WHERE id=$1")
+            .bind(flag_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("Flag not found"))?;
+    super::flag_policy::lock_challenge_definition(&mut transaction, initial_challenge_id).await?;
+    let challenge_id = sqlx::query_scalar::<_, i32>(
+        "SELECT challenge_id FROM ctfzone.flags WHERE id=$1 FOR UPDATE",
+    )
+    .bind(flag_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Flag not found"))?;
+    if challenge_id != initial_challenge_id {
+        return Err(ApiError::conflict(
+            "The flag changed concurrently; reload it and try again",
+        ));
+    }
+    let assignments = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM ctfzone.user_challenge_flags WHERE flag_id=$1)",
+    )
+    .bind(flag_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if assignments {
+        return Err(ApiError::conflict(
+            "Generated flags cannot be deleted after allocation",
+        ));
+    }
+    let flag_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ctfzone.flags WHERE challenge_id=$1")
+            .bind(challenge_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+    if flag_count <= 1 {
+        return Err(ApiError::conflict(
+            "A challenge must retain at least one flag definition",
+        ));
+    }
+    if challenge_has_active_runtime(&mut transaction, challenge_id).await? {
+        return Err(ApiError::conflict(
+            "Stop the active challenge instances before changing flags",
+        ));
+    }
+    sqlx::query("DELETE FROM ctfzone.flags WHERE id=$1")
+        .bind(flag_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 pub(super) async fn list_tags(
@@ -1194,7 +1412,7 @@ pub(super) async fn delete_tag(
     Path(tag_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "tags", tag_id).await
+    delete_integer_id(&state, &user, "tags", tag_id).await
 }
 
 pub(super) async fn list_topics(
@@ -1269,7 +1487,7 @@ pub(super) async fn delete_topic_relation(
     let id = query
         .target_id
         .ok_or_else(|| ApiError::bad_request("target_id is required"))?;
-    delete_integer_id(&state, "challenge_topics", id).await
+    delete_integer_id(&state, &user, "challenge_topics", id).await
 }
 
 pub(super) async fn delete_topic(
@@ -1278,7 +1496,7 @@ pub(super) async fn delete_topic(
     Path(topic_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "topics", topic_id).await
+    delete_integer_id(&state, &user, "topics", topic_id).await
 }
 
 pub(super) async fn list_awards(
@@ -1313,19 +1531,18 @@ pub(super) async fn create_award(
     Json(mut request): Json<AwardInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if super::challenges::is_team_mode(&state).await? && request.team_id.is_none() {
-        request.team_id =
-            sqlx::query_scalar::<_, Option<i32>>("SELECT team_id FROM ctfzone.users WHERE id=$1")
-                .bind(request.user_id)
-                .fetch_one(&state.database)
-                .await
-                .map_err(ApiError::database)?;
-        if request.team_id.is_none() {
-            return Err(ApiError::bad_request(
-                "The award user does not belong to a team",
-            ));
-        }
-    }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
+    request.team_id =
+        canonical_account_team_id(&mut transaction, request.user_id, request.team_id, "award")
+            .await?;
     let award = sqlx::query_as::<_, AwardView>(
         r#"
         INSERT INTO ctfzone.awards
@@ -1343,9 +1560,10 @@ pub(super) async fn create_award(
     .bind(request.category)
     .bind(request.icon)
     .bind(request.requirements)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(Success::new(award))).into_response())
 }
 
@@ -1355,7 +1573,7 @@ pub(super) async fn delete_award(
     Path(award_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "awards", award_id).await
+    delete_integer_id(&state, &user, "awards", award_id).await
 }
 
 pub(super) async fn list_comments(
@@ -1418,6 +1636,30 @@ pub(super) async fn create_comment(
     } else {
         "standard"
     };
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if let Some(team_id) = request.team_id {
+        if super::user_mode_transition::transaction_user_mode(&mut transaction).await? != "teams" {
+            return Err(ApiError::bad_request(
+                "Team comments are only available in team mode",
+            ));
+        }
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ctfzone.teams WHERE id=$1)")
+                .bind(team_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        if !exists {
+            return Err(ApiError::bad_request("Comment team does not exist"));
+        }
+    }
     let comment = sqlx::query_as::<_, CommentView>(
         r#"
         INSERT INTO ctfzone.comments
@@ -1433,9 +1675,10 @@ pub(super) async fn create_comment(
     .bind(request.user_id)
     .bind(request.team_id)
     .bind(request.page_id)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(Success::new(comment))).into_response())
 }
 
@@ -1445,7 +1688,7 @@ pub(super) async fn delete_comment(
     Path(comment_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "comments", comment_id).await
+    delete_integer_id(&state, &user, "comments", comment_id).await
 }
 
 pub(super) async fn list_submissions(
@@ -1495,11 +1738,26 @@ pub(super) async fn get_submission(
 pub(super) async fn create_submission(
     State(state): State<AppState>,
     user: CurrentUser,
-    Json(request): Json<SubmissionInput>,
+    Json(mut request): Json<SubmissionInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
     validate_submission_type(&request.submission_type)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
+    request.team_id = canonical_account_team_id(
+        &mut transaction,
+        request.user_id,
+        request.team_id,
+        "submission",
+    )
+    .await?;
     let id = insert_submission(&mut transaction, &request).await?;
     if request.submission_type == "correct" {
         sqlx::query(
@@ -1528,17 +1786,40 @@ pub(super) async fn update_submission(
     Json(request): Json<SubmissionPatch>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let current = load_submission(&state, submission_id).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
+    let current = sqlx::query_as::<_, SubmissionView>(&format!(
+        "{} WHERE id=$1 FOR UPDATE",
+        submission_select()
+    ))
+    .bind(submission_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Submission not found"))?;
     let requested_type = request
         .submission_type
         .unwrap_or_else(|| current.submission_type.clone().unwrap_or_default());
     validate_submission_type(&requested_type)?;
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let canonical_team_id = canonical_account_team_id(
+        &mut transaction,
+        current.user_id.unwrap_or_default(),
+        current.team_id,
+        "submission",
+    )
+    .await?;
     if current.submission_type.as_deref() != Some("correct") && requested_type == "correct" {
         let input = SubmissionInput {
             challenge_id: current.challenge_id.unwrap_or_default(),
             user_id: current.user_id.unwrap_or_default(),
-            team_id: current.team_id,
+            team_id: canonical_team_id,
             ip: current.ip,
             provided: request.provided.or(current.provided).unwrap_or_default(),
             submission_type: "correct".to_owned(),
@@ -1589,37 +1870,74 @@ pub(super) async fn delete_submission(
     Path(submission_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, "submissions", submission_id).await
+    delete_integer_id(&state, &user, "submissions", submission_id).await
 }
 
-async fn set_private_challenges(
-    state: &AppState,
-    user: &CurrentUser,
-    enabled: bool,
-) -> Result<Response, ApiError> {
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    let revision = sqlx::query_scalar::<_, i64>(
-        r#"
-        UPDATE ctfzone.runtime_settings SET enabled=$1,revision=revision+1,
-            updated_at=now(),updated_by_user_id=$2 WHERE key='private_challenges'
-        RETURNING revision
-        "#,
+async fn reject_direct_user_mode_change(
+    transaction: &mut Transaction<'_, Postgres>,
+    normalized: &[(String, String)],
+) -> Result<(), ApiError> {
+    let Some((_, requested)) = normalized.iter().find(|(key, _)| key == "user_mode") else {
+        return Ok(());
+    };
+    let current = super::user_mode_transition::transaction_user_mode(transaction).await?;
+    if requested == &current {
+        Ok(())
+    } else {
+        Err(direct_user_mode_change_error())
+    }
+}
+
+fn direct_user_mode_change_error() -> ApiError {
+    ApiError::conflict(
+        "Competition mode must be changed through the account-mode transition endpoint",
     )
-    .bind(enabled)
-    .bind(user.id)
-    .fetch_one(&mut *transaction)
+}
+
+async fn canonical_account_team_id(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: i32,
+    requested_team_id: Option<i32>,
+    record_kind: &str,
+) -> Result<Option<i32>, ApiError> {
+    if super::user_mode_transition::transaction_user_mode(transaction).await? == "users" {
+        if requested_team_id.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "A {record_kind} cannot target a team while competition mode is users"
+            )));
+        }
+        let participant_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ctfzone.users WHERE id=$1 AND type='user')",
+        )
+        .bind(user_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if !participant_exists {
+            return Err(ApiError::bad_request(format!(
+                "The {record_kind} user is not a participant"
+            )));
+        }
+        return Ok(None);
+    }
+
+    let assigned_team_id = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
     .await
-    .map_err(ApiError::database)?;
-    notify(&mut transaction, SETTINGS_CHANNEL, &revision.to_string()).await?;
-    transaction.commit().await.map_err(ApiError::database)?;
-    Ok(Json(Success::new(super::configuration::PublicConfig::from(
-        super::configuration::StoredConfig {
-            id: i32::try_from(revision).unwrap_or(i32::MAX),
-            key: Some("private_challenges".to_owned()),
-            value: Some(enabled.to_string()),
-        },
-    )))
-    .into_response())
+    .map_err(ApiError::database)?
+    .flatten()
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("The {record_kind} user does not belong to a team"))
+    })?;
+    if requested_team_id.is_some_and(|team_id| team_id != assigned_team_id) {
+        return Err(ApiError::bad_request(format!(
+            "The {record_kind} team does not match the user's current team"
+        )));
+    }
+    Ok(Some(assigned_team_id))
 }
 
 async fn upsert_config(
@@ -1675,7 +1993,7 @@ async fn load_page(state: &AppState, id: i32) -> Result<PageView, ApiError> {
 
 async fn load_flag(state: &AppState, id: i32) -> Result<FlagView, ApiError> {
     sqlx::query_as::<_, FlagView>(
-        "SELECT id,challenge_id,type AS flag_type,content,data FROM ctfzone.flags WHERE id=$1",
+        "SELECT id,challenge_id,type AS flag_type,content,data,revision FROM ctfzone.flags WHERE id=$1",
     )
     .bind(id)
     .fetch_optional(&state.database)
@@ -1744,7 +2062,12 @@ async fn insert_submission(
     .map_err(ApiError::database)
 }
 
-async fn delete_integer_id(state: &AppState, table: &str, id: i32) -> Result<Response, ApiError> {
+async fn delete_integer_id(
+    state: &AppState,
+    user: &CurrentUser,
+    table: &str,
+    id: i32,
+) -> Result<Response, ApiError> {
     let allowed = [
         "registration_email_allowlist",
         "fields",
@@ -1763,29 +2086,24 @@ async fn delete_integer_id(state: &AppState, table: &str, id: i32) -> Result<Res
             "Unsupported administrative content type",
         ));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let result = sqlx::query(&format!("DELETE FROM ctfzone.{table} WHERE id=$1"))
         .bind(id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("Record not found"));
     }
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(json!({"success": true})).into_response())
-}
-
-async fn notify(
-    transaction: &mut Transaction<'_, Postgres>,
-    channel: &str,
-    payload: &str,
-) -> Result<(), ApiError> {
-    sqlx::query("SELECT pg_notify($1,$2)")
-        .bind(channel)
-        .bind(payload)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::database)?;
-    Ok(())
 }
 
 fn field_select(suffix: &str) -> String {
@@ -1816,21 +2134,15 @@ fn submission_select() -> &'static str {
 
 fn flag_types_value() -> Value {
     json!({
-        "static": {"name": "static", "templates": {}},
-        "regex": {"name": "regex", "templates": {}}
+        "static": {"name": "static", "personalized": false},
+        "regex": {"name": "regex", "personalized": false},
+        "generated": {
+            "name": "generated",
+            "personalized": true,
+            "private_only": true,
+            "random_token_placeholder": super::flag_policy::RANDOM_TOKEN_PLACEHOLDER
+        }
     })
-}
-
-fn value_bool(value: &Value) -> Result<bool, ApiError> {
-    match value {
-        Value::Bool(value) => Ok(*value),
-        Value::String(value) => match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(ApiError::bad_request("Setting must be a boolean")),
-        },
-        _ => Err(ApiError::bad_request("Setting must be a boolean")),
-    }
 }
 
 fn validate_field(owner_type: &str, field_type: &str, name: &str) -> Result<(), ApiError> {
@@ -1888,11 +2200,17 @@ fn validate_bracket(request: &BracketInput) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_flag(flag_type: &str, content: &str) -> Result<(), ApiError> {
-    if !matches!(flag_type, "static" | "regex") || content.trim().is_empty() {
-        return Err(ApiError::bad_request("Flag definition is invalid"));
-    }
-    Ok(())
+async fn challenge_has_active_runtime(
+    transaction: &mut Transaction<'_, Postgres>,
+    challenge_id: i32,
+) -> Result<bool, ApiError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM ctfzone.runtime_instances WHERE challenge_id=$1 AND active)",
+    )
+    .bind(challenge_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(ApiError::database)
 }
 
 fn validate_submission_type(value: &str) -> Result<(), ApiError> {
@@ -1954,6 +2272,26 @@ fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
 mod tests {
     use super::*;
 
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing source marker: {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing source marker: {end}"))
+            .0
+    }
+
+    fn assert_source_order(source: &str, markers: &[&str]) {
+        let mut remaining = source;
+        for marker in markers {
+            remaining = remaining
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("missing or out-of-order source marker: {marker}"))
+                .1;
+        }
+    }
+
     #[test]
     fn validates_public_page_slugs() {
         assert_eq!(validate_public_page_route(" rules ").unwrap(), "rules");
@@ -1970,5 +2308,413 @@ mod tests {
     #[test]
     fn escapes_allowlist_search_wildcards_as_literals() {
         assert_eq!(escape_like("100%_\\example"), "100\\%\\_\\\\example");
+    }
+
+    #[test]
+    fn score_and_unlock_writers_hold_the_shared_mode_fence() {
+        let challenges = include_str!("challenges.rs");
+        assert_source_order(
+            source_between(
+                challenges,
+                "pub(super) async fn attempt(",
+                "async fn challenge_detail_by_id(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "pg_advisory_xact_lock",
+                "insert_submission(",
+                "INSERT INTO ctfzone.solves",
+            ],
+        );
+
+        let content = include_str!("content.rs");
+        assert_source_order(
+            source_between(
+                content,
+                "pub(super) async fn rate_challenge(",
+                "pub(super) async fn challenge_solution(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "lock_team_membership",
+                "require_full_challenge_access_in_transaction",
+                "user_solved_challenge_in_transaction",
+                "INSERT INTO ctfzone.ratings",
+            ],
+        );
+        assert_source_order(
+            source_between(
+                content,
+                "pub(super) async fn unlock(",
+                "pub(super) async fn list_notifications(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "CONTENT_UNLOCK_LOCK_NAMESPACE",
+                "INSERT INTO ctfzone.awards",
+                "INSERT INTO ctfzone.unlocks",
+            ],
+        );
+
+        let administration = include_str!("administration.rs");
+        for (start, end, final_write) in [
+            (
+                "pub(super) async fn create_award(",
+                "pub(super) async fn delete_award(",
+                "INSERT INTO ctfzone.awards",
+            ),
+            (
+                "pub(super) async fn create_submission(",
+                "pub(super) async fn update_submission(",
+                "insert_submission(",
+            ),
+            (
+                "pub(super) async fn update_submission(",
+                "pub(super) async fn delete_submission(",
+                "INSERT INTO ctfzone.solves",
+            ),
+        ] {
+            assert_source_order(
+                source_between(administration, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    "canonical_account_team_id",
+                    final_write,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn upload_token_and_team_writers_hold_the_shared_mode_fence() {
+        let objects = include_str!("objects.rs");
+        for (start, end, final_write) in [
+            (
+                "pub(super) async fn initiate_upload(",
+                "pub(super) async fn complete_upload(",
+                "INSERT INTO ctfzone.stored_objects",
+            ),
+            (
+                "pub(super) async fn complete_upload(",
+                "pub(super) async fn object_detail(",
+                "UPDATE ctfzone.stored_objects",
+            ),
+        ] {
+            assert_source_order(
+                source_between(objects, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    "transaction_user_mode",
+                    "authorization_principal_in_transaction",
+                    final_write,
+                ],
+            );
+        }
+
+        let tokens = include_str!("participant_tokens.rs");
+        assert_source_order(
+            source_between(
+                tokens,
+                "pub(super) async fn get(",
+                "pub(super) async fn rotate(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "lock_team_membership",
+                "current_account_in_transaction",
+                "load_token_in_transaction",
+            ],
+        );
+        assert_source_order(
+            source_between(
+                tokens,
+                "pub(super) async fn rotate(",
+                "async fn current_account_in_transaction(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "current_account_in_transaction",
+                "UPDATE ctfzone.users",
+                "UPDATE ctfzone.teams",
+            ],
+        );
+
+        let teams = include_str!("team_accounts.rs");
+        for (start, end, final_write) in [
+            (
+                "pub(super) async fn create_current(",
+                "pub(super) async fn join_current(",
+                "INSERT INTO ctfzone.teams",
+            ),
+            (
+                "pub(super) async fn join_current(",
+                "pub(super) async fn detail(",
+                "UPDATE ctfzone.users SET team_id",
+            ),
+            (
+                "pub(super) async fn add_member(",
+                "pub(super) async fn current_invite(",
+                "UPDATE ctfzone.users SET team_id",
+            ),
+            (
+                "pub(super) async fn remove_member(",
+                "async fn update(",
+                "UPDATE ctfzone.users SET team_id = NULL",
+            ),
+            (
+                "async fn delete_team(",
+                "async fn load_team(",
+                "DELETE FROM ctfzone.teams",
+            ),
+        ] {
+            assert_source_order(
+                source_between(teams, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    "require_team_mode_in_transaction",
+                    final_write,
+                ],
+            );
+        }
+
+        let api_tokens = include_str!("tokens.rs");
+        for (start, end, final_write) in [
+            (
+                "pub(super) async fn create_token(",
+                "pub(super) async fn get_token(",
+                "INSERT INTO ctfzone.tokens",
+            ),
+            (
+                "pub(super) async fn delete_token(",
+                "async fn find_visible_token(",
+                "DELETE FROM ctfzone.tokens",
+            ),
+        ] {
+            assert_source_order(
+                source_between(api_tokens, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    final_write,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn exact_snapshot_metadata_writers_hold_the_shared_mode_fence() {
+        let challenges = include_str!("challenges.rs");
+        for (start, end, final_write) in [
+            (
+                "pub(super) async fn create(",
+                "pub(super) async fn detail(",
+                "INSERT INTO ctfzone.challenges",
+            ),
+            (
+                "pub(super) async fn delete_challenge(",
+                "pub(super) async fn attempt(",
+                "DELETE FROM ctfzone.challenges",
+            ),
+        ] {
+            assert_source_order(
+                source_between(challenges, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    final_write,
+                ],
+            );
+        }
+        assert_source_order(
+            source_between(
+                challenges,
+                "pub(super) async fn update(",
+                "pub(super) async fn delete_challenge(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "challenge_detail_by_id_for_update",
+                "transaction_user_mode",
+                "UPDATE ctfzone.challenges",
+            ],
+        );
+
+        let content = include_str!("content.rs");
+        assert_source_order(
+            source_between(
+                content,
+                "pub(super) async fn create_notification(",
+                "pub(super) async fn delete_notification(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "INSERT INTO ctfzone.notifications",
+            ],
+        );
+
+        let objects = include_str!("objects.rs");
+        assert_source_order(
+            source_between(
+                objects,
+                "pub(super) async fn download_grant(",
+                "pub(super) async fn delete_object(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "lock_team_membership",
+                "load_object_for_update",
+                "get_url",
+            ],
+        );
+
+        assert_source_order(
+            source_between(
+                challenges,
+                "if let Some(current) = user.as_ref().filter(|current| !current.is_admin()) {",
+                "pub(super) async fn update(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "INSERT INTO ctfzone.tracking",
+            ],
+        );
+
+        let administration = include_str!("administration.rs");
+        assert_source_order(
+            source_between(
+                administration,
+                "pub(super) async fn create_comment(",
+                "pub(super) async fn delete_comment(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "transaction_user_mode",
+                "INSERT INTO ctfzone.comments",
+            ],
+        );
+        assert_source_order(
+            source_between(
+                administration,
+                "async fn delete_integer_id(",
+                "fn field_select(",
+            ),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "DELETE FROM ctfzone.",
+            ],
+        );
+    }
+
+    #[test]
+    fn session_creation_and_revocation_hold_the_shared_mode_fence() {
+        let browser = include_str!("../browser_auth.rs");
+        assert_source_order(
+            source_between(browser, "async fn login(", "async fn logout("),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "SELECT u.id",
+                "insert_session(",
+            ],
+        );
+        assert_source_order(
+            source_between(browser, "async fn logout(", "fn session_id_from_headers("),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "UPDATE ctfzone.user_sessions",
+            ],
+        );
+
+        let sessions = include_str!("sessions.rs");
+        for (start, end) in [
+            (
+                "pub(super) async fn revoke_all(",
+                "pub(super) async fn revoke_user(",
+            ),
+            (
+                "pub(super) async fn revoke_user(",
+                "pub(super) async fn revoke_one(",
+            ),
+            (
+                "pub(super) async fn revoke_one(",
+                "fn current_session_matches(",
+            ),
+        ] {
+            assert_source_order(
+                source_between(sessions, start, end),
+                &[
+                    "state.database.begin()",
+                    "lock_configuration_shared",
+                    "revalidate_current_credential",
+                    "UPDATE ctfzone.user_sessions",
+                ],
+            );
+        }
+
+        let users = include_str!("user_accounts.rs");
+        assert_source_order(
+            source_between(users, "async fn update(", "async fn load_user("),
+            &[
+                "state.database.begin()",
+                "lock_configuration_shared",
+                "revalidate_current_credential",
+                "UPDATE ctfzone.user_sessions",
+            ],
+        );
+    }
+
+    #[test]
+    fn flag_mutations_cannot_leave_a_challenge_without_a_definition() {
+        let source = include_str!("administration.rs");
+        let update = source_between(
+            source,
+            "pub(super) async fn update_flag(",
+            "pub(super) async fn delete_flag(",
+        );
+        let delete = source_between(
+            source,
+            "pub(super) async fn delete_flag(",
+            "pub(super) async fn list_tags(",
+        );
+        for segment in [update, delete] {
+            assert!(segment.contains("SELECT COUNT(*) FROM ctfzone.flags WHERE challenge_id=$1"));
+            assert!(segment.contains("A challenge must retain at least one flag definition"));
+        }
     }
 }

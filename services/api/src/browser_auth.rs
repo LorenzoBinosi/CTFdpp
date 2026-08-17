@@ -22,7 +22,6 @@ type SetupTokenMac = Hmac<Sha256>;
 const SETUP_TOKEN_COMPARISON_KEY: &[u8] = b"ctfzone/setup-token/constant-time-comparison/v1";
 const REGISTRATION_CODE_COMPARISON_KEY: &[u8] =
     b"ctfzone/registration-code/constant-time-comparison/v1";
-const CONFIGURATION_LOCK_KEY: i64 = 0x4354_465A_i64;
 const REGISTRATION_CAPACITY_LOCK_KEY: i64 = 0x4354_465D_i64;
 pub(crate) const DEFAULT_CTF_NAME: &str = "CTFZone";
 pub(crate) const DEFAULT_PLAYER_FRONTEND: &str = "terminal";
@@ -161,7 +160,6 @@ async fn setup(
         ("registration_visibility", "public"),
         ("registration_access_mode", "open"),
         ("verify_emails", "false"),
-        ("social_shares", "false"),
         ("paused", "false"),
         ("start", ""),
         ("end", ""),
@@ -169,17 +167,6 @@ async fn setup(
     ] {
         upsert_setup_config(&mut transaction, key, value).await?;
     }
-    sqlx::query(
-        r#"
-        INSERT INTO ctfzone.runtime_settings (key,enabled,revision,updated_by_user_id)
-        VALUES ('private_challenges',false,1,$1)
-        ON CONFLICT (key) DO NOTHING
-        "#,
-    )
-    .bind(user_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(ApiError::database)?;
     crate::setup::mark_complete(&mut transaction).await?;
 
     let session_id = Uuid::new_v4().to_string();
@@ -396,6 +383,8 @@ async fn login(
     if identity.is_empty() || form.password.len() > 128 {
         return Ok(login_error("invalid_credentials"));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    crate::routes::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
     let user = sqlx::query_as::<_, LoginUser>(
         r#"
         SELECT u.id,u.password,COALESCE(u.banned,false) AS banned,
@@ -408,7 +397,7 @@ async fn login(
         "#,
     )
     .bind(identity)
-    .fetch_optional(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
     let Some(user) = user else {
@@ -423,8 +412,7 @@ async fn login(
     let Some(encoded_password) = user.password.as_deref() else {
         return Ok(login_error("external_account"));
     };
-    let mut connection = state.database.acquire().await.map_err(ApiError::database)?;
-    let matches = passwords::verify_password(&mut connection, &form.password, encoded_password)
+    let matches = passwords::verify_password(&mut transaction, &form.password, encoded_password)
         .await
         .map_err(ApiError::database)?;
     if !matches {
@@ -436,24 +424,13 @@ async fn login(
             "UPDATE ctfzone.user_sessions SET revoked_at=timezone('utc',now()) WHERE id=$1 AND revoked_at IS NULL",
         )
         .bind(session_id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
     }
     let session_id = Uuid::new_v4().to_string();
-    sqlx::query(
-        r#"
-        INSERT INTO ctfzone.user_sessions
-            (id,user_id,created,last_seen,initial_ip,last_ip)
-        VALUES ($1,$2,timezone('utc',now()),timezone('utc',now()),$3,$3)
-        "#,
-    )
-    .bind(&session_id)
-    .bind(user.id)
-    .bind(&request_ip)
-    .execute(&state.database)
-    .await
-    .map_err(ApiError::database)?;
+    insert_session(&mut transaction, &session_id, user.id, &request_ip).await?;
+    transaction.commit().await.map_err(ApiError::database)?;
 
     let destination = query
         .next
@@ -466,13 +443,16 @@ async fn login(
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let session_id = session_id_from_headers(&headers)
         .ok_or_else(|| ApiError::unauthorized("An internal session is required"))?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    crate::routes::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
     sqlx::query(
         "UPDATE ctfzone.user_sessions SET revoked_at=timezone('utc',now()) WHERE id=$1 AND revoked_at IS NULL",
     )
     .bind(session_id)
-    .execute(&state.database)
+    .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(json!({"revoked": true}))).into_response())
 }
 
@@ -564,11 +544,7 @@ async fn locked_registration_policy(
     // Configuration writes take the exclusive form of this lock. Holding its
     // shared form through account creation makes every admission decision use
     // one committed policy version and prevents a mid-registration mode swap.
-    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
-        .bind(CONFIGURATION_LOCK_KEY)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::database)?;
+    crate::routes::user_mode_transition::lock_configuration_shared(transaction).await?;
     let keys = [
         "user_mode",
         "registration_visibility",
@@ -595,13 +571,8 @@ async fn locked_registration_policy(
     let registration_code = value("registration_code").unwrap_or_default().to_owned();
     let domain_whitelist = value("domain_whitelist").unwrap_or_default().to_owned();
     let domain_blacklist = value("domain_blacklist").unwrap_or_default().to_owned();
-    let access_mode = effective_registration_access_mode(
-        value("registration_access_mode"),
-        Some(&registration_code),
-        Some(&domain_whitelist),
-        Some(&domain_blacklist),
-    )
-    .to_owned();
+    let access_mode =
+        effective_registration_access_mode(value("registration_access_mode")).to_owned();
     Ok(RegistrationPolicy {
         registration_closed: value("registration_visibility") == Some("private"),
         access_mode,
@@ -618,27 +589,12 @@ async fn locked_registration_policy(
     })
 }
 
-pub(crate) fn effective_registration_access_mode(
-    explicit: Option<&str>,
-    registration_code: Option<&str>,
-    domain_whitelist: Option<&str>,
-    domain_blacklist: Option<&str>,
-) -> &'static str {
+pub(crate) fn effective_registration_access_mode(explicit: Option<&str>) -> &'static str {
     match explicit {
-        Some("open") => return "open",
-        Some("domain_rules") => return "domain_rules",
-        Some("access_code") => return "access_code",
-        Some("email_allowlist") => return "email_allowlist",
-        _ => {}
-    }
-    if registration_code.is_some_and(|value| !value.is_empty()) {
-        "access_code"
-    } else if domain_whitelist.is_some_and(|value| !value.is_empty())
-        || domain_blacklist.is_some_and(|value| !value.is_empty())
-    {
-        "domain_rules"
-    } else {
-        "open"
+        Some("domain_rules") => "domain_rules",
+        Some("access_code") => "access_code",
+        Some("email_allowlist") => "email_allowlist",
+        Some("open") | None | Some(_) => "open",
     }
 }
 
@@ -953,23 +909,13 @@ mod tests {
     }
 
     #[test]
-    fn registration_access_mode_is_validated_and_preserves_legacy_inference() {
+    fn registration_access_mode_is_explicit_and_validated() {
         for mode in ["open", "domain_rules", "access_code", "email_allowlist"] {
-            assert_eq!(
-                effective_registration_access_mode(Some(mode), None, None, None),
-                mode
-            );
+            assert_eq!(effective_registration_access_mode(Some(mode)), mode);
         }
+        assert_eq!(effective_registration_access_mode(None), "open");
         assert_eq!(
-            effective_registration_access_mode(None, Some("secret"), None, None),
-            "access_code"
-        );
-        assert_eq!(
-            effective_registration_access_mode(None, None, Some("example.test"), None),
-            "domain_rules"
-        );
-        assert_eq!(
-            effective_registration_access_mode(Some("unsupported"), None, None, None),
+            effective_registration_access_mode(Some("unsupported")),
             "open"
         );
     }

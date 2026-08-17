@@ -1,7 +1,7 @@
 # CTFZone configuration
 
 Status: Implemented 1.0.0 baseline  
-Last updated: 2026-08-13
+Last updated: 2026-08-17
 
 CTFZone's administration configuration page is driven by a typed catalog from
 the private Rust API. Python renders that catalog and forwards browser changes;
@@ -16,26 +16,25 @@ Only administrators can read or change the catalog. The Rust API is not exposed
 by Caddy, so browser code always reaches it through Python's authenticated,
 same-origin BFF boundary.
 
-## Sections and restored behavior
+## Sections and behavior
 
-The catalog defines seven logical sections. **Advanced legacy** is omitted when
-there are no preserved legacy rows to show.
+The catalog defines six logical sections.
 
 | Section | Active settings |
 | --- | --- |
 | Site & interface | `ctf_name`, `ctf_description`, `player_frontend` |
 | Visibility & access | `challenge_visibility`, `score_visibility`, `account_visibility` |
 | Schedule | `start`, `end`, `freeze`, `paused`, `view_after_ctf` |
-| Accounts & registration | `user_mode`, `num_users`, `password_min_length`, `name_changes`, `verify_emails`, `team_creation`, `team_size`, `num_teams`, `team_disbanding`, `registration_visibility`, `registration_access_mode`, `registration_code`, `domain_whitelist`, `domain_blacklist` |
+| Accounts & registration | `num_users`, `password_min_length`, `name_changes`, `verify_emails`, `user_mode`, `team_creation`, `team_size`, `num_teams`, `team_disbanding`, `registration_visibility`, `registration_access_mode`, `registration_code`, `domain_whitelist`, `domain_blacklist` |
 | Challenges & scoring | `incorrect_submissions_per_min`, `max_attempts_behavior`, `max_attempts_timeout`, `challenge_ratings`, `hints_free_public_access`, `view_self_submissions` |
 | Email delivery | `mail_provider`, `mail_server`, `mail_port`, `mail_username`, `mail_password`, `mail_ssl`, `mail_tls`, `mailfrom_addr`, `user_creation_email_subject`, `mailgun_base_url`, `mailgun_api_key` |
-| Advanced legacy | Stored keys that are not in the active catalog; these are preserved but normally have no effect |
 
 The combined account section has four API-owned presentation groups, in order:
-**Account type**, **Participant accounts**, **Team accounts**, and
-**Registration access**. The mode selector is first, team-only controls depend
-on team mode, and admission controls remain last so the relational email
-allowlist can follow the settings form directly.
+**Participant accounts**, **Account type**, **Team accounts**, and
+**Registration access**. Policies shared by every participant are shown first;
+the account-type selector then controls the team-only group. Admission controls
+remain last so the relational email allowlist can follow the settings form
+directly.
 
 The API supplies field types, select options, dependencies, presentation-group
 metadata, help text, warnings, and read-only state. It normalizes booleans,
@@ -48,12 +47,93 @@ proposed configuration. Important cross-field checks include:
 - access-code registration requires a configured code;
 - explicitly selected SMTP or Mailgun providers require their corresponding
   connection settings;
-- competition mode cannot change after non-admin participants, teams, or
-  scoring activity exist.
+- ordinary configuration mutations cannot change competition mode. The
+  dedicated transition described below previews and confirms every destructive
+  consequence before changing it.
 
 The browser sends only fields changed in one section. Rust applies that patch in
 one database transaction, so either every field in the save succeeds or none of
 them do.
+
+## Competition mode transition
+
+Changing between individual-user and team scoring is a destructive account-mode
+transition, not an ordinary configuration edit. The administration panel first
+requests a short-lived, signed preview containing the source and target modes,
+the initiating administrator, exact affected-record counts, blockers, and the
+required confirmation phrase. Confirmation is rejected when that preview has
+expired or the database has changed, so the administrator must review fresh
+counts rather than approving a stale estimate.
+
+Both directions delete submissions and solves, awards, purchased unlocks, and
+challenge-open tracking, then restore dynamic challenge values to their
+configured initial values. Participant identities, passwords, profiles,
+verification state, ratings, challenge definitions and assets, registration
+policies, email invitations, and audit history remain. Participant browser
+sessions and API tokens are revoked and participant credentials are rotated so
+clients cannot continue silently under a different scoring principal.
+Participant-owned competition objects (`submission`, `patch`, `program`,
+`pcap`, and `result`) are made unavailable and queued for revision-fenced
+storage cleanup in both directions. Their metadata and lifecycle events remain
+as audit history. The preview counts all matching retained object records,
+including records already deleting or deleted; only objects still in a live
+lifecycle state are newly queued. Export objects and challenge, page, and
+solution assets are preserved.
+
+Both transitions remove every existing or stale membership, team,
+team-targeted notification, team profile entry, and team comment. Switching to
+team mode therefore preserves every participant as an unassigned user; each
+must subsequently create or join a new team. Existing object-lifecycle triggers
+immediately make team-owned objects unavailable and enqueue revision-fenced
+storage cleanup while retaining their metadata and event history.
+
+Challenges configured with team-specific logic are not rewritten automatically
+when switching to individual mode; the preview reports them for administrator
+review.
+
+Any active private challenge instance blocks either account-mode transition.
+Terminate active instances first so runtime ownership, credentials, and team
+references cannot change underneath a live remote workload.
+
+The confirmation endpoint performs the reset, mode update, and durable
+transition audit record in one PostgreSQL transaction under the exclusive
+configuration fence. Mode-sensitive writers take the shared side of that fence,
+preventing a request begun under the old mode from committing after the reset.
+The UI requires the API-provided phrase (for example `SWITCH TO TEAMS`) and
+requires a coordinated PostgreSQL and object-storage backup before continuing.
+
+Registration-access changes are deliberately different: switching among open,
+domain-rule, access-code, and email-allowlist admission affects future
+registrations only. It never deletes accounts, invitations, stored codes, or
+domain rules.
+
+Fresh databases create the transition audit and browser-SSH control-plane schema
+through the ordered files in `db/init`.
+PostgreSQL runs those files only when it creates an empty data directory;
+restarting or rebuilding containers does **not** rerun them for an existing
+volume.
+
+CTFZone 1.0.0 is a fresh-install contract. Pre-release prototype databases are
+not supported and there is no incremental migration directory. During
+development, recreate the PostgreSQL volume when the schema changes; never do
+that to a database whose contents must be retained. Production upgrade scripts
+will begin with the first post-1.0 schema change.
+
+After the SSH gateway has generated console identities, include its
+`ssh_gateway_identities` volume with PostgreSQL and object storage in the same
+coordinated encrypted backup set.
+
+Transition requests use bounded API phases: authentication is capped at 4
+seconds, the complete preview or destructive pre-commit phase at 45 seconds,
+PostgreSQL COMMIT at 8 seconds, and post-handler activity recording at 2
+seconds. The BFF therefore uses a 65-second HTTPX read-phase budget, while the
+Gunicorn timeout setting defaults to 75 seconds as an additional deployment
+safety margin. HTTP transport phases and Gunicorn worker-heartbeat semantics
+mean those two values are not strict end-to-end wall-clock deadlines. Backend
+startup nevertheless rejects overrides that leave less than five seconds of
+configured headroom between the API bound, BFF budget, and worker setting; keep
+`BACKEND_TRANSITION_API_TIMEOUT_SECONDS` and
+`BACKEND_WORKER_TIMEOUT_SECONDS` aligned when customizing them.
 
 ## Defaults and database overrides
 
@@ -85,20 +165,15 @@ value ready if timeout mode is selected); ratings are public; guest free hints
 and participant submission history are disabled. Email defaults to `auto` on
 SMTP port 587, with no provider credentials or sender configured.
 
-For compatibility with older rows, an absent `registration_access_mode` is
-inferred as `access_code` when a registration code exists, or `domain_rules`
-when domain rules exist. Otherwise it is `open`. Saving the selector records the
-mode explicitly.
-
-`private_challenges` is intentionally not a general configuration row. It is a
-revisioned controller setting managed under **Administration -> Managed
-instances**, because changing it must notify and drain managed runtimes.
+Fresh setup stores `registration_access_mode` explicitly. If it is absent or
+invalid, reads fail closed to `open`; access codes and domain rules do not
+silently change the selected policy.
 
 ## Secret settings
 
 The API never returns secret values. It reports only whether a secret is
 configured. This applies to `registration_code`, `mail_password`, and
-`mailgun_api_key`, and defensively to legacy keys ending in `_password`,
+`mailgun_api_key`, and defensively to keys ending in `_password`,
 `_secret`, `_token`, or `_api_key` (case-insensitive).
 
 Secret updates have three explicit meanings:
@@ -136,6 +211,12 @@ open:
 - `domain_rules`: apply the comma-separated allow and deny domain rules;
 - `access_code`: require the configured secret code;
 - `email_allowlist`: require an exact, case-insensitive email entry.
+
+Changing this policy affects future registration attempts only. Existing
+accounts are not modified, and inactive access codes, domain rules, and email
+invitations remain stored for later reuse. In email-allowlist mode, only exact
+invited addresses may register and those invitations deliberately bypass the
+general participant limit.
 
 Domain rules are normalized to lowercase. A rule must be either an exact DNS
 domain (`example.org`) or a wildcard subdomain suffix (`*.example.org`); a bare
@@ -185,8 +266,8 @@ changing the team's password invalidates outstanding codes.
 - `smtp` requires `mail_server` and uses the SMTP port, optional credentials,
   and at most one of implicit TLS or STARTTLS;
 - `mailgun` requires both `mailgun_base_url` and `mailgun_api_key`;
-- `auto` preserves legacy behavior by preferring a complete Mailgun
-  configuration, then a configured SMTP server.
+- `auto` prefers a complete Mailgun configuration, then a configured SMTP
+  server.
 
 `mailfrom_addr` is required when a message is sent. The current implementation
 sends administrator-authored messages to users; the configurable subject may
@@ -197,17 +278,11 @@ are then denied challenge access until they follow the delivered single-use link
 Automatic registration delivery and password-reset messages are not
 implemented yet.
 
-## Preserved and deferred legacy settings
+## Deferred settings
 
-An unknown row is shown under **Advanced legacy** so older database values are
-not silently lost. It remains editable for recovery or forward compatibility,
-but CTFZone does not interpret it unless it is listed in the active-settings
-table above. The one exception called out separately is `social_shares`: an
-existing value is preserved and displayed read-only because player share pages
-do not exist yet.
-
-The following older CTFd capabilities are intentionally not active
-configuration in 1.0.0:
+Only settings in the typed catalog are accepted. Unknown keys are rejected
+rather than stored as inert compatibility data. The following capabilities are
+intentionally not active configuration in 1.0.0:
 
 - database-selected themes, logo/favicon uploads, color controls, and raw
   header/footer/theme injection; CTFZone uses reviewed, manifest-backed player
@@ -224,7 +299,7 @@ configuration in 1.0.0:
   password;
 - a switch that permits unsafe HTML. Rendered participant content remains
   sanitized by design;
-- legacy reset, archive import/export, and arbitrary table CSV controls as
+- reset, archive import/export, and arbitrary table CSV controls as
   configuration-page operations.
 
 `verify_emails` is editable. Enabling it is rejected unless the sender and
@@ -234,5 +309,5 @@ current email address; PostgreSQL stores only their SHA-256 hashes. Sending a
 replacement or changing the address invalidates outstanding links.
 
 Potential implementations for these deferred areas are tracked in
-[Possible improvements](POSSIBLE_IMPROVEMENTS.md). Until a capability has Rust
-domain behavior and tests, adding its old key to PostgreSQL does not enable it.
+[Possible improvements](POSSIBLE_IMPROVEMENTS.md). A capability must gain Rust
+domain behavior and tests before it becomes a configuration key.

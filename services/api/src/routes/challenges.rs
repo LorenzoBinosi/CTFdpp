@@ -6,7 +6,7 @@ use std::{
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::{Duration, NaiveDateTime, Utc};
@@ -55,6 +55,10 @@ struct ChallengeListRow {
     name: Option<String>,
     value: Option<i32>,
     category: Option<String>,
+    category_id: i32,
+    challenge_kind: String,
+    exposure: String,
+    connection_info: Option<String>,
     challenge_type: Option<String>,
     position: i32,
     requirements: Option<Value>,
@@ -86,6 +90,9 @@ struct ChallengeDetailRow {
     max_attempts: Option<i32>,
     value: Option<i32>,
     category: Option<String>,
+    category_id: i32,
+    challenge_kind: String,
+    exposure: String,
     #[serde(rename = "type")]
     challenge_type: Option<String>,
     state: String,
@@ -130,8 +137,7 @@ struct HintRenderRow {
 }
 
 #[derive(Deserialize, FromRow)]
-struct FileRenderRow {
-    id: i32,
+struct ObjectRenderRow {
     object_id: Uuid,
     name: String,
     content_type: String,
@@ -140,8 +146,7 @@ struct FileRenderRow {
 }
 
 #[derive(Serialize)]
-struct ChallengeFileView {
-    id: i32,
+struct ChallengeObjectView {
     object_id: Uuid,
     name: String,
     content_type: String,
@@ -149,13 +154,7 @@ struct ChallengeFileView {
     sha256: Option<String>,
 }
 
-#[derive(FromRow)]
-struct FlagRow {
-    id: i32,
-    flag_type: Option<String>,
-    content: Option<String>,
-    data: Option<String>,
-}
+type FlagRow = super::flag_policy::StoredFlag;
 
 #[derive(Clone, Copy)]
 enum Account {
@@ -175,6 +174,25 @@ enum FlagResult {
     Correct,
     Partial,
     Incorrect(String),
+}
+
+#[derive(Clone, Copy)]
+struct SharedFlagEvidence {
+    flag_id: i32,
+    source_user_id: i32,
+    accepted: bool,
+    match_tag: [u8; 32],
+}
+
+struct ComparisonResult {
+    outcome: FlagResult,
+    shared: Option<SharedFlagEvidence>,
+}
+
+struct SubmissionComparisonContext<'a> {
+    user_id: i32,
+    team_mode: bool,
+    secret_key: &'a str,
 }
 
 pub(super) async fn list(
@@ -207,7 +225,9 @@ pub(super) async fn list_data(
 
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
-        SELECT c.id, c.name, c.value, c.category, c.type AS challenge_type,
+        SELECT c.id, c.name, c.value, c.category, c.category_id,
+               c.challenge_type AS challenge_kind,c.exposure,c.connection_info,
+               c.type AS challenge_type,
                c.position, c.requirements,
                COALESCE(runtime_setting.enabled, false)
                    AND COALESCE(runtime_config.enabled, false)
@@ -306,6 +326,10 @@ pub(super) async fn list_data(
             "solves": if scores_visible { solve_counts.get(&row.id).copied().unwrap_or(0).into() } else { Value::Null },
             "solved_by_me": solved.contains(&row.id),
             "category": row.category,
+            "category_id": row.category_id,
+            "challenge_type": row.challenge_kind,
+            "exposure": row.exposure,
+            "connection_info": row.connection_info,
             "tags": tags,
             "runtime_available": row.runtime_available,
         }));
@@ -334,15 +358,35 @@ async fn challenge_access_context_on(
 
     let admin = user.is_some_and(CurrentUser::is_admin);
     let team_mode = is_team_mode_on(connection).await?;
+    let current_team_id = if team_mode {
+        if let Some(current) = user {
+            sqlx::query_scalar::<_, Option<i32>>("SELECT team_id FROM ctfzone.users WHERE id=$1")
+                .bind(current.id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(ApiError::database)?
+                .flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if team_membership_missing(
         team_mode,
-        user.map(|current| (current.is_admin(), current.team_id)),
+        user.map(|current| (current.is_admin(), current_team_id)),
     ) {
         return Err(ApiError::forbidden("Join a team before viewing challenges"));
     }
 
     let challenge = challenge_detail_by_id_on(connection, challenge_id).await?;
-    let solved = solved_challenge_ids_on(connection, user, team_mode).await?;
+    let solved = solved_challenge_ids_for_identity_on(
+        connection,
+        user.map(|current| current.id),
+        current_team_id,
+        team_mode,
+    )
+    .await?;
     let prerequisite_preview = match challenge_row_access(&challenge, admin, &solved) {
         ChallengeRowAccess::Full => None,
         ChallengeRowAccess::HiddenPreview(preview) => Some(preview),
@@ -438,6 +482,7 @@ fn ctf_time_access(now: i64, start: i64, end: i64, view_after_ctf: bool) -> CtfT
 pub(super) async fn create(
     State(state): State<AppState>,
     user: CurrentUser,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
@@ -445,7 +490,69 @@ pub(super) async fn create(
         .as_object()
         .ok_or_else(|| ApiError::bad_request("Challenge data must be an object"))?;
     let name = required_string(object, "name", 80)?;
-    let category = required_string(object, "category", 80)?;
+    let category_id = optional_i32(object, "category_id")?
+        .ok_or_else(|| ApiError::bad_request("Challenge category_id is required"))?;
+    let challenge_kind = required_string(object, "challenge_type", 32)?;
+    if challenge_kind != "jeopardy" {
+        return Err(ApiError::bad_request(
+            "Only Jeopardy challenges are available in version 1.0",
+        ));
+    }
+    let exposure = required_string(object, "exposure", 16)?;
+    if !matches!(exposure.as_str(), "public" | "private") {
+        return Err(ApiError::bad_request(
+            "Challenge exposure must be public or private",
+        ));
+    }
+    if object.contains_key("public_url") {
+        return Err(ApiError::bad_request(
+            "Challenge public_url is not supported; use optional connection_info",
+        ));
+    }
+    let description = optional_text(object, "description", 65_536)?;
+    let attribution = optional_text(object, "attribution", 2_048)?;
+    let connection_info = optional_text(object, "connection_info", 4_096)?;
+    let initial_flag = serde_json::from_value::<super::flag_policy::InitialFlagInput>(
+        object
+            .get("flag")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("An initial flag is required"))?,
+    )
+    .map_err(|_| ApiError::bad_request("Initial flag data is invalid"))?;
+    let (initial_flag_type, flag_content, flag_data) = super::flag_policy::normalize_definition(
+        &initial_flag.flag_type,
+        &initial_flag.content,
+        initial_flag.data,
+        &exposure,
+    )?;
+    let runtime = object
+        .get("runtime")
+        .cloned()
+        .filter(|value| !value.is_null());
+    let runtime = match (exposure.as_str(), runtime) {
+        ("private", Some(value)) => {
+            let runtime = serde_json::from_value::<super::runtimes::RuntimeConfigInput>(value)
+                .map_err(|_| ApiError::bad_request("Private runtime data is invalid"))?;
+            if runtime.runtime_mode != "managed" {
+                return Err(ApiError::bad_request(
+                    "Private challenges require a managed runtime",
+                ));
+            }
+            Some(runtime)
+        }
+        ("private", None) => {
+            return Err(ApiError::bad_request(
+                "Private challenges require runtime configuration",
+            ));
+        }
+        ("public", Some(_)) => {
+            return Err(ApiError::bad_request(
+                "Public challenges cannot define managed runtime configuration",
+            ));
+        }
+        ("public", None) => None,
+        _ => unreachable!(),
+    };
     let challenge_type = optional_string(object, "type").unwrap_or_else(|| "standard".to_owned());
     if challenge_type != "standard" && challenge_type != "dynamic" {
         return Err(ApiError::bad_request("Unsupported challenge type"));
@@ -458,35 +565,58 @@ pub(super) async fn create(
             "static".to_owned()
         }
     });
-    if !matches!(function.as_str(), "static" | "linear" | "logarithmic") {
+    let dynamic = challenge_type == "dynamic";
+    if (!dynamic && function != "static")
+        || (dynamic && !matches!(function.as_str(), "linear" | "logarithmic"))
+    {
         return Err(ApiError::bad_request(
-            "Unsupported challenge decay function",
+            "Scoring type and decay function do not match",
         ));
     }
-    let dynamic = function != "static";
-    let initial = if dynamic {
-        optional_i32(object, "initial")?.or(optional_i32(object, "value")?)
-    } else {
-        None
-    };
+    let supplied_value = optional_i32(object, "value")?;
+    let supplied_initial = optional_i32(object, "initial")?;
     let minimum = optional_i32(object, "minimum")?;
     let decay = optional_i32(object, "decay")?;
+    if !dynamic && (supplied_initial.is_some() || minimum.is_some() || decay.is_some()) {
+        return Err(ApiError::bad_request(
+            "Standard scoring cannot define dynamic scoring fields",
+        ));
+    }
+    if dynamic
+        && supplied_initial
+            .zip(supplied_value)
+            .is_some_and(|(initial, value)| initial != value)
+    {
+        return Err(ApiError::bad_request(
+            "Dynamic value must match the initial score",
+        ));
+    }
+    let initial = dynamic
+        .then(|| supplied_initial.or(supplied_value))
+        .flatten();
     if dynamic && (initial.is_none() || minimum.is_none() || decay.is_none()) {
         return Err(ApiError::bad_request(
             "Dynamic challenges require initial, minimum, and decay",
         ));
     }
-    if dynamic && decay == Some(0) {
+    if dynamic
+        && (initial.is_some_and(|value| value < 0)
+            || minimum.is_some_and(|value| value < 0)
+            || initial
+                .zip(minimum)
+                .is_some_and(|(initial, minimum)| minimum > initial)
+            || decay.is_some_and(|value| value <= 0))
+    {
         return Err(ApiError::bad_request(
-            "Challenge decay must be greater than zero",
+            "Dynamic scoring requires initial >= minimum >= 0 and decay > 0",
         ));
     }
-    let value = if dynamic {
-        initial
-    } else {
-        optional_i32(object, "value")?
+    let value = if dynamic { initial } else { supplied_value }
+        .ok_or_else(|| ApiError::bad_request("Challenge value is required"))?;
+    if value < 0 {
+        return Err(ApiError::bad_request("Challenge value cannot be negative"));
     }
-    .ok_or_else(|| ApiError::bad_request("Challenge value is required"))?;
+    let max_attempts = validate_max_attempts(optional_i32(object, "max_attempts")?.unwrap_or(0))?;
     let position = optional_i32(object, "position")?.unwrap_or(0);
     if !(0..=32767).contains(&position) {
         return Err(ApiError::bad_request("Challenge position is invalid"));
@@ -503,26 +633,75 @@ pub(super) async fn create(
     validate_requirements(requirements.as_ref())?;
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let (idempotency, replay) = super::create_idempotency::CreateRequest::lock_and_replay(
+        &mut transaction,
+        &headers,
+        user.id,
+        super::create_idempotency::CHALLENGE_CREATE,
+        &payload,
+    )
+    .await?;
+    if let Some(response_data) = replay {
+        transaction.commit().await.map_err(ApiError::database)?;
+        return Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response());
+    }
+    let category = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
+    )
+    .bind(category_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::bad_request("Select an existing challenge category"))?;
+    if let Some(runtime) = runtime.as_ref() {
+        if state_value != "hidden" && !runtime.enabled {
+            return Err(ApiError::conflict(
+                "Visible private challenges require an enabled managed runtime",
+            ));
+        }
+        let gate_enabled = super::runtimes::prepare_private_challenge_gate(
+            &mut transaction,
+            user.id,
+            runtime.enable_global_gate,
+        )
+        .await?;
+        if !gate_enabled && state_value != "hidden" {
+            return Err(ApiError::conflict(
+                "Enable private challenge launches globally or save this challenge as hidden",
+            ));
+        }
+    }
     let id = sqlx::query_scalar::<_, i32>(
         r#"
         INSERT INTO ctfzone.challenges (
             name, description, attribution, connection_info, next_id,
-            max_attempts, value, category, type, state, logic, initial,
-            minimum, decay, position, function, requirements
+            max_attempts, value, category, category_id, challenge_type, exposure,
+            type, state, logic, initial, minimum, decay, position,
+            function, requirements
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-            $13, $14, $15, $16, $17
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17, $18, $19, $20
         ) RETURNING id
         "#,
     )
     .bind(&name)
-    .bind(optional_string(object, "description"))
-    .bind(optional_string(object, "attribution"))
-    .bind(optional_string(object, "connection_info"))
+    .bind(&description)
+    .bind(&attribution)
+    .bind(&connection_info)
     .bind(optional_i32(object, "next_id")?)
-    .bind(optional_i32(object, "max_attempts")?.unwrap_or(0))
+    .bind(max_attempts)
     .bind(value)
     .bind(&category)
+    .bind(category_id)
+    .bind(&challenge_kind)
+    .bind(&exposure)
     .bind(&challenge_type)
     .bind(&state_value)
     .bind(&logic)
@@ -535,6 +714,17 @@ pub(super) async fn create(
     .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    sqlx::query("INSERT INTO ctfzone.flags (challenge_id,type,content,data) VALUES ($1,$2,$3,$4)")
+        .bind(id)
+        .bind(&initial_flag_type)
+        .bind(flag_content)
+        .bind(flag_data)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    if let Some(runtime) = runtime {
+        super::runtimes::upsert_runtime_config(&mut transaction, id, user.id, runtime).await?;
+    }
     if challenge_type == "dynamic" {
         sqlx::query(
             r#"
@@ -552,19 +742,20 @@ pub(super) async fn create(
         .await
         .map_err(ApiError::database)?;
     }
-    transaction.commit().await.map_err(ApiError::database)?;
-
-    Ok(Json(Success::new(json!({
+    let response_data = json!({
         "id": id,
         "name": name,
         "value": value,
-        "description": optional_string(object, "description"),
-        "attribution": optional_string(object, "attribution"),
-        "connection_info": optional_string(object, "connection_info"),
+        "description": description,
+        "attribution": attribution,
+        "connection_info": connection_info,
         "next_id": optional_i32(object, "next_id")?,
         "category": category,
+        "category_id": category_id,
+        "challenge_type": challenge_kind,
+        "exposure": exposure,
         "state": state_value,
-        "max_attempts": optional_i32(object, "max_attempts")?.unwrap_or(0),
+        "max_attempts": max_attempts,
         "position": position,
         "logic": logic,
         "initial": initial,
@@ -572,8 +763,13 @@ pub(super) async fn create(
         "minimum": minimum,
         "function": function,
         "type": challenge_type,
-    })))
-    .into_response())
+    });
+    idempotency
+        .complete(&mut transaction, id, &response_data)
+        .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+
+    Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response())
 }
 
 pub(super) async fn detail(
@@ -667,15 +863,15 @@ pub(super) async fn detail_data(
           ),'[]'::jsonb),
           COALESCE((
             SELECT jsonb_agg(jsonb_build_object(
-              'id',files.id,'object_id',stored_objects.id,
+              'object_id',stored_objects.id,
               'name',stored_objects.original_filename,
               'content_type',stored_objects.content_type,
               'size',COALESCE(stored_objects.actual_size,stored_objects.expected_size),
               'sha256',stored_objects.actual_checksum
-            ) ORDER BY files.id)
-            FROM ctfzone.files
-            JOIN ctfzone.stored_objects ON stored_objects.id=files.object_id
-            WHERE files.type='challenge' AND files.challenge_id=$1
+            ) ORDER BY stored_objects.created_at,stored_objects.id)
+            FROM ctfzone.stored_objects
+            WHERE stored_objects.purpose='challenge_asset'
+              AND stored_objects.challenge_id=$1
               AND stored_objects.status='ready'
           ),'[]'::jsonb),
           COALESCE((
@@ -697,11 +893,11 @@ pub(super) async fn detail_data(
             hint.content = None;
         }
     }
-    let file_rows = serde_json::from_value::<Vec<FileRenderRow>>(files_value)
+    let object_rows = serde_json::from_value::<Vec<ObjectRenderRow>>(files_value)
         .map_err(|_| ApiError::upstream("Challenge files are invalid"))?;
-    let files = file_rows
+    let files = object_rows
         .into_iter()
-        .map(challenge_file_view)
+        .map(challenge_object_view)
         .collect::<Vec<_>>();
     let tags = serde_json::from_value::<Vec<String>>(tags_value)
         .map_err(|_| ApiError::upstream("Challenge tags are invalid"))?;
@@ -764,7 +960,6 @@ pub(super) async fn detail_data(
         challenge.id,
     )
     .await?;
-
     let mut response = challenge_read_json(&challenge);
     response["solves"] = if scores_visible {
         json!(solve_count)
@@ -785,6 +980,17 @@ pub(super) async fn detail_data(
     response["runtime"] = runtime;
 
     if let Some(current) = user.as_ref().filter(|current| !current.is_admin()) {
+        let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+        super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+        crate::auth::revalidate_current_credential(
+            &mut transaction,
+            current,
+            state.auth.session_lifetime_seconds,
+        )
+        .await?;
+        // Re-read the mode while holding CONFIG-S. Tracking is reset by a mode
+        // transition, so this insert must be ordered before or after that reset.
+        let _ = super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
         sqlx::query(
             r#"
             INSERT INTO ctfzone.tracking (type,ip,target,user_id,date)
@@ -795,9 +1001,10 @@ pub(super) async fn detail_data(
         .bind(current.request_ip())
         .bind(challenge.id)
         .bind(current.id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
+        transaction.commit().await.map_err(ApiError::database)?;
     }
 
     Ok(response)
@@ -813,16 +1020,126 @@ pub(super) async fn update(
     let object = payload
         .as_object()
         .ok_or_else(|| ApiError::bad_request("Challenge data must be an object"))?;
-    let current = challenge_detail_by_id(&state, challenge_id).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::flag_policy::lock_challenge_definition(&mut transaction, challenge_id).await?;
+    let current = challenge_detail_by_id_for_update(&mut transaction, challenge_id).await?;
     let dynamic_type = current.challenge_type.as_deref() == Some("dynamic");
+    if object.contains_key("type")
+        && required_string(object, "type", 80)?
+            != current
+                .challenge_type
+                .clone()
+                .unwrap_or_else(|| "standard".to_owned())
+    {
+        return Err(ApiError::bad_request(
+            "Challenge scoring type cannot be changed after creation",
+        ));
+    }
 
     let name = patch_required_string(object, "name", current.name, 80)?;
-    let category = patch_required_string(object, "category", current.category, 80)?;
-    let description = patch_string(object, "description", current.description);
-    let attribution = patch_string(object, "attribution", current.attribution);
-    let connection_info = patch_string(object, "connection_info", current.connection_info);
+    if object.contains_key("category") {
+        return Err(ApiError::bad_request(
+            "Select challenge categories by category_id",
+        ));
+    }
+    let category_id = if object.contains_key("category_id") {
+        optional_i32(object, "category_id")?
+            .ok_or_else(|| ApiError::bad_request("Challenge category_id is required"))?
+    } else {
+        current.category_id
+    };
+    let category = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
+    )
+    .bind(category_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::bad_request("Select an existing challenge category"))?;
+    if object.contains_key("challenge_type")
+        && required_string(object, "challenge_type", 32)? != current.challenge_kind
+    {
+        return Err(ApiError::bad_request(
+            "Challenge type cannot be changed after creation",
+        ));
+    }
+    let exposure = if object.contains_key("exposure") {
+        required_string(object, "exposure", 16)?
+    } else {
+        current.exposure.clone()
+    };
+    if !matches!(exposure.as_str(), "public" | "private") {
+        return Err(ApiError::bad_request(
+            "Challenge exposure must be public or private",
+        ));
+    }
+    let enable_global_gate =
+        private_gate_enable_requested(object, current.challenge_kind.as_str(), exposure.as_str())?;
+    if exposure != current.exposure {
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ctfzone.runtime_instances WHERE challenge_id=$1 AND active)",
+        )
+        .bind(challenge_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if active {
+            return Err(ApiError::conflict(
+                "Stop the active challenge instances before changing exposure",
+            ));
+        }
+        if exposure == "private" {
+            let managed = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM ctfzone.challenge_runtime_configs WHERE challenge_id=$1 AND runtime_mode='managed')",
+            )
+            .bind(challenge_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+            if !managed {
+                return Err(ApiError::conflict(
+                    "Configure a managed runtime before making the challenge private",
+                ));
+            }
+        } else {
+            let generated = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM ctfzone.flags WHERE challenge_id=$1 AND type='generated')",
+            )
+            .bind(challenge_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+            if generated {
+                return Err(ApiError::conflict(
+                    "Replace the generated flag before making the challenge public",
+                ));
+            }
+            sqlx::query("DELETE FROM ctfzone.challenge_runtime_configs WHERE challenge_id=$1")
+                .bind(challenge_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        }
+    }
+    if object.contains_key("public_url") {
+        return Err(ApiError::bad_request(
+            "Challenge public_url is not supported; use optional connection_info",
+        ));
+    }
+    let description = patch_text(object, "description", current.description, 65_536)?;
+    let attribution = patch_text(object, "attribution", current.attribution, 2_048)?;
+    let connection_info = patch_text(object, "connection_info", current.connection_info, 4_096)?;
     let next_id = patch_i32(object, "next_id", current.next_id)?;
-    let max_attempts = patch_i32(object, "max_attempts", current.max_attempts)?.unwrap_or(0);
+    let max_attempts = validate_max_attempts(
+        patch_i32(object, "max_attempts", current.max_attempts)?.unwrap_or(0),
+    )?;
     let position = patch_i32(object, "position", Some(current.position))?.unwrap_or(0);
     if !(0..=32767).contains(&position) {
         return Err(ApiError::bad_request("Challenge position is invalid"));
@@ -831,46 +1148,104 @@ pub(super) async fn update(
     if !matches!(state_value.as_str(), "visible" | "hidden" | "locked") {
         return Err(ApiError::bad_request("Unsupported challenge state"));
     }
+    if enable_global_gate {
+        super::runtimes::prepare_private_challenge_gate(&mut transaction, user.id, true).await?;
+    }
+    if exposure == "private" && state_value != "hidden" {
+        let launchable = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM ctfzone.runtime_settings setting
+                JOIN ctfzone.challenge_runtime_configs runtime ON runtime.challenge_id=$1
+                WHERE setting.key='private_challenges' AND setting.enabled
+                  AND runtime.enabled AND runtime.runtime_mode='managed'
+            )
+            "#,
+        )
+        .bind(challenge_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if !launchable {
+            return Err(ApiError::conflict(
+                "Enable the private runtime and global launch gate before publishing",
+            ));
+        }
+    }
     let logic = patch_required_string(object, "logic", Some(current.logic), 80)?;
     if !matches!(logic.as_str(), "any" | "all" | "team") {
         return Err(ApiError::bad_request("Unsupported challenge logic"));
     }
     let function = patch_required_string(object, "function", current.function, 32)?;
-    if !matches!(function.as_str(), "static" | "linear" | "logarithmic") {
+    if (!dynamic_type && function != "static")
+        || (dynamic_type && !matches!(function.as_str(), "linear" | "logarithmic"))
+    {
         return Err(ApiError::bad_request(
-            "Unsupported challenge decay function",
+            "Scoring type and decay function do not match",
         ));
     }
-    let dynamic = function != "static";
-    let initial = if dynamic {
-        patch_i32(object, "initial", current.initial)?
-    } else {
-        None
-    };
-    let minimum = if dynamic {
-        patch_i32(object, "minimum", current.minimum)?
-    } else {
-        None
-    };
-    let decay = if dynamic {
-        patch_i32(object, "decay", current.decay)?
-    } else {
-        None
-    };
+    let dynamic = dynamic_type;
+    if !dynamic
+        && ["initial", "minimum", "decay"]
+            .iter()
+            .any(|field| object.contains_key(*field))
+    {
+        return Err(ApiError::bad_request(
+            "Standard scoring cannot define dynamic scoring fields",
+        ));
+    }
+    let initial = dynamic
+        .then(|| patch_i32(object, "initial", current.initial))
+        .transpose()?
+        .flatten();
+    let minimum = dynamic
+        .then(|| patch_i32(object, "minimum", current.minimum))
+        .transpose()?
+        .flatten();
+    let decay = dynamic
+        .then(|| patch_i32(object, "decay", current.decay))
+        .transpose()?
+        .flatten();
     if dynamic && (initial.is_none() || minimum.is_none() || decay.is_none()) {
         return Err(ApiError::bad_request(
             "Dynamic challenges require initial, minimum, and decay",
         ));
     }
-    if dynamic && decay == Some(0) {
+    if dynamic
+        && (initial.is_some_and(|value| value < 0)
+            || minimum.is_some_and(|value| value < 0)
+            || initial
+                .zip(minimum)
+                .is_some_and(|(initial, minimum)| minimum > initial)
+            || decay.is_some_and(|value| value <= 0))
+    {
         return Err(ApiError::bad_request(
-            "Challenge decay must be greater than zero",
+            "Dynamic scoring requires initial >= minimum >= 0 and decay > 0",
         ));
     }
-    let mut value = patch_i32(object, "value", current.value)?
-        .ok_or_else(|| ApiError::bad_request("Challenge value is required"))?;
-    if dynamic {
-        value = initial.expect("validated above");
+    let supplied_value = object
+        .contains_key("value")
+        .then(|| patch_i32(object, "value", current.value))
+        .transpose()?
+        .flatten();
+    if dynamic
+        && supplied_value
+            .zip(initial)
+            .is_some_and(|(value, initial)| value != initial)
+    {
+        return Err(ApiError::bad_request(
+            "Dynamic value must match the initial score",
+        ));
+    }
+    let value = if dynamic {
+        initial.expect("validated above")
+    } else {
+        patch_i32(object, "value", current.value)?
+            .ok_or_else(|| ApiError::bad_request("Challenge value is required"))?
+    };
+    if value < 0 {
+        return Err(ApiError::bad_request("Challenge value cannot be negative"));
     }
     let requirements = if object.contains_key("requirements") {
         object
@@ -882,19 +1257,18 @@ pub(super) async fn update(
     };
     validate_requirements(requirements.as_ref())?;
     let team_mode = if dynamic {
-        Some(is_team_mode(&state).await?)
+        Some(super::user_mode_transition::transaction_user_mode(&mut transaction).await? == "teams")
     } else {
         None
     };
-
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     sqlx::query(
         r#"
         UPDATE ctfzone.challenges SET
             name=$1,description=$2,attribution=$3,connection_info=$4,next_id=$5,
-            max_attempts=$6,value=$7,category=$8,state=$9,logic=$10,initial=$11,
-            minimum=$12,decay=$13,position=$14,function=$15,requirements=$16
-        WHERE id=$17
+            max_attempts=$6,value=$7,category=$8,category_id=$9,state=$10,logic=$11,
+            exposure=$12,initial=$13,minimum=$14,decay=$15,
+            position=$16,function=$17,requirements=$18
+        WHERE id=$19
         "#,
     )
     .bind(name)
@@ -905,8 +1279,10 @@ pub(super) async fn update(
     .bind(max_attempts)
     .bind(value)
     .bind(category)
+    .bind(category_id)
     .bind(state_value)
     .bind(logic)
+    .bind(exposure)
     .bind(initial)
     .bind(minimum)
     .bind(decay)
@@ -959,14 +1335,61 @@ pub(super) async fn delete_challenge(
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::flag_policy::lock_challenge_definition(&mut transaction, challenge_id).await?;
+    let exists =
+        sqlx::query_scalar::<_, i32>("SELECT id FROM ctfzone.challenges WHERE id=$1 FOR UPDATE")
+            .bind(challenge_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .is_some();
+    if !exists {
+        return Err(ApiError::not_found("Challenge not found"));
+    }
+    let (active, assignments) = sqlx::query_as::<_, (bool, bool)>(
+        r#"
+        SELECT
+          EXISTS(SELECT 1 FROM ctfzone.runtime_instances WHERE challenge_id=$1 AND active),
+          EXISTS(SELECT 1 FROM ctfzone.user_challenge_flags WHERE challenge_id=$1)
+        "#,
+    )
+    .bind(challenge_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if active {
+        return Err(ApiError::conflict(
+            "Stop the active challenge instances before deleting the challenge",
+        ));
+    }
+    if assignments {
+        return Err(ApiError::conflict(
+            "Challenges with allocated per-user flags cannot be deleted",
+        ));
+    }
     let result = sqlx::query("DELETE FROM ctfzone.challenges WHERE id=$1")
         .bind(challenge_id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("Challenge not found"));
     }
+    super::create_idempotency::forget_resource(
+        &mut transaction,
+        super::create_idempotency::CHALLENGE_CREATE,
+        challenge_id,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(json!({"success": true})).into_response())
 }
 
@@ -1015,18 +1438,11 @@ pub(super) async fn attempt(
         ));
     }
 
-    let team_mode = is_team_mode(&state).await?;
-    if team_mode && user.team_id.is_none() {
-        return Err(ApiError::forbidden("Join a team before submitting flags"));
-    }
-    let account = if team_mode {
-        Account::Team(user.team_id.expect("checked above"))
-    } else {
-        Account::User(user.id)
-    };
     let submission = request.submission.trim();
-    if submission.is_empty() {
-        return Err(ApiError::bad_request("A submission is required"));
+    if submission.is_empty() || submission.len() > 4096 || submission.contains('\0') {
+        return Err(ApiError::bad_request(
+            "A submission between 1 and 4096 bytes is required",
+        ));
     }
     let incorrect_limit = config_i64(&state, "incorrect_submissions_per_min", 10).await?;
     let max_behavior = config_string(&state, "max_attempts_behavior")
@@ -1035,6 +1451,36 @@ pub(super) async fn attempt(
     let max_timeout = config_i64(&state, "max_attempts_timeout", 300).await?;
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let team_mode =
+        super::user_mode_transition::transaction_user_mode(&mut transaction).await? == "teams";
+    let submission_team_id = if team_mode {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+        Some(
+            sqlx::query_scalar::<_, Option<i32>>(
+                "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+            )
+            .bind(user.id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .flatten()
+            .ok_or_else(|| ApiError::forbidden("Join a team before submitting flags"))?,
+        )
+    } else {
+        None
+    };
+    let account = if let Some(team_id) = submission_team_id {
+        Account::Team(team_id)
+    } else {
+        Account::User(user.id)
+    };
     let lock_key = ((i64::from(account.id())) << 32) ^ i64::from(request.challenge_id);
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
@@ -1081,12 +1527,15 @@ pub(super) async fn attempt(
     }
 
     let flags = sqlx::query_as::<_, FlagRow>(
-        "SELECT id, type AS flag_type, content, data FROM ctfzone.flags WHERE challenge_id=$1 ORDER BY id",
+        "SELECT id,type AS flag_type,content,data,revision FROM ctfzone.flags WHERE challenge_id=$1 ORDER BY id",
     )
     .bind(challenge.id)
     .fetch_all(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    if flags.is_empty() {
+        return Err(ApiError::upstream("The challenge has no flag definition"));
+    }
 
     if preview {
         let outcome = compare_submission(
@@ -1095,11 +1544,14 @@ pub(super) async fn attempt(
             &challenge,
             &flags,
             submission,
-            user.id,
-            team_mode,
+            SubmissionComparisonContext {
+                user_id: user.id,
+                team_mode,
+                secret_key: &state.auth.secret_key,
+            },
         )
         .await?;
-        return Ok(flag_result_response(outcome));
+        return Ok(flag_result_response(outcome.outcome));
     }
 
     let now = Utc::now().naive_utc();
@@ -1146,7 +1598,7 @@ pub(super) async fn attempt(
                 insert_submission(
                     &mut transaction,
                     &user,
-                    team_mode,
+                    submission_team_id,
                     challenge.id,
                     submission,
                     "ratelimited",
@@ -1170,7 +1622,7 @@ pub(super) async fn attempt(
         insert_submission(
             &mut transaction,
             &user,
-            team_mode,
+            submission_team_id,
             challenge.id,
             submission,
             "ratelimited",
@@ -1186,7 +1638,39 @@ pub(super) async fn attempt(
         ));
     }
 
+    let comparison = compare_submission(
+        &mut transaction,
+        account,
+        &challenge,
+        &flags,
+        submission,
+        SubmissionComparisonContext {
+            user_id: user.id,
+            team_mode,
+            secret_key: &state.auth.secret_key,
+        },
+    )
+    .await?;
+
     if has_solved(&mut transaction, account, challenge.id).await? {
+        let submission_id = insert_submission(
+            &mut transaction,
+            &user,
+            submission_team_id,
+            challenge.id,
+            submission,
+            "discard",
+        )
+        .await?;
+        record_shared_flag_evidence(
+            &mut transaction,
+            submission_id,
+            challenge.id,
+            user.id,
+            submission_team_id,
+            comparison.shared,
+        )
+        .await?;
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok(attempt_response(
             StatusCode::OK,
@@ -1195,25 +1679,24 @@ pub(super) async fn attempt(
         ));
     }
 
-    let outcome = compare_submission(
-        &mut transaction,
-        account,
-        &challenge,
-        &flags,
-        submission,
-        user.id,
-        team_mode,
-    )
-    .await?;
-    let response = match outcome {
+    let response = match comparison.outcome {
         FlagResult::Correct => {
             let submission_id = insert_submission(
                 &mut transaction,
                 &user,
-                team_mode,
+                submission_team_id,
                 challenge.id,
                 submission,
                 "correct",
+            )
+            .await?;
+            record_shared_flag_evidence(
+                &mut transaction,
+                submission_id,
+                challenge.id,
+                user.id,
+                submission_team_id,
+                comparison.shared,
             )
             .await?;
             sqlx::query(
@@ -1222,7 +1705,7 @@ pub(super) async fn attempt(
             .bind(submission_id)
             .bind(challenge.id)
             .bind(user.id)
-            .bind(if team_mode { user.team_id } else { None })
+            .bind(submission_team_id)
             .execute(&mut *transaction)
             .await
             .map_err(ApiError::database)?;
@@ -1230,13 +1713,22 @@ pub(super) async fn attempt(
             attempt_response(StatusCode::OK, "correct", Some("Correct".to_owned()))
         }
         FlagResult::Partial => {
-            insert_submission(
+            let submission_id = insert_submission(
                 &mut transaction,
                 &user,
-                team_mode,
+                submission_team_id,
                 challenge.id,
                 submission,
                 "partial",
+            )
+            .await?;
+            record_shared_flag_evidence(
+                &mut transaction,
+                submission_id,
+                challenge.id,
+                user.id,
+                submission_team_id,
+                comparison.shared,
             )
             .await?;
             let message = if challenge.logic == "team" && team_mode {
@@ -1247,13 +1739,22 @@ pub(super) async fn attempt(
             attempt_response(StatusCode::OK, "partial", Some(message.to_owned()))
         }
         FlagResult::Incorrect(message) => {
-            insert_submission(
+            let submission_id = insert_submission(
                 &mut transaction,
                 &user,
-                team_mode,
+                submission_team_id,
                 challenge.id,
                 submission,
                 "incorrect",
+            )
+            .await?;
+            record_shared_flag_evidence(
+                &mut transaction,
+                submission_id,
+                challenge.id,
+                user.id,
+                submission_team_id,
+                comparison.shared,
             )
             .await?;
             attempt_response(StatusCode::OK, "incorrect", Some(message))
@@ -1278,7 +1779,8 @@ async fn challenge_detail_by_id_on(
     sqlx::query_as::<_, ChallengeDetailRow>(
         r#"
         SELECT c.id,c.name,c.description,c.attribution,c.connection_info,c.next_id,c.max_attempts,
-               c.value,c.category,c.type AS challenge_type,c.state,c.logic,
+               c.value,c.category,c.category_id,c.challenge_type AS challenge_kind,
+               c.exposure,c.type AS challenge_type,c.state,c.logic,
                COALESCE(dc.dynamic_initial,c.initial) AS initial,
                COALESCE(dc.dynamic_minimum,c.minimum) AS minimum,
                COALESCE(dc.dynamic_decay,c.decay) AS decay,
@@ -1290,6 +1792,32 @@ async fn challenge_detail_by_id_on(
     )
     .bind(challenge_id)
     .fetch_optional(&mut *connection)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge not found"))
+}
+
+async fn challenge_detail_by_id_for_update(
+    transaction: &mut Transaction<'_, Postgres>,
+    challenge_id: i32,
+) -> Result<ChallengeDetailRow, ApiError> {
+    sqlx::query_as::<_, ChallengeDetailRow>(
+        r#"
+        SELECT c.id,c.name,c.description,c.attribution,c.connection_info,c.next_id,c.max_attempts,
+               c.value,c.category,c.category_id,c.challenge_type AS challenge_kind,
+               c.exposure,c.type AS challenge_type,c.state,c.logic,
+               COALESCE(dc.dynamic_initial,c.initial) AS initial,
+               COALESCE(dc.dynamic_minimum,c.minimum) AS minimum,
+               COALESCE(dc.dynamic_decay,c.decay) AS decay,
+               c.position,COALESCE(dc.dynamic_function,c.function) AS function,c.requirements
+        FROM ctfzone.challenges c
+        LEFT JOIN ctfzone.dynamic_challenge dc ON dc.id=c.id
+        WHERE c.id=$1
+        FOR UPDATE OF c
+        "#,
+    )
+    .bind(challenge_id)
+    .fetch_optional(&mut **transaction)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Challenge not found"))
@@ -1331,6 +1859,9 @@ fn challenge_read_json(challenge: &ChallengeDetailRow) -> Value {
         "connection_info": challenge.connection_info,
         "next_id": challenge.next_id,
         "category": challenge.category,
+        "category_id": challenge.category_id,
+        "challenge_type": challenge.challenge_kind,
+        "exposure": challenge.exposure,
         "state": challenge.state,
         "max_attempts": challenge.max_attempts.unwrap_or(0),
         "position": challenge.position,
@@ -1352,14 +1883,13 @@ fn challenge_read_json(challenge: &ChallengeDetailRow) -> Value {
     })
 }
 
-fn challenge_file_view(file: FileRenderRow) -> ChallengeFileView {
-    ChallengeFileView {
-        id: file.id,
-        object_id: file.object_id,
-        name: file.name,
-        content_type: file.content_type,
-        size: file.size,
-        sha256: file.sha256,
+fn challenge_object_view(object: ObjectRenderRow) -> ChallengeObjectView {
+    ChallengeObjectView {
+        object_id: object.object_id,
+        name: object.name,
+        content_type: object.content_type,
+        size: object.size,
+        sha256: object.sha256,
     }
 }
 
@@ -1453,12 +1983,53 @@ fn patch_required_string(
     }
 }
 
-fn patch_string(object: &Map<String, Value>, key: &str, current: Option<String>) -> Option<String> {
+fn patch_text(
+    object: &Map<String, Value>,
+    key: &str,
+    current: Option<String>,
+    max_bytes: usize,
+) -> Result<Option<String>, ApiError> {
     if object.contains_key(key) {
-        optional_string(object, key)
+        optional_text(object, key, max_bytes)
     } else {
-        current
+        Ok(current)
     }
+}
+
+fn optional_text(
+    object: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let value = match value {
+        Value::Null => return Ok(None),
+        Value::String(value) => value,
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Challenge {key} must be a string or null"
+            )));
+        }
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes {
+        return Err(ApiError::bad_request(format!(
+            "Challenge {key} is too long"
+        )));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(ApiError::bad_request(format!(
+            "Challenge {key} contains unsupported control characters"
+        )));
+    }
+    Ok(Some(value.clone()))
 }
 
 fn patch_i32(
@@ -1479,9 +2050,14 @@ async fn compare_submission(
     challenge: &ChallengeAttemptRow,
     flags: &[FlagRow],
     submission: &str,
-    user_id: i32,
-    team_mode: bool,
-) -> Result<FlagResult, ApiError> {
+    context: SubmissionComparisonContext<'_>,
+) -> Result<ComparisonResult, ApiError> {
+    if flags.is_empty() {
+        return Ok(ComparisonResult {
+            outcome: FlagResult::Incorrect("Incorrect".to_owned()),
+            shared: None,
+        });
+    }
     match challenge.logic.as_str() {
         "all" => {
             let mut provided = sqlx::query_scalar::<_, Option<String>>(
@@ -1499,11 +2075,25 @@ async fn compare_submission(
             .flatten()
             .collect::<Vec<_>>();
             provided.push(submission.to_owned());
+            let current_index = provided.len() - 1;
+            let mut shared = None;
             let mut all_matched = true;
             for flag in flags {
                 let mut matched = false;
-                for candidate in &provided {
-                    if flag_matches(transaction, flag, candidate).await? {
+                for (index, candidate) in provided.iter().enumerate() {
+                    let evaluation = flag_matches(
+                        transaction,
+                        flag,
+                        candidate,
+                        challenge.id,
+                        context.user_id,
+                        context.secret_key,
+                    )
+                    .await?;
+                    if index == current_index && evaluation.shared.is_some() {
+                        shared = evaluation.shared;
+                    }
+                    if evaluation.matched {
                         matched = true;
                         break;
                     }
@@ -1514,26 +2104,63 @@ async fn compare_submission(
                 }
             }
             if all_matched {
-                Ok(FlagResult::Correct)
+                Ok(ComparisonResult {
+                    outcome: FlagResult::Correct,
+                    shared,
+                })
             } else {
                 for flag in flags {
-                    if flag_matches(transaction, flag, submission).await? {
-                        return Ok(FlagResult::Partial);
+                    let evaluation = flag_matches(
+                        transaction,
+                        flag,
+                        submission,
+                        challenge.id,
+                        context.user_id,
+                        context.secret_key,
+                    )
+                    .await?;
+                    if evaluation.shared.is_some() {
+                        shared = evaluation.shared;
+                    }
+                    if evaluation.matched {
+                        return Ok(ComparisonResult {
+                            outcome: FlagResult::Partial,
+                            shared,
+                        });
                     }
                 }
-                Ok(FlagResult::Incorrect("Incorrect".to_owned()))
+                Ok(ComparisonResult {
+                    outcome: FlagResult::Incorrect("Incorrect".to_owned()),
+                    shared,
+                })
             }
         }
-        "team" if team_mode => {
+        "team" if context.team_mode => {
             let mut correct = false;
+            let mut shared = None;
             for flag in flags {
-                if flag_matches(transaction, flag, submission).await? {
+                let evaluation = flag_matches(
+                    transaction,
+                    flag,
+                    submission,
+                    challenge.id,
+                    context.user_id,
+                    context.secret_key,
+                )
+                .await?;
+                if evaluation.shared.is_some() {
+                    shared = evaluation.shared;
+                }
+                if evaluation.matched {
                     correct = true;
                     break;
                 }
             }
             if !correct {
-                return Ok(FlagResult::Incorrect("Incorrect".to_owned()));
+                return Ok(ComparisonResult {
+                    outcome: FlagResult::Incorrect("Incorrect".to_owned()),
+                    shared,
+                });
             }
             let submitters = sqlx::query_scalar::<_, Option<i32>>(
                 "SELECT DISTINCT user_id FROM ctfzone.submissions WHERE team_id=$1 AND challenge_id=$2 AND type='partial'",
@@ -1544,7 +2171,7 @@ async fn compare_submission(
             .await
             .map_err(ApiError::database)?;
             let mut submitters = submitters.into_iter().flatten().collect::<HashSet<_>>();
-            submitters.insert(user_id);
+            submitters.insert(context.user_id);
             let members =
                 sqlx::query_scalar::<_, i32>("SELECT id FROM ctfzone.users WHERE team_id=$1")
                     .bind(account.id())
@@ -1554,52 +2181,112 @@ async fn compare_submission(
                     .into_iter()
                     .collect::<HashSet<_>>();
             if submitters == members {
-                Ok(FlagResult::Correct)
+                Ok(ComparisonResult {
+                    outcome: FlagResult::Correct,
+                    shared,
+                })
             } else {
-                Ok(FlagResult::Partial)
+                Ok(ComparisonResult {
+                    outcome: FlagResult::Partial,
+                    shared,
+                })
             }
         }
         _ => {
+            let mut shared = None;
             for flag in flags {
-                if flag_matches(transaction, flag, submission).await? {
-                    return Ok(FlagResult::Correct);
+                let evaluation = flag_matches(
+                    transaction,
+                    flag,
+                    submission,
+                    challenge.id,
+                    context.user_id,
+                    context.secret_key,
+                )
+                .await?;
+                if evaluation.shared.is_some() {
+                    shared = evaluation.shared;
+                }
+                if evaluation.matched {
+                    return Ok(ComparisonResult {
+                        outcome: FlagResult::Correct,
+                        shared,
+                    });
                 }
             }
-            Ok(FlagResult::Incorrect("Incorrect".to_owned()))
+            Ok(ComparisonResult {
+                outcome: FlagResult::Incorrect("Incorrect".to_owned()),
+                shared,
+            })
         }
     }
+}
+
+struct FlagEvaluation {
+    matched: bool,
+    shared: Option<SharedFlagEvidence>,
 }
 
 async fn flag_matches(
     transaction: &mut Transaction<'_, Postgres>,
     flag: &FlagRow,
     provided: &str,
-) -> Result<bool, ApiError> {
-    let saved = flag.content.as_deref().unwrap_or_default();
-    let insensitive = flag.data.as_deref() == Some("case_insensitive");
-    match flag.flag_type.as_deref().unwrap_or("static") {
-        "static" => Ok(static_flag_matches(saved, provided, insensitive)),
-        "regex" => {
-            let pattern = format!("^(?:{saved})$");
-            let query = if insensitive {
-                "SELECT $1::text ~* $2::text"
-            } else {
-                "SELECT $1::text ~ $2::text"
-            };
-            sqlx::query_scalar::<_, bool>(query)
-                .bind(provided)
-                .bind(pattern)
-                .fetch_one(&mut **transaction)
-                .await
-                .map_err(|error| match error {
-                    sqlx::Error::Database(ref database)
-                        if database.code().as_deref() == Some("2201B") =>
-                    {
-                        ApiError::bad_request("Regex parse error occurred")
-                    }
-                    error => ApiError::database(error),
-                })
-        }
+    challenge_id: i32,
+    user_id: i32,
+    secret_key: &str,
+) -> Result<FlagEvaluation, ApiError> {
+    let policy = serde_json::from_value::<super::flag_policy::FlagPolicyData>(flag.data.clone())
+        .map_err(|_| ApiError::upstream("Stored flag options are invalid"))?;
+    match flag.flag_type.as_str() {
+        "static" => Ok(FlagEvaluation {
+            matched: super::flag_policy::flag_matches_literal(
+                &flag.content,
+                provided,
+                policy.case_sensitive,
+            ),
+            shared: None,
+        }),
+        "regex" => Ok(FlagEvaluation {
+            matched: super::flag_policy::flag_matches_regex(
+                &flag.content,
+                provided,
+                policy.case_sensitive,
+            )?,
+            shared: None,
+        }),
+        "generated" => match super::flag_policy::generated_flag_match(
+            transaction,
+            flag,
+            provided,
+            user_id,
+            challenge_id,
+            secret_key,
+        )
+        .await?
+        {
+            super::flag_policy::FlagMatch::No => Ok(FlagEvaluation {
+                matched: false,
+                shared: None,
+            }),
+            super::flag_policy::FlagMatch::Own => Ok(FlagEvaluation {
+                matched: true,
+                shared: None,
+            }),
+            super::flag_policy::FlagMatch::Other {
+                flag_id,
+                source_user_id,
+                accepted,
+                match_tag,
+            } => Ok(FlagEvaluation {
+                matched: accepted,
+                shared: Some(SharedFlagEvidence {
+                    flag_id,
+                    source_user_id,
+                    accepted,
+                    match_tag,
+                }),
+            }),
+        },
         _ => Err(ApiError::bad_request(format!(
             "Unsupported flag type on flag {}",
             flag.id
@@ -1607,18 +2294,10 @@ async fn flag_matches(
     }
 }
 
-fn static_flag_matches(saved: &str, provided: &str, insensitive: bool) -> bool {
-    if insensitive {
-        saved.to_lowercase() == provided.to_lowercase()
-    } else {
-        saved == provided
-    }
-}
-
 async fn insert_submission(
     transaction: &mut Transaction<'_, Postgres>,
     user: &CurrentUser,
-    team_mode: bool,
+    team_id: Option<i32>,
     challenge_id: i32,
     provided: &str,
     submission_type: &str,
@@ -1633,13 +2312,46 @@ async fn insert_submission(
     )
     .bind(challenge_id)
     .bind(user.id)
-    .bind(if team_mode { user.team_id } else { None })
+    .bind(team_id)
     .bind(user.request_ip())
     .bind(provided)
     .bind(submission_type)
     .fetch_one(&mut **transaction)
     .await
     .map_err(ApiError::database)
+}
+
+async fn record_shared_flag_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    submission_id: i32,
+    challenge_id: i32,
+    submitting_user_id: i32,
+    team_id_snapshot: Option<i32>,
+    evidence: Option<SharedFlagEvidence>,
+) -> Result<(), ApiError> {
+    let Some(evidence) = evidence else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO ctfzone.flag_sharing_events
+            (submission_id,challenge_id,flag_id,submitting_user_id,source_user_id,
+             team_id_snapshot,provided_match_tag,accepted)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        "#,
+    )
+    .bind(submission_id)
+    .bind(challenge_id)
+    .bind(evidence.flag_id)
+    .bind(submitting_user_id)
+    .bind(evidence.source_user_id)
+    .bind(team_id_snapshot)
+    .bind(evidence.match_tag.as_slice())
+    .bind(evidence.accepted)
+    .execute(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?;
+    Ok(())
 }
 
 async fn submission_count(
@@ -1807,10 +2519,29 @@ async fn solved_challenge_ids_on(
     let Some(user) = user else {
         return Ok(HashSet::new());
     };
-    let (column, account_id) = if team_mode {
-        ("team_id", user.team_id)
+    let team_id = if team_mode {
+        sqlx::query_scalar::<_, Option<i32>>("SELECT team_id FROM ctfzone.users WHERE id=$1")
+            .bind(user.id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(ApiError::database)?
+            .flatten()
     } else {
-        ("user_id", Some(user.id))
+        None
+    };
+    solved_challenge_ids_for_identity_on(connection, Some(user.id), team_id, team_mode).await
+}
+
+async fn solved_challenge_ids_for_identity_on(
+    connection: &mut PgConnection,
+    user_id: Option<i32>,
+    team_id: Option<i32>,
+    team_mode: bool,
+) -> Result<HashSet<i32>, ApiError> {
+    let (column, account_id) = if team_mode {
+        ("team_id", team_id)
+    } else {
+        ("user_id", user_id)
     };
     let Some(account_id) = account_id else {
         return Ok(HashSet::new());
@@ -1933,6 +2664,30 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Option<String> {
     })
 }
 
+fn private_gate_enable_requested(
+    object: &Map<String, Value>,
+    challenge_kind: &str,
+    exposure: &str,
+) -> Result<bool, ApiError> {
+    let Some(value) = object.get("enable_global_gate") else {
+        return Ok(false);
+    };
+    let enable = value
+        .as_bool()
+        .ok_or_else(|| ApiError::bad_request("Challenge enable_global_gate must be a boolean"))?;
+    if challenge_kind != "jeopardy" {
+        return Err(ApiError::bad_request(
+            "enable_global_gate is available only for Jeopardy challenges",
+        ));
+    }
+    if exposure != "private" {
+        return Err(ApiError::bad_request(
+            "enable_global_gate is available only for private challenges",
+        ));
+    }
+    Ok(enable)
+}
+
 fn optional_i32(object: &Map<String, Value>, key: &str) -> Result<Option<i32>, ApiError> {
     let Some(value) = object.get(key) else {
         return Ok(None);
@@ -1946,6 +2701,16 @@ fn optional_i32(object: &Map<String, Value>, key: &str) -> Result<Option<i32>, A
         .and_then(|value| i32::try_from(value).ok())
         .ok_or_else(|| ApiError::bad_request(format!("Challenge {key} must be an integer")))?;
     Ok(Some(parsed))
+}
+
+fn validate_max_attempts(value: i32) -> Result<i32, ApiError> {
+    if value < 0 {
+        Err(ApiError::bad_request(
+            "Challenge max_attempts cannot be negative",
+        ))
+    } else {
+        Ok(value)
+    }
 }
 
 fn flag_result_response(result: FlagResult) -> Response {
@@ -2174,9 +2939,15 @@ mod tests {
 
     #[test]
     fn compares_static_flags() {
-        assert!(static_flag_matches("CTF{yes}", "CTF{yes}", false));
-        assert!(!static_flag_matches("CTF{yes}", "ctf{yes}", false));
-        assert!(static_flag_matches("CTF{yes}", "ctf{YES}", true));
+        assert!(super::super::flag_policy::flag_matches_literal(
+            "CTF{yes}", "CTF{yes}", true
+        ));
+        assert!(!super::super::flag_policy::flag_matches_literal(
+            "CTF{yes}", "ctf{yes}", true
+        ));
+        assert!(super::super::flag_policy::flag_matches_literal(
+            "CTF{yes}", "ctf{YES}", false
+        ));
     }
 
     #[test]
@@ -2235,6 +3006,93 @@ mod tests {
         assert_eq!(ctf_time_access(100, 0, 99, true), CtfTimeAccess::Allowed);
     }
 
+    #[test]
+    fn private_gate_enable_request_is_boolean_and_private_jeopardy_only() {
+        let enabled = json!({"enable_global_gate": true});
+        let disabled = json!({"enable_global_gate": false});
+        let missing = json!({});
+        let invalid = json!({"enable_global_gate": "true"});
+
+        assert!(matches!(
+            private_gate_enable_requested(enabled.as_object().unwrap(), "jeopardy", "private"),
+            Ok(true)
+        ));
+        assert!(matches!(
+            private_gate_enable_requested(disabled.as_object().unwrap(), "jeopardy", "private"),
+            Ok(false)
+        ));
+        assert!(matches!(
+            private_gate_enable_requested(missing.as_object().unwrap(), "jeopardy", "private"),
+            Ok(false)
+        ));
+        assert!(
+            private_gate_enable_requested(invalid.as_object().unwrap(), "jeopardy", "private")
+                .is_err()
+        );
+        assert!(
+            private_gate_enable_requested(enabled.as_object().unwrap(), "jeopardy", "public")
+                .is_err()
+        );
+        assert!(
+            private_gate_enable_requested(
+                enabled.as_object().unwrap(),
+                "attack_defense",
+                "private"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn max_attempts_uses_zero_as_unlimited_and_rejects_negative_values() {
+        assert_eq!(validate_max_attempts(0).expect("zero is unlimited"), 0);
+        assert_eq!(validate_max_attempts(1).expect("positive limit"), 1);
+        assert!(validate_max_attempts(-1).is_err());
+    }
+
+    #[test]
+    fn optional_authoring_text_is_typed_bounded_and_allows_multiline_commands() {
+        let valid = json!({
+            "connection_info": "nc challenge.example 31337\n# or open the link in the description",
+            "attribution": "Alice, **Bob**",
+        });
+        let object = valid.as_object().unwrap();
+        assert_eq!(
+            optional_text(object, "connection_info", 4_096)
+                .unwrap()
+                .as_deref(),
+            Some("nc challenge.example 31337\n# or open the link in the description")
+        );
+        assert_eq!(
+            optional_text(object, "attribution", 2_048)
+                .unwrap()
+                .as_deref(),
+            Some("Alice, **Bob**")
+        );
+
+        assert!(optional_text(json!({"value": 7}).as_object().unwrap(), "value", 8).is_err());
+        assert!(
+            optional_text(
+                json!({"value": "bad\u{0000}"}).as_object().unwrap(),
+                "value",
+                8
+            )
+            .is_err()
+        );
+        assert!(
+            optional_text(
+                json!({"value": "123456789"}).as_object().unwrap(),
+                "value",
+                8
+            )
+            .is_err()
+        );
+        assert_eq!(
+            optional_text(json!({"value": "  "}).as_object().unwrap(), "value", 8).unwrap(),
+            None
+        );
+    }
+
     fn access_test_challenge(state: &str, requirements: Option<Value>) -> ChallengeDetailRow {
         ChallengeDetailRow {
             id: 1,
@@ -2246,6 +3104,9 @@ mod tests {
             max_attempts: None,
             value: Some(100),
             category: Some("test".to_owned()),
+            category_id: 1,
+            challenge_kind: "jeopardy".to_owned(),
+            exposure: "public".to_owned(),
             challenge_type: Some("standard".to_owned()),
             state: state.to_owned(),
             logic: "any".to_owned(),

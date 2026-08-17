@@ -13,17 +13,56 @@
 {$CADDY_SITE_ADDRESS:https://localhost} {
 	encode zstd gzip
 
-	# The browser can reach only the Python web boundary. Rust is intentionally
-	# absent from Caddy's application routes and accepts service-authenticated
-	# traffic on an internal Docker network.
+	# Normal portal traffic reaches only the Python web boundary. The sole
+	# exception is the isolated, ticket-authenticated SSH WebSocket below; the
+	# private Rust API remains absent from Caddy's public routes.
 	# Portal bodies are small metadata/forms. Buffering the same bounded body
 	# before opening an upstream request prevents slow clients from occupying a
 	# finite Gunicorn worker during the storage-sized edge upload window.
 	request_body {
 		max_size {$MAX_PROXY_BODY_BYTES:6291456}
 	}
-	reverse_proxy backend:8000 {
-		request_buffers {$MAX_PROXY_BODY_BYTES:6291456}
+	route {
+		# Interactive terminals use a one-time ticket in the first WebSocket
+		# frame. Keeping this route separate means Flask never handles SSH keys,
+		# terminal bytes, or long-lived upgraded connections.
+		@ssh_terminal {
+			path /bff/ssh/terminal
+			method GET
+			header Connection *Upgrade*
+			header Upgrade websocket
+			header Sec-WebSocket-Protocol ctfzone.ssh.v1
+		}
+		handle @ssh_terminal {
+			# The gateway intentionally exposes only its internal `/terminal`
+			# endpoint; keep the public namespace at `/bff/ssh/*`. The browser
+			# session cookie and every private control-plane credential stop at
+			# Caddy: the gateway authenticates only the one-use first-frame ticket.
+			uri strip_prefix /bff/ssh
+			reverse_proxy ssh-gateway:8091 {
+				header_up -Cookie
+				header_up -Authorization
+				header_up -Proxy-Authorization
+				header_up -Csrf-Token
+				header_up -X-Ctfzone-Backend-Token
+				header_up -X-Ctfzone-Ssh-Gateway-Token
+				header_up -X-Ctfzone-Session
+				header_up -X-Ctfzone-Browser-Request-Id
+				flush_interval -1
+			}
+		}
+		# Never expose a normal same-origin HTTP response from the gateway. This
+		# preserves its compromise boundary: terminal traffic is usable only by
+		# the browser's WebSocket API and cannot become portal-origin HTML or JS.
+		handle /bff/ssh/terminal {
+			respond "SSH terminal WebSocket upgrade required" 400
+		}
+
+		handle {
+			reverse_proxy backend:8000 {
+				request_buffers {$MAX_PROXY_BODY_BYTES:6291456}
+			}
+		}
 	}
 }
 

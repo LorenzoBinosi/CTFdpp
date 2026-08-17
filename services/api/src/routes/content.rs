@@ -150,16 +150,24 @@ struct UnlockView {
 
 pub(super) async fn challenge_types() -> Response {
     Json(Success::new(json!({
-        "standard": {
-            "id": "standard",
-            "name": "standard",
-            "capabilities": {"flag_submission": true, "dynamic_scoring": false}
+        "jeopardy": {
+            "id": "jeopardy",
+            "name": "Jeopardy",
+            "selectable": true,
+            "capabilities": {"flag_submission": true, "private_instances": true}
         },
-        "dynamic": {
-            "id": "dynamic",
-            "name": "dynamic",
-            "capabilities": {"flag_submission": true, "dynamic_scoring": true}
-        }
+        "attack_defence": {
+            "id": "attack_defence", "name": "Attack / Defence", "selectable": false,
+            "availability": "future"
+        },
+        "speed_run": {
+            "id": "speed_run", "name": "Speed run", "selectable": false,
+            "availability": "future"
+        },
+        "king_of_the_hill": {
+            "id": "king_of_the_hill", "name": "King of the hill", "selectable": false,
+            "availability": "future"
+        },
     })))
     .into_response()
 }
@@ -205,23 +213,13 @@ pub(super) async fn challenge_files(
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let data = sqlx::query_as::<
-        _,
-        (
-            i32,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<uuid::Uuid>,
-            Option<String>,
-        ),
-    >(
+    let data = sqlx::query_as::<_, (uuid::Uuid, String, String, i64, Option<String>)>(
         r#"
-        SELECT files.id,files.type,files.location,files.sha1sum,files.object_id,
-               stored_objects.status
-        FROM ctfzone.files
-        LEFT JOIN ctfzone.stored_objects ON stored_objects.id=files.object_id
-        WHERE files.challenge_id=$1 ORDER BY files.id
+        SELECT id,original_filename,content_type,
+               COALESCE(actual_size,expected_size),actual_checksum
+        FROM ctfzone.stored_objects
+        WHERE challenge_id=$1 AND purpose='challenge_asset' AND status='ready'
+        ORDER BY created_at,id
         "#,
     )
     .bind(challenge_id)
@@ -229,8 +227,18 @@ pub(super) async fn challenge_files(
     .await
     .map_err(ApiError::database)?
     .into_iter()
-    .map(|(id, file_type, location, sha1sum, object_id, status)| {
-        json!({"id": id, "type": file_type, "location": location, "sha1sum": sha1sum, "object_id": object_id, "status": status, "challenge_id": challenge_id})
+    .map(|(object_id, filename, content_type, size, sha256)| {
+        json!({
+            "id": object_id,
+            "object_id": object_id,
+            "purpose": "challenge_asset",
+            "filename": filename,
+            "content_type": content_type,
+            "size": size,
+            "sha256": sha256,
+            "status": "ready",
+            "challenge_id": challenge_id,
+        })
     })
     .collect::<Vec<_>>();
     Ok(Json(Success::new(data)).into_response())
@@ -286,16 +294,17 @@ pub(super) async fn challenge_flags(
     Path(challenge_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let data = sqlx::query_as::<_, (i32, Option<i32>, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id,challenge_id,type,content,data FROM ctfzone.flags WHERE challenge_id=$1 ORDER BY id",
+    let data = sqlx::query_as::<_, (i32, i32, String, String, Value, i64)>(
+        "SELECT id,challenge_id,type,content,data,revision FROM ctfzone.flags WHERE challenge_id=$1 ORDER BY id",
     )
     .bind(challenge_id)
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?
     .into_iter()
-    .map(|(id, challenge_id, flag_type, content, data)| json!({
-        "id": id, "challenge_id": challenge_id, "type": flag_type, "content": content, "data": data
+    .map(|(id, challenge_id, flag_type, content, data, revision)| json!({
+        "id": id, "challenge_id": challenge_id, "type": flag_type, "content": content,
+        "data": data, "revision": revision
     }))
     .collect::<Vec<_>>();
     Ok(Json(Success::new(data)).into_response())
@@ -361,15 +370,56 @@ pub(super) async fn rate_challenge(
     Path(challenge_id): Path<i32>,
     Json(request): Json<RatingInput>,
 ) -> Result<Response, ApiError> {
-    super::challenges::require_full_challenge_access(&state, Some(&user), challenge_id).await?;
     if !matches!(request.value, -1 | 1) || request.review.len() > 2000 {
         return Err(ApiError::bad_request("Invalid rating value or review"));
     }
-    let rating_mode = config_string(&state, "challenge_ratings").await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let user_mode = super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
+    let team_mode = user_mode == "teams";
+    let mut effective_user = user.clone();
+    if team_mode && !effective_user.is_admin() {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+        effective_user.team_id = sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+        )
+        .bind(effective_user.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten();
+    }
+    super::challenges::require_full_challenge_access_in_transaction(
+        &mut transaction,
+        Some(&effective_user),
+        challenge_id,
+    )
+    .await?;
+    let rating_mode = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT value FROM ctfzone.config WHERE key='challenge_ratings' LIMIT 1",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .flatten();
     if rating_mode.as_deref() == Some("disabled") {
         return Err(ApiError::forbidden("Challenge ratings are disabled"));
     }
-    if !user.is_admin() && !user_solved_challenge(&state, &user, challenge_id).await? {
+    if !effective_user.is_admin()
+        && !user_solved_challenge_in_transaction(
+            &mut transaction,
+            &effective_user,
+            challenge_id,
+            team_mode,
+        )
+        .await?
+    {
         return Err(ApiError::forbidden(
             "You must solve this challenge before rating it",
         ));
@@ -387,9 +437,10 @@ pub(super) async fn rate_challenge(
     .bind(challenge_id)
     .bind(request.value)
     .bind(request.review)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(rating)).into_response())
 }
 
@@ -525,7 +576,7 @@ pub(super) async fn delete_hint(
     Path(hint_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_by_id(&state, "hints", hint_id).await
+    delete_by_id(&state, &user, "hints", hint_id).await
 }
 
 pub(super) async fn list_solutions(
@@ -629,7 +680,7 @@ pub(super) async fn delete_solution(
     Path(solution_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_by_id(&state, "solutions", solution_id).await
+    delete_by_id(&state, &user, "solutions", solution_id).await
 }
 
 pub(super) async fn list_unlocks(
@@ -656,14 +707,35 @@ pub(super) async fn unlock(
     if !matches!(request.target_type.as_str(), "hints" | "solutions") {
         return Err(ApiError::bad_request("Unsupported unlock type"));
     }
-    let team_mode = super::challenges::is_team_mode(&state).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let team_mode =
+        super::user_mode_transition::transaction_user_mode(&mut transaction).await? == "teams";
+    let current_team_id = if team_mode {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+        sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+        )
+        .bind(user.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten()
+    } else {
+        None
+    };
     let account_id = if team_mode {
-        user.team_id
+        current_team_id
             .ok_or_else(|| ApiError::forbidden("Join a team before unlocking content"))?
     } else {
         user.id
     };
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     // Serialize all purchases for an account so concurrent different hints cannot overspend.
     sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
         .bind(CONTENT_UNLOCK_LOCK_NAMESPACE)
@@ -711,7 +783,7 @@ pub(super) async fn unlock(
     .bind(request.target)
     .bind(&request.target_type)
     .bind(team_mode)
-    .bind(user.team_id)
+    .bind(current_team_id)
     .bind(user.id)
     .fetch_one(&mut *transaction)
     .await
@@ -738,7 +810,7 @@ pub(super) async fn unlock(
                 "#,
             )
             .bind(user.id)
-            .bind(user.team_id)
+            .bind(current_team_id)
             .bind(title.unwrap_or_else(|| format!("Hint {}", request.target)))
             .bind(format!("Hint for challenge {challenge_id}"))
             .bind(-cost)
@@ -759,7 +831,7 @@ pub(super) async fn unlock(
         "#,
     )
     .bind(user.id)
-    .bind(user.team_id)
+    .bind(current_team_id)
     .bind(request.target)
     .bind(request.target_type)
     .fetch_optional(&mut *transaction)
@@ -819,6 +891,30 @@ pub(super) async fn create_notification(
     if request.title.trim().is_empty() || request.title.len() > 500 {
         return Err(ApiError::bad_request("Notification title is invalid"));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if let Some(team_id) = request.team_id {
+        if super::user_mode_transition::transaction_user_mode(&mut transaction).await? != "teams" {
+            return Err(ApiError::bad_request(
+                "Team notifications are only available in team mode",
+            ));
+        }
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ctfzone.teams WHERE id=$1)")
+                .bind(team_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        if !exists {
+            return Err(ApiError::bad_request("Notification team does not exist"));
+        }
+    }
     let notification = sqlx::query_as::<_, NotificationView>(
         r#"
         INSERT INTO ctfzone.notifications (title,content,date,user_id,team_id)
@@ -830,9 +926,10 @@ pub(super) async fn create_notification(
     .bind(request.content)
     .bind(request.user_id)
     .bind(request.team_id)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     let mut data = serde_json::to_value(notification).expect("notification is serializable");
     data["type"] = json!(
         request
@@ -849,7 +946,7 @@ pub(super) async fn delete_notification(
     Path(notification_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_by_id(&state, "notifications", notification_id).await
+    delete_by_id(&state, &user, "notifications", notification_id).await
 }
 
 async fn simple_relation(
@@ -943,6 +1040,30 @@ async fn user_solved_challenge(
     .bind(user.team_id)
     .bind(user.id)
     .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::database)
+}
+
+async fn user_solved_challenge_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    user: &CurrentUser,
+    challenge_id: i32,
+    team_mode: bool,
+) -> Result<bool, ApiError> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ctfzone.submissions s JOIN ctfzone.solves solved ON solved.id=s.id
+            WHERE s.challenge_id=$1
+              AND (($2 AND s.team_id=$3) OR (NOT $2 AND s.user_id=$4))
+        )
+        "#,
+    )
+    .bind(challenge_id)
+    .bind(team_mode)
+    .bind(user.team_id)
+    .bind(user.id)
+    .fetch_one(&mut **transaction)
     .await
     .map_err(ApiError::database)
 }
@@ -1051,19 +1172,33 @@ fn validate_solution_parent_patch(
     }
 }
 
-async fn delete_by_id(state: &AppState, table: &str, id: i32) -> Result<Response, ApiError> {
+async fn delete_by_id(
+    state: &AppState,
+    user: &CurrentUser,
+    table: &str,
+    id: i32,
+) -> Result<Response, ApiError> {
     let allowed = ["hints", "solutions", "notifications"];
     if !allowed.contains(&table) {
         return Err(ApiError::bad_request("Unsupported content type"));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let result = sqlx::query(&format!("DELETE FROM ctfzone.{table} WHERE id=$1"))
         .bind(id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("Content not found"));
     }
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(json!({"success": true})).into_response())
 }
 

@@ -4,17 +4,32 @@ from ctfzone_web.markdown import render_markdown
 
 
 class MarkdownTests(unittest.TestCase):
-    def test_escapes_raw_html_and_unsafe_links(self):
+    def test_allows_safe_html_and_escapes_active_content(self):
         rendered = str(
             render_markdown(
-                '<script>alert("x")</script> [bad](javascript:alert(1)) '
-                "[good](https://example.org/path)"
+                '<strong data-unsafe="x">Safe</strong> '
+                '<a href="https://example.org/path" onclick="steal()">visit</a> '
+                '<a href="javascript:alert(1)">bad</a> '
+                '<script>alert("x")</script> '
+                '<img src=x onerror="steal()">'
             )
         )
+        self.assertIn("<strong>Safe</strong>", rendered)
+        self.assertIn('href="https://example.org/path"', rendered)
+        self.assertIn('rel="noopener noreferrer"', rendered)
+        self.assertNotIn("onclick", rendered)
+        self.assertNotIn('href="javascript:', rendered)
         self.assertNotIn("<script>", rendered)
         self.assertIn("&lt;script&gt;", rendered)
-        self.assertNotIn('href="javascript:', rendered)
-        self.assertIn('href="https://example.org/path"', rendered)
+        self.assertNotIn("<img", rendered)
+        self.assertIn("&lt;img", rendered)
+
+    def test_renders_safe_block_html_without_paragraph_wrapping(self):
+        rendered = str(render_markdown("<div><h2>Connect</h2><p>Use <code>nc host 1</code></p></div>"))
+        self.assertEqual(
+            rendered,
+            "<div><h2>Connect</h2><p>Use <code>nc host 1</code></p></div>",
+        )
 
     def test_renders_basic_structure(self):
         rendered = str(render_markdown("# Goal\n\n- Find **flag**\n- Run `id`"))

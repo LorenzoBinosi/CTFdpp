@@ -1,15 +1,16 @@
 # CTFZone managed-instance controller
 
 Status: Implemented 1.0.0 baseline
-Last updated: 2026-08-12
+Last updated: 2026-08-17
 
-This document describes the controller implemented in this repository. It is
-the selected PostgreSQL-coordinated design from
-[`CONTROLLER_ALTERNATIVES.md`](CONTROLLER_ALTERNATIVES.md).
+This document describes the PostgreSQL-coordinated private-instance worker
+implemented in the controller. The same controller process also runs the
+independent object-maintenance worker; browser SSH is owned by the separate
+SSH gateway described in [`SSH_CONSOLE.md`](SSH_CONSOLE.md).
 
 ## 1. Boundary and topology
 
-CTFZone has four core services plus Caddy and object-storage infrastructure:
+CTFZone separates the portal, private API, durable workers, and browser SSH:
 
 ```text
 Browser -- HTTPS --> Caddy(site) --> Python BFF --> private Rust API
@@ -20,6 +21,8 @@ Browser -- HTTPS --> Caddy(site) --> Python BFF --> private Rust API
                                       |                    |
                                       |             Rust controller -- SSH --> remote runtime host
                                       |                                    + host expiry timer
+                                      |
+                                      +-- browser terminal WebSocket --> SSH gateway -- SSH --> registered host
                                       |
                                       +-- signed redirect/PUT --> Caddy(storage) --> object storage
 ```
@@ -36,12 +39,14 @@ Browser -- HTTPS --> Caddy(site) --> Python BFF --> private Rust API
 - PostgreSQL is the only authoritative platform database.
 - The controller is an internal worker. A participant cannot connect to it or
   send it arbitrary container instructions.
+- The SSH gateway is a separate, isolated browser-terminal bridge. Its host
+  inventory, key volume, and shell sessions are not runtime placement inputs.
 - Remote hosts run challenge workloads and are not additional CTFZone platform
   services.
 
 Human-facing pages and their JavaScript actions reach Python through Caddy;
 Python validates the browser boundary and calls Rust without implementing
-domain behavior. Caddy does not expose a generic Rust `/api/v1` or `/files`
+domain behavior. Caddy does not expose a generic Rust `/api/v1`
 route. A future machine API needs a separate, explicitly scoped ingress and
 credential model rather than reusing the private BFF contract. The controller
 is never part of the user authentication boundary.
@@ -73,7 +78,7 @@ degraded are not ready.
 ### Platform state
 
 The native API owns users, teams, sessions, tokens, challenges, flags, hints,
-submissions, solves, fails, awards, scoreboard rules, configuration, files,
+submissions, solves, fails, awards, scoreboard rules, configuration, objects,
 pages, notifications, and exports in the same PostgreSQL database.
 
 ### Runtime policy

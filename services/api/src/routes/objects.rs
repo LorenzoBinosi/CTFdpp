@@ -23,20 +23,6 @@ use crate::{
 pub(super) const MAX_UPLOAD_BODY_BYTES: usize = 64 * 1024;
 const STORAGE_QUOTA_LOCK_NAMESPACE: i32 = 0x4354_465a;
 
-#[derive(Clone, FromRow, Serialize)]
-struct FileView {
-    id: i32,
-    #[serde(rename = "type")]
-    file_type: Option<String>,
-    location: Option<String>,
-    sha1sum: Option<String>,
-    challenge_id: Option<i32>,
-    page_id: Option<i32>,
-    solution_id: Option<i32>,
-    object_id: Option<Uuid>,
-    object_status: Option<String>,
-}
-
 #[derive(Clone, FromRow)]
 struct StoredObject {
     id: Uuid,
@@ -189,6 +175,13 @@ impl Purpose {
     }
 }
 
+fn is_competition_purpose(value: &str) -> bool {
+    matches!(
+        value,
+        "submission" | "patch" | "program" | "pcap" | "result"
+    )
+}
+
 struct ValidatedTarget {
     challenge_id: Option<i32>,
     page_id: Option<i32>,
@@ -225,39 +218,6 @@ impl AuthorizationPrincipal {
     }
 }
 
-pub(super) async fn list(
-    State(state): State<AppState>,
-    user: CurrentUser,
-) -> Result<Response, ApiError> {
-    require_admin(&user)?;
-    let files = sqlx::query_as::<_, FileView>(&file_select("ORDER BY files.id"))
-        .fetch_all(&state.database)
-        .await
-        .map_err(ApiError::database)?;
-    Ok(Json(Success::new(files)).into_response())
-}
-
-pub(super) async fn detail(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    Path(file_id): Path<i32>,
-) -> Result<Response, ApiError> {
-    require_admin(&user)?;
-    Ok(Json(Success::new(load_file_by_id(&state, file_id).await?)).into_response())
-}
-
-/// Compatibility alias for the old file collection. The request is now JSON
-/// and returns a presigned PUT instead of proxying multipart bytes through the
-/// Python and Rust processes.
-pub(super) async fn upload(
-    state: State<AppState>,
-    user: CurrentUser,
-    headers: HeaderMap,
-    request: Json<UploadRequest>,
-) -> Result<Response, ApiError> {
-    initiate_upload(state, user, headers, request).await
-}
-
 pub(super) async fn initiate_upload(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -278,7 +238,6 @@ pub(super) async fn initiate_upload(
     let expected_checksum = validate_sha256(&request.sha256)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let target = validate_target(&state, &user, purpose, &request).await?;
-    let principal = authorization_principal(&state, &user, purpose).await?;
     let object_id = Uuid::new_v4();
     let now = Utc::now();
     let upload_expires_at = now
@@ -293,6 +252,20 @@ pub(super) async fn initiate_upload(
     let upload_key = format!("uploads/{object_id}");
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if !purpose.is_asset() {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
+    let user_mode = super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
+    let principal =
+        authorization_principal_in_transaction(&mut transaction, &user, purpose, &user_mode)
+            .await?;
     if !lock_validated_target(&mut transaction, purpose, &target).await? {
         return Err(ApiError::not_found("Object target not found"));
     }
@@ -420,7 +393,7 @@ pub(super) async fn complete_upload(
         return Err(ApiError::conflict("Object upload is no longer pending"));
     }
     if object.upload_expires_at < Utc::now() {
-        fail_upload(&state, &object, user.id, "upload_expired").await?;
+        fail_upload(&state, &object, &user, "upload_expired").await?;
         return Err(ApiError::conflict("Object upload has expired"));
     }
 
@@ -433,20 +406,36 @@ pub(super) async fn complete_upload(
         None
     };
     if let Some(reason) = invalid_reason {
-        fail_upload(&state, &object, user.id, reason).await?;
+        fail_upload(&state, &object, &user, reason).await?;
         return Err(ApiError::conflict(
             "Uploaded object metadata does not match the grant",
         ));
     }
 
+    let purpose = Purpose::parse(&object.purpose)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if !purpose.is_asset() {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
+    let user_mode = super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
     if !lock_target(&mut transaction, &object).await? {
         transaction.rollback().await.map_err(ApiError::database)?;
-        fail_upload(&state, &object, user.id, "target_removed").await?;
+        fail_upload(&state, &object, &user, "target_removed").await?;
         return Err(ApiError::conflict("The upload target no longer exists"));
     }
     let current = load_object_for_update(&mut transaction, object.id).await?;
     authorize_change_in_transaction(&mut transaction, user.id, &current).await?;
+    let principal =
+        authorization_principal_in_transaction(&mut transaction, &user, purpose, &user_mode)
+            .await?;
+    require_current_upload_principal(&current, principal, user.id)?;
     if current.status == "ready" {
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok(Json(Success::new(ObjectView::from(&current))).into_response());
@@ -456,7 +445,7 @@ pub(super) async fn complete_upload(
     }
     if current.upload_expires_at < Utc::now() {
         transaction.rollback().await.map_err(ApiError::database)?;
-        fail_upload(&state, &current, user.id, "upload_expired").await?;
+        fail_upload(&state, &current, &user, "upload_expired").await?;
         return Err(ApiError::conflict("Object upload has expired"));
     }
     copy_to_final_key(&state, &current).await?;
@@ -486,7 +475,6 @@ pub(super) async fn complete_upload(
     .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
-    associate_legacy_file(&mut transaction, &current).await?;
     sqlx::query(
         "UPDATE ctfzone.object_operations SET status='cancelled',completed_at=now() WHERE object_id=$1 AND operation='reconcile' AND status IN ('pending','claimed')",
     )
@@ -538,11 +526,71 @@ pub(super) async fn download_grant(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Path(object_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let object = load_object(&state, object_id).await?;
-    if object.status != "ready" {
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    if let Some(current) = user.as_ref() {
+        crate::auth::revalidate_current_credential(
+            &mut transaction,
+            current,
+            state.auth.session_lifetime_seconds,
+        )
+        .await?;
+    }
+    let user_mode = super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
+    let mut effective_user = user.clone();
+    let current_team_id = if user_mode == "teams"
+        && effective_user
+            .as_ref()
+            .is_some_and(|current| !current.is_admin())
+    {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+        let current = effective_user.as_ref().expect("checked above");
+        let team_id = sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+        )
+        .bind(current.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten();
+        effective_user.as_mut().expect("checked above").team_id = team_id;
+        team_id
+    } else {
+        None
+    };
+    let authorized_object = load_object_in_transaction(&mut transaction, object_id).await?;
+    if is_competition_purpose(&authorized_object.purpose) {
+        let current = effective_user
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("Object not found"))?;
+        if !current.is_admin() {
+            let authorized = match authorized_object.authorization_scope.as_str() {
+                "user" if user_mode == "users" => {
+                    authorized_object.owner_user_id == Some(current.id)
+                }
+                "team" if user_mode == "teams" => {
+                    authorized_object.owner_team_id.is_some()
+                        && authorized_object.owner_team_id == current_team_id
+                }
+                _ => false,
+            };
+            if !authorized {
+                return Err(ApiError::not_found("Object not found"));
+            }
+        }
+    } else {
+        authorize_download_in_transaction(
+            &mut transaction,
+            effective_user.as_ref(),
+            &authorized_object,
+            &user_mode,
+        )
+        .await?;
+    }
+    let object = load_object_for_update(&mut transaction, object_id).await?;
+    if !same_download_identity(&authorized_object, &object) || object.status != "ready" {
         return Err(ApiError::not_found("Object not found"));
     }
-    authorize_download(&state, user.as_ref(), &object).await?;
     let url = state.object_storage.get_url(
         &object.object_key,
         &object.original_filename,
@@ -551,6 +599,7 @@ pub(super) async fn download_grant(
     let expires_at = Utc::now()
         + ChronoDuration::from_std(state.object_storage.presign_ttl())
             .map_err(|_| ApiError::upstream("Download expiry is invalid"))?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(json!({
         "method": "GET",
         "url": url,
@@ -566,24 +615,7 @@ pub(super) async fn delete_object(
 ) -> Result<Response, ApiError> {
     let object = load_object(&state, object_id).await?;
     authorize_change(&state, user.id, &object).await?;
-    schedule_delete(&state, object.id, user.id).await?;
-    Ok(Json(Success::new(json!({"status": "deleting"}))).into_response())
-}
-
-pub(super) async fn delete(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    Path(file_id): Path<i32>,
-) -> Result<Response, ApiError> {
-    require_admin(&user)?;
-    let file = load_file_by_id(&state, file_id).await?;
-    let Some(object_id) = file.object_id else {
-        return Err(ApiError::conflict(
-            "Legacy filesystem objects are not supported",
-        ));
-    };
-    let object = load_object(&state, object_id).await?;
-    schedule_delete(&state, object.id, user.id).await?;
+    schedule_delete(&state, &object, &user).await?;
     Ok(Json(Success::new(json!({"status": "deleting"}))).into_response())
 }
 
@@ -675,16 +707,24 @@ async fn require_row(state: &AppState, table: &str, id: i32) -> Result<(), ApiEr
     }
 }
 
-async fn authorization_principal(
-    state: &AppState,
+async fn authorization_principal_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: &CurrentUser,
     purpose: Purpose,
+    user_mode: &str,
 ) -> Result<AuthorizationPrincipal, ApiError> {
     if purpose.is_asset() {
         return Ok(AuthorizationPrincipal::Target);
     }
-    if super::challenges::is_team_mode(state).await? {
-        if let Some(team_id) = user.team_id {
+    if user_mode == "teams" {
+        let team_id =
+            sqlx::query_scalar::<_, Option<i32>>("SELECT team_id FROM ctfzone.users WHERE id=$1")
+                .bind(user.id)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(ApiError::database)?
+                .flatten();
+        if let Some(team_id) = team_id {
             Ok(AuthorizationPrincipal::Team(team_id))
         } else if user.is_admin() {
             Ok(AuthorizationPrincipal::User(user.id))
@@ -695,6 +735,31 @@ async fn authorization_principal(
         }
     } else {
         Ok(AuthorizationPrincipal::User(user.id))
+    }
+}
+
+fn require_current_upload_principal(
+    object: &StoredObject,
+    principal: AuthorizationPrincipal,
+    actor_user_id: i32,
+) -> Result<(), ApiError> {
+    let current = match principal {
+        AuthorizationPrincipal::Target => object.authorization_scope == "target",
+        AuthorizationPrincipal::User(user_id) => {
+            object.authorization_scope == "user" && object.owner_user_id == Some(user_id)
+        }
+        AuthorizationPrincipal::Team(team_id) => {
+            object.authorization_scope == "team"
+                && object.owner_user_id == Some(actor_user_id)
+                && object.owner_team_id == Some(team_id)
+        }
+    };
+    if current {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "The upload was created for a previous competition mode",
+        ))
     }
 }
 
@@ -1033,12 +1098,22 @@ async fn copy_to_final_key(state: &AppState, object: &StoredObject) -> Result<()
 async fn fail_upload(
     state: &AppState,
     object: &StoredObject,
-    actor_user_id: i32,
+    user: &CurrentUser,
     reason: &str,
 ) -> Result<(), ApiError> {
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if is_competition_purpose(&object.purpose) {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
     let current = load_object_for_update(&mut transaction, object.id).await?;
-    authorize_change_in_transaction(&mut transaction, actor_user_id, &current).await?;
+    authorize_change_in_transaction(&mut transaction, user.id, &current).await?;
     if current.status != "pending" {
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok(());
@@ -1077,7 +1152,7 @@ async fn fail_upload(
         current.id,
         "upload_failed",
         "api",
-        Some(actor_user_id),
+        Some(user.id),
         json!({"reason": reason}),
     )
     .await?;
@@ -1086,12 +1161,22 @@ async fn fail_upload(
 
 async fn schedule_delete(
     state: &AppState,
-    object_id: Uuid,
-    actor_user_id: i32,
+    object: &StoredObject,
+    user: &CurrentUser,
 ) -> Result<(), ApiError> {
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    let current = load_object_for_update(&mut transaction, object_id).await?;
-    authorize_change_in_transaction(&mut transaction, actor_user_id, &current).await?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    if is_competition_purpose(&object.purpose) {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
+    let current = load_object_for_update(&mut transaction, object.id).await?;
+    authorize_change_in_transaction(&mut transaction, user.id, &current).await?;
     if current.status == "deleted" || current.status == "deleting" {
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok(());
@@ -1109,11 +1194,6 @@ async fn schedule_delete(
     .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
-    sqlx::query("DELETE FROM ctfzone.files WHERE object_id=$1")
-        .bind(current.id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?;
     sqlx::query(
         "UPDATE ctfzone.object_operations SET status='cancelled',completed_at=now() WHERE object_id=$1 AND status IN ('pending','claimed')",
     )
@@ -1135,7 +1215,7 @@ async fn schedule_delete(
         current.id,
         "delete_requested",
         "api",
-        Some(actor_user_id),
+        Some(user.id),
         json!({}),
     )
     .await?;
@@ -1172,38 +1252,6 @@ async fn enqueue_operation(
 
 fn staging_cleanup_at(upload_expires_at: DateTime<Utc>) -> DateTime<Utc> {
     upload_expires_at + ChronoDuration::seconds(5)
-}
-
-async fn associate_legacy_file(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    object: &StoredObject,
-) -> Result<(), ApiError> {
-    let file_type = match object.purpose.as_str() {
-        "challenge_asset" => Some("challenge"),
-        "page_asset" => Some("page"),
-        "solution_asset" => Some("solution"),
-        _ => None,
-    };
-    if let Some(file_type) = file_type {
-        sqlx::query(
-            r#"
-            INSERT INTO ctfzone.files
-                (type,location,sha1sum,challenge_id,page_id,solution_id,object_id)
-            SELECT $1,$2,NULL,$3,$4,$5,$6
-            WHERE NOT EXISTS (SELECT 1 FROM ctfzone.files WHERE object_id=$6)
-            "#,
-        )
-        .bind(file_type)
-        .bind(&object.object_key)
-        .bind(object.challenge_id)
-        .bind(object.page_id)
-        .bind(object.solution_id)
-        .bind(object.id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::database)?;
-    }
-    Ok(())
 }
 
 async fn insert_event(
@@ -1271,27 +1319,55 @@ async fn load_object_for_update(
     .ok_or_else(|| ApiError::not_found("Object not found"))
 }
 
-async fn authorize_download(
-    state: &AppState,
+async fn load_object_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    object_id: Uuid,
+) -> Result<StoredObject, ApiError> {
+    sqlx::query_as::<_, StoredObject>(
+        r#"
+        SELECT id,object_key,upload_key,purpose,status,authorization_scope,
+               owner_user_id,owner_team_id,
+               challenge_id,page_id,solution_id,original_filename,content_type,
+               expected_size,actual_size,expected_checksum,actual_checksum,
+               upload_expires_at,created_at,ready_at,revision
+        FROM ctfzone.stored_objects WHERE id=$1
+        "#,
+    )
+    .bind(object_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Object not found"))
+}
+
+async fn authorize_download_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: Option<&CurrentUser>,
     object: &StoredObject,
+    user_mode: &str,
 ) -> Result<(), ApiError> {
     match object.purpose.as_str() {
         "challenge_asset" => {
             let challenge_id = object
                 .challenge_id
                 .ok_or_else(|| ApiError::not_found("Object not found"))?;
-            super::challenges::require_full_challenge_access(state, user, challenge_id).await
+            lock_download_challenge(transaction, challenge_id).await?;
+            super::challenges::require_full_challenge_access_in_transaction(
+                transaction,
+                user,
+                challenge_id,
+            )
+            .await
         }
         "page_asset" => {
             let page_id = object
                 .page_id
                 .ok_or_else(|| ApiError::not_found("Object not found"))?;
             let (draft, hidden, auth_required) = sqlx::query_as::<_, (bool, bool, bool)>(
-                "SELECT COALESCE(draft,false),COALESCE(hidden,false),COALESCE(auth_required,false) FROM ctfzone.pages WHERE id=$1",
+                "SELECT COALESCE(draft,false),COALESCE(hidden,false),COALESCE(auth_required,false) FROM ctfzone.pages WHERE id=$1 FOR KEY SHARE",
             )
             .bind(page_id)
-            .fetch_optional(&state.database)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(ApiError::database)?
             .ok_or_else(|| ApiError::not_found("Object not found"))?;
@@ -1304,7 +1380,9 @@ async fn authorize_download(
                 Ok(())
             }
         }
-        "solution_asset" => authorize_solution_download(state, user, object).await,
+        "solution_asset" => {
+            authorize_solution_download_in_transaction(transaction, user, object, user_mode).await
+        }
         "submission" | "patch" | "program" | "pcap" | "result" => {
             let Some(user) = user else {
                 return Err(ApiError::not_found("Object not found"));
@@ -1329,26 +1407,34 @@ async fn authorize_download(
     }
 }
 
-async fn authorize_solution_download(
-    state: &AppState,
+async fn authorize_solution_download_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: Option<&CurrentUser>,
     object: &StoredObject,
+    user_mode: &str,
 ) -> Result<(), ApiError> {
     let solution_id = object
         .solution_id
         .ok_or_else(|| ApiError::not_found("Object not found"))?;
+    let expected_challenge_id = object
+        .challenge_id
+        .ok_or_else(|| ApiError::not_found("Object not found"))?;
+    lock_download_challenge(transaction, expected_challenge_id).await?;
     let (challenge_id, solution_state) = sqlx::query_as::<_, (i32, String)>(
-        "SELECT challenge_id,state FROM ctfzone.solutions WHERE id=$1",
+        "SELECT challenge_id,state FROM ctfzone.solutions WHERE id=$1 AND challenge_id=$2 FOR KEY SHARE",
     )
     .bind(solution_id)
-    .fetch_optional(&state.database)
+    .bind(expected_challenge_id)
+    .fetch_optional(&mut **transaction)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Object not found"))?;
-    if object.challenge_id != Some(challenge_id) {
-        return Err(ApiError::not_found("Object not found"));
-    }
-    super::challenges::require_full_challenge_access(state, user, challenge_id).await?;
+    super::challenges::require_full_challenge_access_in_transaction(
+        transaction,
+        user,
+        challenge_id,
+    )
+    .await?;
     let Some(user) = user else {
         return Err(ApiError::not_found("Object not found"));
     };
@@ -1358,7 +1444,7 @@ async fn authorize_solution_download(
     if solution_state == "visible" {
         return Ok(());
     }
-    let team_mode = super::challenges::is_team_mode(state).await?;
+    let team_mode = user_mode == "teams";
     let solved = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS(SELECT 1 FROM ctfzone.submissions s
@@ -1371,7 +1457,7 @@ async fn authorize_solution_download(
     .bind(team_mode)
     .bind(user.team_id)
     .bind(user.id)
-    .fetch_one(&state.database)
+    .fetch_one(&mut **transaction)
     .await
     .map_err(ApiError::database)?;
     if solution_state == "solved" && solved {
@@ -1379,6 +1465,33 @@ async fn authorize_solution_download(
     } else {
         Err(ApiError::not_found("Object not found"))
     }
+}
+
+async fn lock_download_challenge(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    challenge_id: i32,
+) -> Result<(), ApiError> {
+    sqlx::query_scalar::<_, i32>("SELECT id FROM ctfzone.challenges WHERE id=$1 FOR KEY SHARE")
+        .bind(challenge_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("Object not found"))?;
+    Ok(())
+}
+
+fn same_download_identity(left: &StoredObject, right: &StoredObject) -> bool {
+    left.id == right.id
+        && left.object_key == right.object_key
+        && left.purpose == right.purpose
+        && left.authorization_scope == right.authorization_scope
+        && left.owner_user_id == right.owner_user_id
+        && left.owner_team_id == right.owner_team_id
+        && left.challenge_id == right.challenge_id
+        && left.page_id == right.page_id
+        && left.solution_id == right.solution_id
+        && left.original_filename == right.original_filename
+        && left.content_type == right.content_type
 }
 
 async fn authorize_change(
@@ -1452,28 +1565,6 @@ fn mutation_scope_authorized(
         }
         _ => false,
     }
-}
-
-async fn load_file_by_id(state: &AppState, id: i32) -> Result<FileView, ApiError> {
-    sqlx::query_as::<_, FileView>(&file_select("WHERE files.id=$1"))
-        .bind(id)
-        .fetch_optional(&state.database)
-        .await
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::not_found("File not found"))
-}
-
-fn file_select(suffix: &str) -> String {
-    format!(
-        r#"
-        SELECT files.id,files.type AS file_type,files.location,files.sha1sum,
-               files.challenge_id,files.page_id,files.solution_id,files.object_id,
-               stored_objects.status AS object_status
-        FROM ctfzone.files
-        LEFT JOIN ctfzone.stored_objects ON stored_objects.id=files.object_id
-        {suffix}
-        "#
-    )
 }
 
 fn default_content_type() -> String {

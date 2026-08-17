@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import hmac
 import json
 import secrets
@@ -41,7 +44,6 @@ _REGISTRATION_ACCESS_MODES = {
     "access_code",
     "email_allowlist",
 }
-
 _RESPONSE_HEADERS = (
     "cache-control",
     "content-disposition",
@@ -185,8 +187,8 @@ def _normalize_bootstrap(data: Any, status: int = 200) -> dict[str, Any]:
         "name": site.get("name") or "CTFZone",
         "description": site.get("description") or "Capture the flag. Own the zone.",
         "user_mode": "teams" if site.get("user_mode") == "teams" else "users",
-        # Missing policy metadata from an older API must not expose a create
-        # action that the participant endpoint may reject.
+        # Invalid or missing policy metadata must not expose a create action
+        # that the participant endpoint may reject.
         "team_creation": site.get("team_creation") is True,
         "team_size": site.get("team_size")
         if isinstance(site.get("team_size"), int)
@@ -305,11 +307,20 @@ def _proxy(path: str) -> Response:
         request.method == "POST"
         and path == "/api/v1/users/me/verification-email"
     )
+    mode_transition = (
+        request.method == "POST"
+        and path == "/api/v1/configs/user-mode-transition"
+    ) or (
+        request.method == "GET"
+        and path == "/api/v1/views/admin/user-mode-transition"
+    )
     timeout_seconds = None
     if storage_completion:
         timeout_seconds = current_app.config["API_STORAGE_TIMEOUT_SECONDS"]
     elif email_delivery:
         timeout_seconds = current_app.config["API_EMAIL_TIMEOUT_SECONDS"]
+    elif mode_transition:
+        timeout_seconds = current_app.config["API_TRANSITION_TIMEOUT_SECONDS"]
     try:
         if timeout_seconds is None:
             upstream = _api().request_from_browser(
@@ -461,13 +472,6 @@ def login() -> Response | str:
         "login.html",
         **_page_context("login", error=_error_message(), next=request.args.get("next", "")),
     )
-
-
-@web.get("/admin/login")
-def admin_login_legacy() -> Response:
-    """Keep old bookmarks on the single player-frontend login surface."""
-
-    return redirect(url_for("web.login"), code=302)
 
 
 @web.route("/register", methods=["GET", "POST"])
@@ -865,14 +869,8 @@ def team_profile(team_id: int) -> Response | tuple[str, int] | str:
 @web.get("/rules")
 def rules() -> str:
     context = _page_context("rules")
-    page_data = None
-    for path in ("/api/v1/pages/by-route/rules", "/api/v1/pages/route/rules"):
-        status, value = _read_data(path, None)
-        if status < 400 and isinstance(value, dict):
-            page_data = value
-            break
-        if status != 404:
-            break
+    status, value = _read_data("/api/v1/pages/by-route/rules", None)
+    page_data = value if status < 400 and isinstance(value, dict) else None
     raw = page_data.get("content") if page_data else None
     if not raw:
         raw = (
@@ -1114,8 +1112,8 @@ def _normalize_configuration_catalog(value: Any) -> dict[str, Any]:
             danger = raw_setting.get("danger")
             if key == "user_mode" and not danger:
                 danger = (
-                    "Changing participant mode changes scoring ownership and account "
-                    "semantics. Only switch an event before participants or submissions exist."
+                    "Switching account mode requires a destructive transition that clears "
+                    "competition history. The exact impact is previewed before confirmation."
                 )
             if key == "player_frontend":
                 requested_frontend = typed_value
@@ -1186,8 +1184,8 @@ def _normalize_configuration_catalog(value: Any) -> dict[str, Any]:
         and isinstance(entry.get("id"), int)
         and isinstance(entry.get("email"), str)
     ]
-    # Defense in depth while older API versions still return an unbounded list.
-    # The current API applies the same cap before querying/serializing the view.
+    # Treat the internal response as untrusted input and cap it again before
+    # rendering. The API applies the same bound before serialization.
     preview_limit = 200
     declared_count = catalog.get("registration_email_count")
     registration_email_count = (
@@ -1224,7 +1222,6 @@ def admin_overview() -> Response | tuple[str, int] | str:
             "challenges": stats.get("challenges", 0),
             "users": stats.get("users", 0),
             "teams": stats.get("teams", 0),
-            "instances": stats.get("instances", 0),
         },
         recent_submissions=recent if isinstance(recent, list) else [],
         module_error=status >= 400,
@@ -1247,7 +1244,31 @@ def admin_challenge_new() -> Response | tuple[str, int] | str:
     context, gate = _admin_context("challenges", "New challenge")
     if gate:
         return gate
-    context.update(challenge=None, form_mode="create", module_error=False)
+    category_data, category_error = _admin_read(
+        "/api/v1/admin/challenge-categories", []
+    )
+    runtime_gate_data, runtime_gate_error = _admin_read(
+        "/api/v1/admin/runtime/settings/private-challenges", {}
+    )
+    categories = category_data if isinstance(category_data, list) else []
+    context.update(
+        challenge=None,
+        form_mode="create",
+        categories=[
+            category
+            for category in categories
+            if isinstance(category, dict)
+            and isinstance(category.get("id"), int)
+            and isinstance(category.get("name"), str)
+        ],
+        category_error=category_error,
+        private_challenge_gate_enabled=bool(
+            isinstance(runtime_gate_data, dict)
+            and runtime_gate_data.get("enabled") is True
+        ),
+        private_challenge_gate_error=runtime_gate_error,
+        module_error=False,
+    )
     return render_template("admin/challenge_form.html", **context)
 
 
@@ -1260,7 +1281,38 @@ def admin_challenge_edit(challenge_id: int) -> Response | tuple[str, int] | str:
     challenge = data if isinstance(data, dict) else None
     if not challenge and not error:
         abort(404)
-    context.update(challenge=challenge, form_mode="edit", module_error=error)
+    category_data, category_error = _admin_read(
+        "/api/v1/admin/challenge-categories", []
+    )
+    runtime_gate_data: Any = {}
+    runtime_gate_error = False
+    if (
+        challenge
+        and challenge.get("challenge_type") == "jeopardy"
+        and challenge.get("exposure") == "private"
+    ):
+        runtime_gate_data, runtime_gate_error = _admin_read(
+            "/api/v1/admin/runtime/settings/private-challenges", {}
+        )
+    categories = category_data if isinstance(category_data, list) else []
+    context.update(
+        challenge=challenge,
+        form_mode="edit",
+        categories=[
+            category
+            for category in categories
+            if isinstance(category, dict)
+            and isinstance(category.get("id"), int)
+            and isinstance(category.get("name"), str)
+        ],
+        category_error=category_error,
+        private_challenge_gate_enabled=bool(
+            isinstance(runtime_gate_data, dict)
+            and runtime_gate_data.get("enabled") is True
+        ),
+        private_challenge_gate_error=runtime_gate_error,
+        module_error=error,
+    )
     return render_template("admin/challenge_form.html", **context)
 
 
@@ -1281,26 +1333,251 @@ def admin_config() -> Response | tuple[str, int] | str:
     return render_template("admin/config.html", **context)
 
 
-@web.get("/admin/runtime")
-def admin_runtime() -> Response | tuple[str, int] | str:
-    context, gate = _admin_context("runtime", "Managed instances")
+def _normalize_ssh_public_key(value: Any) -> str | None:
+    """Accept only a canonical, single-line Ed25519 public key."""
+
+    if (
+        not isinstance(value, str)
+        or not (32 <= len(value) <= 1024)
+        or not value.isascii()
+    ):
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    fields = value.split()
+    if len(fields) != 2 or fields[0] != "ssh-ed25519":
+        return None
+    encoded = fields[1]
+    if len(encoded) > 256:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    expected_prefix = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
+    if len(decoded) != len(expected_prefix) + 32 or not decoded.startswith(expected_prefix):
+        return None
+    return f"ssh-ed25519 {encoded}"
+
+
+def _safe_ssh_fingerprint(value: Any) -> str | None:
+    """Accept the standard, bounded OpenSSH SHA-256 fingerprint form."""
+
+    if not isinstance(value, str) or not value.startswith("SHA256:"):
+        return None
+    encoded = value.removeprefix("SHA256:")
+    if len(encoded) != 43 or not encoded.isascii():
+        return None
+    if not all(character.isalnum() or character in "+/" for character in encoded):
+        return None
+    return value
+
+
+def _ssh_public_key_fingerprint(public_key: str | None) -> str | None:
+    """Derive the OpenSSH SHA-256 fingerprint from a normalized public key."""
+
+    if public_key is None:
+        return None
+    try:
+        decoded = base64.b64decode(public_key.split()[1], validate=True)
+    except (binascii.Error, IndexError, ValueError):
+        return None
+    digest = base64.b64encode(hashlib.sha256(decoded).digest()).decode("ascii")
+    return f"SHA256:{digest.rstrip('=')}"
+
+
+def _safe_ssh_timestamp(value: Any) -> str | None:
+    """Keep bounded ISO-like timestamps out of the generic host payload."""
+
+    if (
+        not isinstance(value, str)
+        or not (20 <= len(value) <= 40)
+        or not value.isascii()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
+def _normalize_ssh_host(value: Any) -> dict[str, Any] | None:
+    """Return only validated, public fields for the browser SSH console."""
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        host_id = str(UUID(str(value.get("id"))))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+    raw_name = value.get("name")
+    name_valid = (
+        isinstance(raw_name, str)
+        and 1 <= len(raw_name) <= 100
+        and raw_name.isascii()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in raw_name)
+    )
+    name = raw_name if name_valid else "invalid"
+    raw_hostname = value.get("hostname")
+    hostname_valid = (
+        isinstance(raw_hostname, str)
+        and 1 <= len(raw_hostname) <= 253
+        and raw_hostname.isascii()
+        and not raw_hostname.startswith("-")
+        and all(
+            character.isalnum() or character in ".:_-"
+            for character in raw_hostname
+        )
+    )
+    hostname = raw_hostname if hostname_valid else "invalid"
+    raw_ssh_user = value.get("ssh_user")
+    ssh_user_characters = (
+        list(raw_ssh_user) if isinstance(raw_ssh_user, str) else []
+    )
+    ssh_user_valid = (
+        isinstance(raw_ssh_user, str)
+        and 1 <= len(raw_ssh_user) <= 32
+        and raw_ssh_user.isascii()
+        and raw_ssh_user not in {"root", "toor"}
+        and (raw_ssh_user[0].islower() or raw_ssh_user[0] == "_")
+        and all(
+            character.islower() or character.isdigit() or character in "_-"
+            for character in ssh_user_characters[1:]
+        )
+    )
+    ssh_user = raw_ssh_user if ssh_user_valid else "invalid"
+    raw_port = value.get("ssh_port")
+    ssh_port_valid = (
+        isinstance(raw_port, int)
+        and not isinstance(raw_port, bool)
+        and 1 <= raw_port <= 65535
+    )
+    ssh_port = raw_port if ssh_port_valid else 0
+    target_valid = (
+        name_valid
+        and hostname_valid
+        and ssh_user_valid
+        and ssh_port_valid
+        and name == ssh_user
+    )
+
+    public_key = _normalize_ssh_public_key(value.get("ssh_public_key"))
+    access_key_fingerprint = _safe_ssh_fingerprint(value.get("ssh_key_fingerprint"))
+    key_states = {
+        "pending": "key_pending",
+        "ready": "key_ready",
+        "failed": "key_failed",
+    }
+    key_state = key_states.get(value.get("identity_state"), "unknown")
+    raw_key_error = value.get("identity_error_code")
+    key_error = None
+    if raw_key_error is not None:
+        key_error = (
+            raw_key_error
+            if isinstance(raw_key_error, str)
+            and 1 <= len(raw_key_error) <= 64
+            and raw_key_error.isascii()
+            and all(
+                character.islower()
+                or character.isdigit()
+                or character in "_-"
+                for character in raw_key_error
+            )
+            else "unknown_error"
+        )
+    raw_authorized_keys_line = value.get("authorized_keys_line")
+    authorized_keys_line = (
+        raw_authorized_keys_line
+        if public_key is not None
+        and raw_authorized_keys_line == f"restrict,pty {public_key}"
+        else None
+    )
+    key_ready = (
+        key_state == "key_ready"
+        and key_error is None
+        and public_key is not None
+        and access_key_fingerprint is not None
+        and access_key_fingerprint == _ssh_public_key_fingerprint(public_key)
+        and authorized_keys_line is not None
+        and target_valid
+    )
+
+    trusted_host_public_key = _normalize_ssh_public_key(
+        value.get("trusted_host_public_key")
+    )
+    trusted_host_key_fingerprint = _safe_ssh_fingerprint(
+        value.get("trusted_host_key_fingerprint")
+    )
+    host_key_states = {
+        "untrusted": "untrusted",
+        "candidate": "untrusted",
+        "trusted": "trusted",
+    }
+    host_key_state = host_key_states.get(value.get("host_key_state"), "untrusted")
+    host_key_trusted = (
+        host_key_state == "trusted"
+        and trusted_host_public_key is not None
+        and trusted_host_key_fingerprint is not None
+        and trusted_host_key_fingerprint
+        == _ssh_public_key_fingerprint(trusted_host_public_key)
+    )
+
+    raw_revision = value.get("revision")
+    revision = (
+        raw_revision
+        if isinstance(raw_revision, int)
+        and not isinstance(raw_revision, bool)
+        and raw_revision > 0
+        else 0
+    )
+    enabled = value.get("enabled") is True
+    connect_ready = key_ready and host_key_trusted and enabled
+    return {
+        "id": host_id,
+        "name": name,
+        "hostname": hostname,
+        "ssh_port": ssh_port,
+        "ssh_user": ssh_user,
+        "target_valid": target_valid,
+        "key_state": key_state,
+        "key_ready": key_ready,
+        "ssh_public_key": public_key,
+        "authorized_keys_line": authorized_keys_line,
+        "ssh_key_fingerprint": access_key_fingerprint,
+        "key_error": key_error,
+        "host_key_state": host_key_state,
+        "host_key_trusted": host_key_trusted,
+        "host_key_fingerprint": trusted_host_key_fingerprint,
+        "enabled": enabled,
+        "connect_ready": connect_ready,
+        "authorized_key_cleanup_required": value.get(
+            "authorized_key_cleanup_required"
+        )
+        is True,
+        "revision": revision,
+        "created_at": _safe_ssh_timestamp(value.get("created_at")),
+        "updated_at": _safe_ssh_timestamp(value.get("updated_at")),
+    }
+
+
+@web.get("/admin/machines")
+def admin_machines() -> Response | tuple[str, int] | str:
+    context, gate = _admin_context("machines", "SSH connections")
     if gate:
         return gate
-    setting, setting_error = _admin_read(
-        "/api/v1/admin/runtime/settings/private-challenges", {}
-    )
-    instance_data, instances_error = _admin_read(
-        "/api/v1/admin/runtime/instances?per_page=100", {}
-    )
-    servers, servers_error = _admin_read("/api/v1/admin/runtime/servers", [])
-    instances = instance_data.get("items", []) if isinstance(instance_data, dict) else []
-    context.update(
-        runtime_setting=setting if isinstance(setting, dict) else {},
-        instances=instances,
-        servers=servers if isinstance(servers, list) else [],
-        module_error=setting_error and instances_error and servers_error,
-    )
-    return render_template("admin/runtime.html", **context)
+    values, error = _admin_read("/api/v1/admin/ssh/hosts", [])
+    machines = []
+    if isinstance(values, list):
+        machines = [
+            machine
+            for value in values
+            if (machine := _normalize_ssh_host(value)) is not None
+        ]
+    context.update(machines=machines, module_error=error)
+    return render_template("admin/machines.html", **context)
 
 
 def _admin_records(
@@ -1411,23 +1688,6 @@ def admin_sessions() -> Response | tuple[str, int] | str:
     return render_template("admin/sessions.html", **context)
 
 
-@web.get("/admin/sessions")
-def admin_sessions_legacy() -> Response:
-    """Preserve bookmarks while avoiding stale permanent browser redirects."""
-
-    return redirect(url_for("web.admin_sessions"), code=302)
-
-
-@web.get("/admin/<path:legacy_path>")
-def admin_placeholder(legacy_path: str) -> Response | tuple[str, int] | str:
-    label = legacy_path.replace("-", " ").replace("_", " ").replace("/", " / ").title()
-    context, gate = _admin_context("placeholder", label or "Administration")
-    if gate:
-        return gate
-    context.update(legacy_path=legacy_path)
-    return render_template("admin/placeholder.html", **context)
-
-
 @web.route(
     "/bff/api/v1/", defaults={"subpath": ""},
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -1439,7 +1699,7 @@ def admin_placeholder(legacy_path: str) -> Response | tuple[str, int] | str:
 def api_proxy(subpath: str) -> Response:
     if (
         request.method == "POST"
-        and subpath in {"files", "storage/uploads"}
+        and subpath == "storage/uploads"
         and not request.is_json
     ):
         return (

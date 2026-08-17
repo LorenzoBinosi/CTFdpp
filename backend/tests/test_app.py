@@ -22,6 +22,8 @@ APP_CONFIG = {
     "SECRET_KEY": "test-only-browser-session-signing-key",
     "BACKEND_SERVICE_TOKEN": "test-backend-service-token",
     "OBJECT_STORAGE_PUBLIC_URL": "https://files.example.test",
+    "API_TRANSITION_TIMEOUT_SECONDS": 65,
+    "GUNICORN_WORKER_TIMEOUT_SECONDS": 75,
     "SESSION_COOKIE_SECURE": False,
 }
 
@@ -70,6 +72,11 @@ CHALLENGE_DETAIL = {
     "description": "Find **the flag** <script>bad()</script>",
     "value": 150,
     "category": "web",
+    "category_id": 2,
+    "challenge_type": "jeopardy",
+    "exposure": "private",
+    "attribution": "Alice and Bob",
+    "connection_info": None,
     "solves": 4,
     "solved_by_me": False,
     "tags": [{"value": "easy"}],
@@ -98,7 +105,7 @@ class FakeApi:
             "success": True,
             "data": {
                 "bootstrap": copy.deepcopy(self.bootstrap["data"]),
-                "stats": {"challenges": 1, "users": 1, "teams": 0, "instances": 1},
+                "stats": {"challenges": 1, "users": 1, "teams": 0},
                 "recent_submissions": [
                     {
                         "id": 91,
@@ -144,6 +151,23 @@ class FakeApi:
             "/api/v1/challenges?view=admin": (
                 200,
                 {"success": True, "data": copy.deepcopy(CHALLENGE_LIST)},
+            ),
+            "/api/v1/admin/challenge-categories": (
+                200,
+                {
+                    "success": True,
+                    "data": [
+                        {"id": 1, "name": "Crypto"},
+                        {"id": 2, "name": "Web"},
+                    ],
+                },
+            ),
+            "/api/v1/admin/runtime/settings/private-challenges": (
+                200,
+                {
+                    "success": True,
+                    "data": {"key": "private_challenges", "enabled": False, "revision": 1},
+                },
             ),
             "/api/v1/users?view=admin&per_page=50&page=1": (
                 200,
@@ -253,7 +277,6 @@ class FakeApi:
             "/api/v1/scoreboard": (200, {"success": True, "data": []}),
             "/api/v1/teams/me": (404, {"message": "No team"}),
             "/api/v1/pages/by-route/rules": (404, {"message": "Not found"}),
-            "/api/v1/pages/route/rules": (404, {"message": "Not found"}),
         }
         if responses:
             self.responses.update(copy.deepcopy(responses))
@@ -351,10 +374,9 @@ ADMIN_TEMPLATE_NAMES = (
     "users.html",
     "user_form.html",
     "config.html",
-    "runtime.html",
+    "machines.html",
     "records.html",
     "sessions.html",
-    "placeholder.html",
 )
 
 
@@ -365,7 +387,16 @@ def make_frontend_tree(root: Path, *identifiers: str) -> Path:
         (frontend_root / "admin" / "templates" / template).write_text(
             f"admin={template}", encoding="utf-8"
         )
-    for asset in ("css/admin.css", "js/admin.js"):
+    for asset in (
+        "css/admin.css",
+        "js/admin.js",
+        "vendor/xterm/xterm.css",
+        "vendor/xterm/xterm.js",
+        "vendor/xterm/addon-fit.js",
+        "vendor/xterm/LICENSE",
+        "vendor/xterm/LICENSE.addon-fit",
+        "vendor/xterm/VERSIONS",
+    ):
         target = frontend_root / "admin" / "static" / asset
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(asset, encoding="utf-8")
@@ -661,7 +692,7 @@ class AppTests(unittest.TestCase):
             "flag",
             "user",
             "team",
-            "server",
+            "machine",
             "settings",
         ):
             with self.subTest(icon=icon):
@@ -757,8 +788,40 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("<script>bad()", body)
         self.assertIn("&lt;script&gt;bad()&lt;/script&gt;", body)
         self.assertIn(f'content="{CSRF_TOKEN}"', body)
+        self.assertIn("data-flag-form", body)
+        self.assertIn('data-instance="true"', body)
+        self.assertNotIn("data-runtime-action", body)
         self.assertLessEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0][1], "/api/v1/views/challenges")
+
+    def test_private_instance_player_surface_remains_available(self):
+        frontend = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "player"
+            / "terminal"
+        )
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                frontend / "templates" / "challenges.html",
+                frontend / "templates" / "partials" / "challenge_panel.html",
+                frontend / "static" / "js" / "challenges.js",
+                frontend / "static" / "css" / "player.css",
+            )
+        )
+        for expected in (
+            "runtime_available",
+            "data-instance",
+            "data-runtime-action",
+            "runtime-card",
+            "/instance`",
+            "/api/v1/instances/",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, sources)
+        self.assertIn("data-flag-form", sources)
+        self.assertIn("data-unlock-hint", sources)
 
     def test_private_first_boot_board_preserves_setup_shell(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
@@ -846,6 +909,32 @@ class AppTests(unittest.TestCase):
             [("GET", "/api/v1/challenges/7", SESSION_ID)],
         )
 
+    def test_challenge_fragment_exposes_private_instance_launch_controls(self):
+        detail = copy.deepcopy(CHALLENGE_DETAIL)
+        detail["runtime"] = {
+            "available": True,
+            "config": {"allow_extension": True},
+            "instance": None,
+            "blocking_instance": None,
+        }
+        api = FakeApi(
+            responses={
+                "/api/v1/challenges/7": (
+                    200,
+                    {"success": True, "data": detail},
+                )
+            }
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+
+        body = client.get("/bff/fragments/challenges/7").get_data(as_text=True)
+
+        self.assertIn("PRIVATE INSTANCE — READY TO LAUNCH", body)
+        self.assertIn('data-runtime-action="start"', body)
+        self.assertIn('data-challenge-id="7"', body)
+        self.assertNotIn("Managed instances", body)
+
     def test_challenge_fragment_uses_explicit_page_frontend_not_session_theme(self):
         with tempfile.TemporaryDirectory() as temporary:
             frontend_root = make_frontend_tree(
@@ -911,6 +1000,108 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 403)
         self.assertEqual(cross_site.status_code, 403)
+
+    def test_inline_category_creation_uses_the_exact_authenticated_bff_path(self):
+        payload = {"name": "Web"}
+
+        response = self.client.post(
+            "/bff/api/v1/admin/challenge-categories",
+            data=json.dumps(payload),
+            content_type="application/json",
+            headers={
+                **unsafe_headers(),
+                "Idempotency-Key": "category-web-create",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.api.browser_request,
+            (
+                "POST",
+                "/api/v1/admin/challenge-categories",
+                json.dumps(payload).encode(),
+            ),
+        )
+        self.assertEqual(
+            self.api.calls[-1],
+            ("POST", "/api/v1/admin/challenge-categories", SESSION_ID),
+        )
+
+    def test_account_mode_transition_uses_the_authenticated_bff_channel(self):
+        payload = {
+            "target_mode": "teams",
+            "confirmation": "SWITCH TO TEAMS",
+            "preview_token": "signed-preview-token",
+        }
+
+        response = self.client.post(
+            "/bff/api/v1/configs/user-mode-transition",
+            data=json.dumps(payload),
+            content_type="application/json",
+            headers=unsafe_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.api.browser_request[0:2],
+            ("POST", "/api/v1/configs/user-mode-transition"),
+        )
+        self.assertEqual(json.loads(self.api.browser_request[2]), payload)
+        self.assertEqual(self.api.calls[-1][2], SESSION_ID)
+        self.assertEqual(self.api.browser_timeout, 65.0)
+
+        preview = self.client.get(
+            "/bff/api/v1/views/admin/user-mode-transition?target=teams"
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(
+            self.api.browser_request[0:2],
+            ("GET", "/api/v1/views/admin/user-mode-transition"),
+        )
+        self.assertEqual(self.api.browser_timeout, 65.0)
+
+    def test_transition_timeout_hierarchy_is_enforced_at_startup(self):
+        safe = create_app(
+            {
+                **APP_CONFIG,
+                "API_CLIENT": FakeApi(),
+                "API_TRANSITION_TIMEOUT_SECONDS": 64,
+                "GUNICORN_WORKER_TIMEOUT_SECONDS": 69,
+            }
+        )
+        self.assertEqual(safe.config["API_TRANSITION_TIMEOUT_SECONDS"], 64)
+        self.assertEqual(safe.config["GUNICORN_WORKER_TIMEOUT_SECONDS"], 69)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "API_TRANSITION_TIMEOUT_SECONDS must be at least 64"
+        ):
+            create_app(
+                {
+                    **APP_CONFIG,
+                    "API_CLIENT": FakeApi(),
+                    "API_TRANSITION_TIMEOUT_SECONDS": 63.9,
+                }
+            )
+        with self.assertRaisesRegex(
+            RuntimeError, "GUNICORN_WORKER_TIMEOUT_SECONDS must be at least 70"
+        ):
+            create_app(
+                {
+                    **APP_CONFIG,
+                    "API_CLIENT": FakeApi(),
+                    "API_TRANSITION_TIMEOUT_SECONDS": 65,
+                    "GUNICORN_WORKER_TIMEOUT_SECONDS": 69.9,
+                }
+            )
+        with self.assertRaisesRegex(RuntimeError, "positive finite number"):
+            create_app(
+                {
+                    **APP_CONFIG,
+                    "API_CLIENT": FakeApi(),
+                    "API_TRANSITION_TIMEOUT_SECONDS": float("nan"),
+                }
+            )
 
     def test_storage_upload_initiation_proxies_metadata_not_file_bytes(self):
         metadata = {
@@ -1139,13 +1330,11 @@ class AppTests(unittest.TestCase):
         self.assertEqual(location.path, "/login")
         self.assertFalse(location.query)
 
-    def test_legacy_admin_login_redirects_to_the_shared_login(self):
+    def test_removed_admin_compatibility_paths_return_not_found(self):
         client = self.client_for_role(None)
-        response = client.get("/admin/login?next=/admin/config")
-        self.assertEqual(response.status_code, 302)
-        location = urlsplit(response.headers["Location"])
-        self.assertEqual(location.path, "/login")
-        self.assertFalse(location.query)
+        for path in ("/admin/login", "/admin/sessions", "/admin/plugins/example"):
+            with self.subTest(path=path):
+                self.assertEqual(client.get(path).status_code, 404)
 
     def test_shared_login_posts_to_rust_contract(self):
         client = self.client_for_role(None)
@@ -1599,7 +1788,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("data-registration-allowlist", body)
         self.assertIn('data-depends-key="registration_access_mode"', body)
         self.assertIn('data-depends-values="[&quot;email_allowlist&quot;]"', body)
-        self.assertIn("Switching policies keeps these invitations.", body)
+        self.assertIn(
+            "Policy changes affect future registrations only; existing accounts and "
+            "these invitations are retained.",
+            body,
+        )
         self.assertIn("data-conditional-fieldset", body)
         self.assertLess(
             body.index('id="config-registration"'),
@@ -1626,7 +1819,13 @@ class AppTests(unittest.TestCase):
         for mode in ("open", "domain_rules", "access_code", "email_allowlist"):
             self.assertIn(f'data-registration-policy="{mode}"', body)
         self.assertIn(
-            "Changing policy does not erase the saved code, domain rules, or email invitations.",
+            "Policy changes affect future registrations only. Existing accounts remain "
+            "unchanged, and saved access codes, domain rules, and email invitations are retained.",
+            body,
+        )
+        self.assertIn(
+            "Only exact invited email addresses can register; invitations bypass the "
+            "participant limit.",
             body,
         )
         self.assertIn("All policy editors are shown because JavaScript is unavailable.", body)
@@ -1680,20 +1879,24 @@ class AppTests(unittest.TestCase):
             '.config-section[data-config-section-id="accounts"] .config-setting-list',
             stylesheet,
         )
+        self.assertIn(
+            ".config-setting-notices { display: grid; grid-column: 1 / -1;",
+            stylesheet,
+        )
 
     def test_accounts_and_registration_use_api_owned_groups_in_one_atomic_section(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
         bootstrap["data"]["user"]["type"] = "admin"
         groups = [
             {
-                "id": "account_type",
-                "title": "Account type",
-                "description": "Choose the event participant model.",
-            },
-            {
                 "id": "participant_accounts",
                 "title": "Participant accounts",
                 "description": "Policies shared by both account models.",
+            },
+            {
+                "id": "account_type",
+                "title": "Account type",
+                "description": "Choose the event participant model.",
             },
             {
                 "id": "team_accounts",
@@ -1718,6 +1921,10 @@ class AppTests(unittest.TestCase):
             }
 
         settings = [
+            setting("num_users", "participant_accounts"),
+            setting("password_min_length", "participant_accounts", effective=12),
+            setting("name_changes", "participant_accounts", "boolean", True),
+            setting("verify_emails", "participant_accounts", "boolean", False),
             setting(
                 "user_mode",
                 "account_type",
@@ -1728,11 +1935,9 @@ class AppTests(unittest.TestCase):
                     {"value": "users", "label": "Individual users"},
                     {"value": "teams", "label": "Teams"},
                 ],
+                warning="Mode changes never erase records.",
+                danger="Switching changes score ownership and participant workflows.",
             ),
-            setting("num_users", "participant_accounts"),
-            setting("password_min_length", "participant_accounts", effective=12),
-            setting("name_changes", "participant_accounts", "boolean", True),
-            setting("verify_emails", "participant_accounts", "boolean", False),
             setting(
                 "team_creation",
                 "team_accounts",
@@ -1813,8 +2018,16 @@ class AppTests(unittest.TestCase):
         self.assertEqual(body.count("data-config-section data-config-section-id="), 1)
         group_positions = [body.index(f'data-config-group="{group["id"]}"') for group in groups]
         self.assertEqual(group_positions, sorted(group_positions))
-        self.assertLess(body.index('data-config-key="user_mode"'), body.index('data-config-key="num_users"'))
+        self.assertLess(body.index('data-config-key="num_users"'), body.index('data-config-key="user_mode"'))
         self.assertLess(body.index('data-config-key="team_creation"'), body.index('data-config-key="registration_visibility"'))
+        user_mode_start = body.index('data-config-key="user_mode"')
+        user_mode_control = body.index('id="config-accounts-user_mode"', user_mode_start)
+        user_mode_notices = body.index('class="config-setting-notices"', user_mode_start)
+        user_mode_warning = body.index('class="config-warning"', user_mode_notices)
+        user_mode_danger = body.index('class="config-danger"', user_mode_notices)
+        self.assertLess(user_mode_control, user_mode_notices)
+        self.assertLess(user_mode_notices, user_mode_warning)
+        self.assertLess(user_mode_warning, user_mode_danger)
         team_group = body[body.index('data-config-group="team_accounts"'):]
         self.assertIn('data-depends-key="user_mode"', team_group)
         self.assertIn('data-depends-values="[&#34;teams&#34;]"', team_group)
@@ -1824,6 +2037,18 @@ class AppTests(unittest.TestCase):
         self.assertLess(form_end, allowlist_start)
         self.assertNotIn("<form", body[form_start + 1:form_end])
         self.assertLess(body.index('data-config-key="registration_access_mode"'), allowlist_start)
+        self.assertIn("data-user-mode-input", body)
+        self.assertIn("data-user-mode-transition-dialog", body)
+        self.assertIn('aria-labelledby="user-mode-transition-title"', body)
+        self.assertIn("DESTRUCTIVE ACCOUNT TRANSITION", body)
+        self.assertIn("data-user-mode-transition-counts", body)
+        self.assertIn("data-user-mode-transition-blockers", body)
+        self.assertIn("data-user-mode-transition-logic-warning", body)
+        self.assertIn("data-user-mode-transition-confirmation-input", body)
+        self.assertIn("Backup guidance", body)
+        self.assertNotIn("Review managed instances", body)
+        self.assertNotIn("data-user-mode-runtime-link", body)
+        self.assertIn("This transition changes only the account mode.", body)
 
         script = (
             Path(ctfzone_web.__file__).parent
@@ -1833,8 +2058,50 @@ class AppTests(unittest.TestCase):
             / "js"
             / "admin.js"
         ).read_text(encoding="utf-8")
-        self.assertIn('["registration", "accounts"]', script)
+        self.assertIn("Active private instances (must be stopped)", script)
         self.assertIn('document.querySelectorAll("[data-config-group]")', script)
+        self.assertIn(
+            "`/api/v1/views/admin/user-mode-transition?${parameters}`",
+            script,
+        )
+        self.assertIn(
+            'await apiRequest("/api/v1/configs/user-mode-transition", {',
+            script,
+        )
+        self.assertIn('if (Object.hasOwn(payload, "user_mode")) {', script)
+        self.assertIn("openUserModeTransition(section, payload.user_mode);", script)
+        self.assertIn("if (userModeDirty && (anotherInputDirty || anotherSecretDirty))", script)
+        self.assertIn("Switch account mode separately. Revert to the current mode", script)
+        self.assertNotIn("remainingPayload", script)
+        self.assertIn('if (error.status === 409) {', script)
+        self.assertIn('confirmation: userModeDialogInput.value', script)
+        self.assertIn('preview_token: preview.preview_token', script)
+        self.assertIn('team_logic_challenges: "Team-specific challenge definitions preserved"', script)
+        self.assertIn('memberships: "Team memberships removed"', script)
+        self.assertIn(
+            'user_objects: "Participant competition-object records matched"',
+            script,
+        )
+        self.assertIn(
+            'team_objects: "Team-owned object records matched (teams removed)"',
+            script,
+        )
+        self.assertNotIn("transition.current_session_revoked", script)
+        self.assertIn(
+            'participants: "Participant credentials rotated (accounts preserved)"',
+            script,
+        )
+
+        stylesheet = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "admin"
+            / "static"
+            / "css"
+            / "admin.css"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".user-mode-transition-dialog::backdrop", stylesheet)
+        self.assertIn(".user-mode-transition-logic-warning[hidden]", stylesheet)
 
     def test_admin_configuration_preserves_types_dependencies_and_secrets(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
@@ -1980,7 +2247,7 @@ class AppTests(unittest.TestCase):
         self.assertIn('input.dataset.forceDirty === "true"', script)
         self.assertIn("delete input.dataset.forceDirty", script)
 
-    def test_configuration_caps_legacy_unbounded_allowlist_previews(self):
+    def test_configuration_caps_unbounded_allowlist_previews(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
         bootstrap["data"]["user"]["type"] = "admin"
         entries = [
@@ -2048,12 +2315,242 @@ class AppTests(unittest.TestCase):
         self.assertNotIn('startsWith("x-amz-")', source)
         self.assertNotIn("FormData", source)
 
-    def test_unknown_legacy_admin_path_uses_placeholder_shell(self):
-        response = self.client_for_role("admin").get("/admin/plugins/example")
+    def test_admin_new_challenge_is_an_accessible_five_step_jeopardy_wizard(self):
+        client = self.client_for_role("admin")
+        client.fake_api.calls.clear()
+        response = client.get("/admin/challenges/new")
         body = response.get_data(as_text=True)
+
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Plugins / Example", body)
-        self.assertIn('href="/admin"', body)
+        self.assertIn("admin-challenge-form admin-challenge-wizard", body)
+        self.assertEqual(body.count('data-wizard-step="'), 5)
+        self.assertIn('aria-label="Challenge creation progress"', body)
+        self.assertIn('aria-live="polite">Step 1 of 5', body)
+        self.assertLess(body.index("Details</strong>"), body.index("Flag</strong>"))
+        self.assertLess(body.index("Flag</strong>"), body.index("Connection</strong>"))
+        self.assertLess(body.index('id="challenge-step-3"'), body.index('id="challenge-step-4"'))
+        self.assertLess(body.index('id="challenge-step-4"'), body.index('id="challenge-step-5"'))
+        self.assertIn('name="challenge_type" value="jeopardy" required', body)
+        for challenge_type in ("attack_defense", "speed_run", "king_of_the_hill"):
+            self.assertRegex(
+                body,
+                rf'name="challenge_type" value="{challenge_type}" disabled',
+            )
+        self.assertIn('name="exposure" value="public" required', body)
+        self.assertIn('name="exposure" value="private" required', body)
+        self.assertNotIn('name="public_url"', body)
+        self.assertIn('name="connection_info"', body)
+        self.assertIn("it does not have to be a URL", body)
+        self.assertIn("Leave blank if the description already explains", body)
+        self.assertIn('name="attribution"', body)
+        self.assertIn("Author(s) / attribution", body)
+        self.assertIn("Markdown + safe HTML", body)
+        self.assertIn("Controller deployment", body)
+        self.assertIn("Private challenge launches are disabled globally", body)
+        self.assertIn('name="enable_global_gate" type="checkbox" disabled', body)
+        self.assertIn("This affects every enabled private challenge", body)
+        self.assertIn("{{RANDOM_TOKEN}}", body.replace("&#123;", "{").replace("&#125;", "}"))
+        self.assertIn('name="leet_variation" type="checkbox"', body)
+        self.assertIn('name="accept_other_users" type="checkbox" disabled', body)
+        self.assertIn('maxlength="512"', body)
+        self.assertIn('name="category_id" required data-category-select', body)
+        self.assertIn('<option value="2">Web</option>', body)
+        self.assertIn("data-category-dialog", body)
+        self.assertEqual(
+            [call[1] for call in client.fake_api.calls],
+            [
+                "/api/v1/bootstrap",
+                "/api/v1/admin/challenge-categories",
+                "/api/v1/admin/runtime/settings/private-challenges",
+            ],
+        )
+
+    def test_admin_challenge_wizard_uses_atomic_create_and_inline_categories(self):
+        static_root = (
+            Path(ctfzone_web.__file__).parent / "frontends" / "admin" / "static"
+        )
+        source = (static_root / "js" / "admin.js").read_text(encoding="utf-8")
+        styles = (static_root / "css" / "admin.css").read_text(encoding="utf-8")
+
+        self.assertIn('apiRequest("/api/v1/admin/challenge-categories"', source)
+        self.assertIn("payload.flag = createFlagPayload()", source)
+        self.assertIn("payload.runtime = createRuntimePayload()", source)
+        self.assertIn("connection_info: challengeForm.elements.connection_info", source)
+        self.assertIn("attribution: challengeForm.elements.attribution", source)
+        self.assertNotIn("payload.public_url", source)
+        self.assertIn("enable_global_gate", source)
+        self.assertIn("Enable private challenge launches globally", source)
+        self.assertIn('const randomTokenPlaceholder = "{{RANDOM_TOKEN}}"', source)
+        self.assertIn("const leetScope = template =>", source)
+        self.assertIn("const isTokenIndex = index =>", source)
+        self.assertIn('template[index] === "{" && !isTokenIndex(index)', source)
+        self.assertIn('template[index] === "}" && !isTokenIndex(index)', source)
+        self.assertIn("template.startsWith(randomTokenPlaceholder, cursor)", source)
+        self.assertIn("cursor >= scope.start && cursor < scope.end", source)
+        self.assertIn("accept_other_users", source)
+        self.assertIn("flagByteLength", source)
+        self.assertIn("renderedBytes > 512", source)
+        self.assertIn("Finite capacity", source)
+        self.assertIn("challengeCreateStorageKey", source)
+        self.assertIn("headers: mode === \"create\" ? challengeCreateHeaders", source)
+        self.assertIn("categoryCreateHeaders.get(categoryKey)", source)
+        self.assertIn('payload.logic = "any"', source)
+        self.assertNotIn('logic: "any",', source)
+        self.assertIn('payload.state = "hidden"', source)
+        self.assertIn("body: { state: stagedDesiredState }", source)
+        self.assertIn("It remains hidden until you retry.", source)
+        self.assertNotIn('apiRequest("/api/v1/flags"', source)
+        self.assertNotIn("/api/v1/admin/challenges/${challengeId}/runtime", source)
+        self.assertIn(".admin-challenge-form { max-width: 1440px; }", styles)
+        self.assertIn("@media (max-width: 680px)", styles)
+
+    def test_admin_challenge_wizard_matches_generated_flag_placeholder_rules(self):
+        source = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "admin"
+            / "static"
+            / "js"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("const hasUnsupportedGeneratedPlaceholder = value =>", source)
+        self.assertIn('withoutRandomToken.includes("{{")', source)
+        self.assertIn('withoutRandomToken.includes("}}")', source)
+        self.assertIn(
+            "Generated flags support only the exact {{RANDOM_TOKEN}} placeholder.",
+            source,
+        )
+        self.assertIn(
+            "Random tokens are not available for regular expression flags.",
+            source,
+        )
+        self.assertIn('exposureValue() === "public" && count > 0', source)
+        self.assertIn("privateExact && leet && eligible > 62", source)
+        self.assertNotIn("privateExact && eligible > 62", source)
+
+    def test_admin_challenge_wizard_reflects_an_enabled_private_runtime_gate(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["user"]["type"] = "admin"
+        api = FakeApi(
+            bootstrap=bootstrap,
+            responses={
+                "/api/v1/admin/runtime/settings/private-challenges": (
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "key": "private_challenges",
+                            "enabled": True,
+                            "revision": 2,
+                        },
+                    },
+                )
+            }
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+        body = client.get("/admin/challenges/new").get_data(as_text=True)
+        self.assertIn("Private challenge launches are enabled globally", body)
+        self.assertIn('data-global-gate-enabled="true"', body)
+        self.assertNotIn('name="enable_global_gate"', body)
+
+    def test_admin_challenge_editor_uses_the_precreated_category_catalog(self):
+        client = self.client_for_role("admin")
+        body = client.get("/admin/challenges/7").get_data(as_text=True)
+        self.assertIn('name="category_id" required data-category-select', body)
+        self.assertIn('<option value="2" selected>Web</option>', body)
+        self.assertNotIn('name="category"', body)
+        self.assertEqual(body.count('name="name"'), 1)
+        self.assertIn('name="attribution"', body)
+        self.assertIn('name="connection_info"', body)
+        self.assertNotIn('name="public_url"', body)
+
+    def test_admin_private_challenge_editor_can_enable_launches_when_publishing(self):
+        client = self.client_for_role("admin")
+        client.fake_api.calls.clear()
+        body = client.get("/admin/challenges/7").get_data(as_text=True)
+
+        self.assertIn("Launch availability", body)
+        self.assertIn('data-private-edit-gate data-global-gate-enabled="false"', body)
+        self.assertIn('name="enable_global_gate" type="checkbox"', body)
+        self.assertIn("keeps this challenge's saved managed-runtime configuration unchanged", body)
+        self.assertIn(
+            "/api/v1/admin/runtime/settings/private-challenges",
+            [call[1] for call in client.fake_api.calls],
+        )
+
+        source = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "admin"
+            / "static"
+            / "js"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("const syncPrivateEditGate = () =>", source)
+        self.assertIn("payload.enable_global_gate = true", source)
+        self.assertIn("challengeForm.elements.enable_global_gate?.checked", source)
+
+    def test_admin_private_challenge_editor_reflects_enabled_gate(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["user"]["type"] = "admin"
+        api = FakeApi(
+            bootstrap=bootstrap,
+            responses={
+                "/api/v1/admin/runtime/settings/private-challenges": (
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "key": "private_challenges",
+                            "enabled": True,
+                            "revision": 2,
+                        },
+                    },
+                )
+            }
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+        body = client.get("/admin/challenges/7").get_data(as_text=True)
+
+        self.assertIn('data-private-edit-gate data-global-gate-enabled="true"', body)
+        self.assertIn("Private challenge launches are enabled globally", body)
+        self.assertNotIn('name="enable_global_gate"', body)
+
+    def test_admin_public_challenge_editor_omits_private_gate_controls(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["user"]["type"] = "admin"
+        public_challenge = copy.deepcopy(CHALLENGE_DETAIL)
+        public_challenge.update(
+            exposure="public",
+            connection_info="https://challenge.example.test",
+        )
+        api = FakeApi(
+            bootstrap=bootstrap,
+            responses={
+                "/api/v1/challenges/7": (
+                    200,
+                    {"success": True, "data": public_challenge},
+                )
+            }
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+        api.calls.clear()
+        body = client.get("/admin/challenges/7").get_data(as_text=True)
+
+        self.assertNotIn("data-private-edit-gate", body)
+        self.assertNotIn('name="enable_global_gate"', body)
+        self.assertNotIn(
+            "/api/v1/admin/runtime/settings/private-challenges",
+            [call[1] for call in api.calls],
+        )
+
+    def test_unknown_admin_path_returns_not_found(self):
+        response = self.client_for_role("admin").get("/admin/plugins/example")
+        self.assertEqual(response.status_code, 404)
 
     def test_admin_modules_have_a_renderable_minimum_surface(self):
         client = self.client_for_role("admin")
@@ -2061,7 +2558,7 @@ class AppTests(unittest.TestCase):
             "/admin/challenges/new",
             "/admin/challenges/7",
             "/admin/config",
-            "/admin/runtime",
+            "/admin/machines",
             "/admin/users",
             "/admin/users/1",
             "/admin/teams",
@@ -2075,6 +2572,344 @@ class AppTests(unittest.TestCase):
                 self.assertIn('<aside class="admin-sidebar" data-admin-sidebar>', body)
                 self.assertIn('id="main-content"', body)
                 self.assertIn('/assets/admin/css/admin.css', body)
+
+    @staticmethod
+    def _ssh_host(**overrides):
+        host_id = "22222222-2222-4222-8222-222222222222"
+        encoded_key = (
+            "AAAAC3NzaC1lZDI1NTE5AAAAI"
+            "FQKjN4PvEJOJfFjWmoXwZf4IpLVhuxTRQ6P3qA6zP1x"
+        )
+        host_encoded_key = (
+            "AAAAC3NzaC1lZDI1NTE5AAAAI"
+            "AABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+        )
+        public_key = f"ssh-ed25519 {encoded_key}"
+        host = {
+            "id": host_id,
+            "name": "tecnico",
+            "hostname": "server.example.test",
+            "ssh_port": 2222,
+            "ssh_user": "tecnico",
+            "enabled": True,
+            "identity_state": "ready",
+            "ssh_public_key": public_key,
+            "ssh_key_fingerprint": "SHA256:YkUYtsxBh/wrTEbudRueV4FaST2GdYFJ4iUwjZwoVVw",
+            "authorized_keys_line": f"restrict,pty {public_key}",
+            "key_generated_at": "2026-08-17T09:00:00Z",
+            "identity_error_code": None,
+            "host_key_state": "trusted",
+            "trusted_host_public_key": f"ssh-ed25519 {host_encoded_key}",
+            "trusted_host_key_fingerprint": "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA",
+            "host_key_trusted_at": "2026-08-17T09:05:00Z",
+            "host_key_candidates": [],
+            "authorized_key_cleanup_required": False,
+            "active_session_count": 0,
+            "revision": 3,
+            "created_at": "2026-08-17T08:55:00Z",
+            "updated_at": "2026-08-17T09:05:00Z",
+        }
+        host.update(overrides)
+        return host
+
+    def _render_ssh_hosts(self, *hosts):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["user"]["type"] = "admin"
+        api = FakeApi(
+            bootstrap=bootstrap,
+            responses={
+                "/api/v1/admin/ssh/hosts": (
+                    200,
+                    {"success": True, "data": list(hosts)},
+                )
+            },
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+        response = client.get("/admin/machines")
+        return response, response.get_data(as_text=True), api
+
+    def test_admin_machines_renders_shell_host_without_runtime_or_private_material(self):
+        host = self._ssh_host(
+            ssh_private_key="NEVER-RENDER-THIS",
+            identity_file="/run/secrets/private-identity",
+            helper_path="/usr/local/libexec/ctfzone-runtime-helper",
+            pool="legacy",
+            capacity=100,
+        )
+        response, body, api = self._render_ssh_hosts(host)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data-admin-module="machines"', body)
+        self.assertIn("SSH connections", body)
+        self.assertIn("Existing SSH user", body)
+        self.assertIn("real shell with the selected account's full permissions", body)
+        self.assertIn("it is not read-only", body)
+        self.assertIn('pattern="[a-z_][a-z0-9_-]{0,31}"', body)
+        self.assertIn("tecnico@server.example.test:2222", body)
+        self.assertIn(host["authorized_keys_line"], body)
+        self.assertIn("Copy authorized_keys line", body)
+        self.assertNotIn("Copy public key", body)
+        self.assertIn("It permits a shell and PTY", body)
+        self.assertIn("SSH forwarding disabled", body)
+        self.assertIn('data-probe-machine="22222222-2222-4222-8222-222222222222"', body)
+        self.assertRegex(
+            body,
+            r'data-connect-machine="22222222-2222-4222-8222-222222222222"(?![^>]*disabled)',
+        )
+        self.assertIn("Compare host key", body)
+        self.assertIn("separate trusted channel", body)
+        self.assertIn("Interactive SSH terminal", body)
+        self.assertIn("/assets/admin/vendor/xterm/xterm.css", body)
+        self.assertIn("/assets/admin/vendor/xterm/xterm.js", body)
+        self.assertIn("/assets/admin/vendor/xterm/addon-fit.js", body)
+        self.assertNotIn("NEVER-RENDER-THIS", body)
+        self.assertNotIn("/run/secrets/private-identity", body)
+        self.assertNotIn("runtime-helper", body)
+        self.assertNotIn("ssh-dispatch", body)
+        self.assertNotIn("Scheduling settings", body)
+        self.assertNotIn("Pool legacy", body)
+        self.assertNotIn("capacity 100", body)
+        self.assertNotIn("Workloads", body)
+        self.assertIn(("GET", "/api/v1/admin/ssh/hosts", SESSION_ID), api.calls)
+        self.assertFalse(
+            any(call[1] == "/api/v1/admin/runtime/servers" for call in api.calls)
+        )
+
+    def test_admin_machines_preserves_supported_safe_hostname_forms(self):
+        for index, hostname in enumerate(
+            ("ssh_host.internal", "host.example.", "host..example"), start=1
+        ):
+            with self.subTest(hostname=hostname):
+                host_id = f"22222222-2222-4222-8222-{index:012d}"
+                _, body, _api = self._render_ssh_hosts(
+                    self._ssh_host(id=host_id, hostname=hostname)
+                )
+                self.assertIn(f"tecnico@{hostname}:2222", body)
+                self.assertIn(f'data-machine-host="{hostname}"', body)
+                self.assertIn(f'data-connect-machine="{host_id}"', body)
+                self.assertNotIn("Connection record is invalid", body)
+
+    def test_admin_machines_requires_key_readiness_and_explicit_host_trust(self):
+        pending = self._ssh_host(
+            id="33333333-3333-4333-8333-333333333333",
+            name="pending_user",
+            ssh_user="pending_user",
+            identity_state="pending",
+            ssh_public_key=None,
+            ssh_key_fingerprint=None,
+            authorized_keys_line=None,
+            enabled=False,
+            host_key_state="untrusted",
+            trusted_host_public_key=None,
+            trusted_host_key_fingerprint=None,
+        )
+        untrusted = self._ssh_host(
+            id="44444444-4444-4444-8444-444444444444",
+            name="untrusted_user",
+            ssh_user="untrusted_user",
+            enabled=False,
+            host_key_state="candidate",
+            trusted_host_public_key=None,
+            trusted_host_key_fingerprint=None,
+            authorized_key_cleanup_required=True,
+        )
+        _, body, _api = self._render_ssh_hosts(pending, untrusted)
+
+        self.assertIn("Preparing access key", body)
+        self.assertIn("data-machine-refresh", body)
+        pending_card = body.split('data-machine-card="33333333-3333-4333-8333-333333333333"', 1)[1].split("</article>", 1)[0]
+        self.assertNotIn("data-probe-machine", pending_card)
+        self.assertNotIn("data-connect-machine", pending_card)
+
+        untrusted_card = body.split('data-machine-card="44444444-4444-4444-8444-444444444444"', 1)[1].split("</article>", 1)[0]
+        self.assertIn("Host identity unverified", untrusted_card)
+        self.assertIn("Inspect host key", untrusted_card)
+        self.assertRegex(untrusted_card, r"data-connect-machine=[^>]+disabled")
+        self.assertIn("Authorized-key cleanup required", untrusted_card)
+        self.assertIn("previous restricted key line", untrusted_card)
+        self.assertIn("data-host-key-confirm", body)
+        self.assertRegex(body, r"data-host-key-trust disabled")
+
+    def test_admin_machines_fails_closed_for_malformed_public_records(self):
+        valid = self._ssh_host()
+        malformed_hosts = (
+            self._ssh_host(
+                id="55555555-5555-4555-8555-555555555551",
+                authorized_keys_line=f'command="/bin/sh" {valid["ssh_public_key"]}',
+            ),
+            self._ssh_host(
+                id="55555555-5555-4555-8555-555555555552",
+                name="root",
+                ssh_user="root",
+            ),
+            self._ssh_host(
+                id="55555555-5555-4555-8555-555555555553",
+                ssh_key_fingerprint="SHA256:not-a-real-fingerprint",
+            ),
+            self._ssh_host(
+                id="55555555-5555-4555-8555-555555555554",
+                ssh_public_key="ssh-ed25519 invalid command-injection-marker",
+            ),
+        )
+
+        for malformed in malformed_hosts:
+            with self.subTest(host_id=malformed["id"]):
+                _, body, _api = self._render_ssh_hosts(malformed)
+                self.assertNotIn("data-machine-authorized-line", body)
+                self.assertNotIn("data-probe-machine", body)
+                self.assertNotIn("data-connect-machine", body)
+                self.assertNotIn("command-injection-marker", body)
+                self.assertNotIn('command="/bin/sh"', body)
+                self.assertTrue(
+                    "Connection record is invalid" in body
+                    or "Access setup incomplete" in body
+                )
+
+    def test_admin_machines_disables_connect_when_api_has_not_enabled_host(self):
+        _, body, _api = self._render_ssh_hosts(self._ssh_host(enabled=False))
+        self.assertIn("Host identity trusted", body)
+        self.assertIn("Inspect again", body)
+        self.assertRegex(body, r"data-connect-machine=[^>]+disabled")
+
+        _, inconsistent_body, _api = self._render_ssh_hosts(
+            self._ssh_host(trusted_host_key_fingerprint=f"SHA256:{'C' * 43}")
+        )
+        self.assertIn("Host identity unverified", inconsistent_body)
+        self.assertIn("Inspect host key", inconsistent_body)
+        self.assertRegex(inconsistent_body, r"data-connect-machine=[^>]+disabled")
+
+    def test_admin_machines_empty_state_is_about_browser_ssh(self):
+        _, body, _api = self._render_ssh_hosts()
+        self.assertIn("No SSH connections registered", body)
+        self.assertIn("existing SSH account", body)
+        self.assertNotIn("restricted command helper", body)
+        self.assertNotIn("controller", body.lower())
+
+    def test_admin_runtime_inventory_surface_is_removed(self):
+        client = self.client_for_role("admin")
+        response = client.get("/admin/runtime")
+        templates = Path(ctfzone_web.__file__).parent / "frontends" / "admin" / "templates"
+        script = templates.parent / "static" / "js" / "admin.js"
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse((templates / "runtime.html").exists())
+        self.assertFalse((templates / "placeholder.html").exists())
+        source = script.read_text(encoding="utf-8")
+        self.assertNotIn("/api/v1/admin/runtime/settings/private-challenges", source)
+        self.assertNotIn("/api/v1/admin/runtime/instances/", source)
+        self.assertNotIn("data-runtime-setting", source)
+        self.assertNotIn("data-reconcile-instance", source)
+        self.assertNotIn("data-terminate-instance", source)
+        self.assertFalse(
+            any(call[1].startswith("/api/v1/admin/runtime/") for call in client.fake_api.calls)
+        )
+
+    def test_browser_ssh_script_uses_tickets_trust_and_bounded_binary_frames(self):
+        source = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "admin"
+            / "static"
+            / "js"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+        ssh_source = source.split("const machineEnrollmentForm", 1)[1]
+
+        self.assertIn('apiRequest("/api/v1/admin/ssh/hosts"', source)
+        self.assertIn("name: sshUser", source)
+        self.assertIn("ssh_port: Number(machineEnrollmentForm.elements.ssh_port.value)", source)
+        self.assertIn("/^[a-z_][a-z0-9_-]{0,31}$/.test(sshUser)", source)
+        self.assertIn('["root", "toor"].includes(sshUser)', source)
+        self.assertNotIn("machineEnrollmentForm.elements.ssh_user", source)
+        self.assertNotIn("machineEnrollmentForm.elements.pool", source)
+        self.assertNotIn("machineEnrollmentForm.elements.capacity", source)
+        self.assertNotIn("/api/v1/admin/runtime/servers", source)
+        self.assertNotIn("ctfzone-runtime-helper", source)
+        self.assertNotIn("ssh-dispatch", source)
+        self.assertIn("/identity/retry`,", source)
+        self.assertIn("/host-key/trust`,", source)
+        self.assertIn("/tickets`,", source)
+        self.assertIn('{ method: "POST", body: { purpose } }', source)
+        self.assertIn('const SSH_WEBSOCKET_PATH = "/bff/ssh/terminal"', source)
+        self.assertIn('const SSH_WEBSOCKET_PROTOCOL = "ctfzone.ssh.v1"', source)
+        self.assertIn("new WebSocket(`${scheme}//${window.location.host}${ticketData.path}`", source)
+        self.assertIn('type: "auth"', source)
+        self.assertIn("ticket: oneTimeTicket", source)
+        self.assertIn('term: "xterm-256color"', source)
+        self.assertNotIn("?ticket=", source)
+        self.assertNotIn("ticketData.ticket}`", source)
+        self.assertNotIn("console.log", source)
+        self.assertNotIn("localStorage", ssh_source)
+        self.assertNotIn("sessionStorage", ssh_source)
+        self.assertIn("new TextEncoder().encode(data)", source)
+        self.assertIn("offset += 16 * 1024", source)
+        self.assertIn("encoded.slice(offset, offset + 16 * 1024)", source)
+        self.assertIn("session.socket.bufferedAmount > SSH_MAX_BUFFERED_INPUT", source)
+        self.assertIn('type: "resize"', source)
+        self.assertIn("safeSshDiagnostic", source)
+        self.assertIn("control.host_key_fingerprint !== expectedHostFingerprint", source)
+        self.assertIn("candidate_id: candidateId, fingerprint, revision", source)
+        self.assertIn("allowProposedApi: false", source)
+        self.assertIn("Remote terminal output must never navigate", source)
+        self.assertIn("activate() {}", source)
+        self.assertIn("windowOptions: {}", source)
+        self.assertNotIn("WebLinksAddon", source)
+        self.assertNotIn("ClipboardAddon", source)
+        self.assertIn("installed authorized_keys line remains", source)
+        self.assertIn('button.closest("[data-machine-card]")?.remove()', source)
+
+    def test_browser_ssh_ticket_post_uses_authenticated_csrf_bff_channel(self):
+        path = "/bff/api/v1/admin/ssh/hosts/22222222-2222-4222-8222-222222222222/tickets"
+        response = self.client.post(
+            path,
+            data=b'{"purpose":"terminal"}',
+            content_type="application/json",
+            headers=unsafe_headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.api.browser_request[0:2],
+            (
+                "POST",
+                "/api/v1/admin/ssh/hosts/22222222-2222-4222-8222-222222222222/tickets",
+            ),
+        )
+        self.assertEqual(self.api.calls[-1][2], SESSION_ID)
+
+        missing_csrf = self.client.post(
+            path,
+            data=b'{"purpose":"terminal"}',
+            content_type="application/json",
+            headers={"Origin": "http://localhost"},
+        )
+        self.assertEqual(missing_csrf.status_code, 403)
+
+    def test_xterm_assets_are_local_pinned_and_part_of_registry_hash(self):
+        admin_root = Path(ctfzone_web.__file__).parent / "frontends" / "admin"
+        template = (admin_root / "templates" / "machines.html").read_text(encoding="utf-8")
+        registry = (Path(ctfzone_web.__file__).parent / "frontends.py").read_text(encoding="utf-8")
+        vendor = admin_root / "static" / "vendor" / "xterm"
+
+        for filename in (
+            "xterm.css",
+            "xterm.js",
+            "addon-fit.js",
+            "LICENSE",
+            "LICENSE.addon-fit",
+            "VERSIONS",
+        ):
+            self.assertTrue((vendor / filename).is_file(), filename)
+            self.assertIn(f'"vendor/xterm/{filename}"', registry)
+        self.assertGreater((vendor / "xterm.js").stat().st_size, 400_000)
+        self.assertGreater((vendor / "addon-fit.js").stat().st_size, 1_000)
+        self.assertIn("Permission is hereby granted", (vendor / "LICENSE").read_text(encoding="utf-8"))
+        self.assertIn("Permission is hereby granted", (vendor / "LICENSE.addon-fit").read_text(encoding="utf-8"))
+        versions = (vendor / "VERSIONS").read_text(encoding="utf-8")
+        self.assertIn("@xterm/xterm 6.0.0", versions)
+        self.assertIn("@xterm/addon-fit 0.11.0", versions)
+        self.assertNotIn("https://", template)
+        self.assertNotIn("//cdn", template)
 
     def test_admin_sessions_render_individual_account_and_global_revocation_controls(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
@@ -2164,12 +2999,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("This includes your current administration session", source)
         self.assertIn('window.location.assign("/login")', source)
 
-        legacy = client.get("/admin/sessions")
-        self.assertEqual(legacy.status_code, 302)
-        self.assertEqual(
-            urlsplit(legacy.headers["Location"]).path,
-            "/admin/session-management",
-        )
+        self.assertEqual(client.get("/admin/sessions").status_code, 404)
 
     def test_immutable_setup_marker_is_not_an_editable_config(self):
         bootstrap = copy.deepcopy(BOOTSTRAP)
@@ -2433,7 +3263,7 @@ class AppTests(unittest.TestCase):
         delays = [value for value in match.group(1).split(",") if value.strip()]
         self.assertLessEqual(len(delays), 2)
 
-    def test_storage_origin_is_the_only_extra_connect_source(self):
+    def test_storage_and_exact_same_origin_websocket_are_the_only_extra_connect_sources(self):
         api = FakeApi()
         app = create_app(
             {
@@ -2442,10 +3272,54 @@ class AppTests(unittest.TestCase):
                 "OBJECT_STORAGE_PUBLIC_URL": "https://files.example.test",
             }
         )
-        response = app.test_client().get("/healthz")
+        response = app.test_client().get(
+            "/healthz",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "admin.example.test:8443",
+            },
+        )
         policy = response.headers["Content-Security-Policy"]
-        self.assertIn("connect-src 'self' https://files.example.test", policy)
+        self.assertIn(
+            "connect-src 'self' wss://admin.example.test:8443 https://files.example.test",
+            policy,
+        )
+        self.assertNotRegex(policy, r"connect-src[^;]*(?:^|\s)wss?:(?:\s|;)")
+        self.assertNotIn("wss://*", policy)
         self.assertNotIn("test-backend-service-token", response.get_data(as_text=True))
+
+    def test_inline_styles_are_allowed_only_on_the_browser_terminal_page(self):
+        machines_policy = self.client.get("/admin/machines").headers[
+            "Content-Security-Policy"
+        ]
+        health_policy = self.client.get("/healthz").headers[
+            "Content-Security-Policy"
+        ]
+        configuration_policy = self.client.get("/admin/config").headers[
+            "Content-Security-Policy"
+        ]
+
+        # xterm creates runtime style elements and attributes. Keep that narrow
+        # exception on its host page while scripts remain self-only everywhere.
+        self.assertIn("style-src 'self' 'unsafe-inline';", machines_policy)
+        self.assertIn("script-src 'self';", machines_policy)
+        self.assertNotIn("script-src 'self' 'unsafe-inline'", machines_policy)
+        for policy in (health_policy, configuration_policy):
+            self.assertIn("style-src 'self';", policy)
+            self.assertNotIn("'unsafe-inline'", policy)
+
+    def test_csp_rejects_an_unsafe_forwarded_websocket_host(self):
+        response = self.client.get(
+            "/healthz",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "admin.example.test;wss://evil.example",
+            },
+        )
+        policy = response.headers["Content-Security-Policy"]
+        self.assertNotIn("evil.example", policy)
+        self.assertNotIn("admin.example.test", policy)
+        self.assertIn("connect-src 'self' https://files.example.test", policy)
 
 
 if __name__ == "__main__":

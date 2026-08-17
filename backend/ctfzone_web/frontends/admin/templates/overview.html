@@ -6,7 +6,6 @@
     <a class="admin-stat-card" href="{{ url_for('web.admin_challenges') }}"><span>Challenges</span><strong>{{ stats.challenges }}</strong><small>published and hidden</small></a>
     <a class="admin-stat-card" href="{{ url_for('web.admin_users') }}"><span>Users</span><strong>{{ stats.users }}</strong><small>registered operators</small></a>
     <a class="admin-stat-card" href="{{ url_for('web.admin_teams') }}"><span>Teams</span><strong>{{ stats.teams }}</strong><small>competition groups</small></a>
-    <a class="admin-stat-card" href="{{ url_for('web.admin_runtime') }}"><span>Instances</span><strong>{{ stats.instances }}</strong><small>managed runtime records</small></a>
   </section>
 
   <section class="admin-panel">
@@ -36,6 +35,5 @@
 
   <section class="admin-quick-grid">
     <a class="admin-quick-card" href="{{ url_for('web.admin_config') }}"><strong>Configure the event</strong><span>Site identity, visibility, registration, scoring and timing.</span><small>Open configuration →</small></a>
-    <a class="admin-quick-card" href="{{ url_for('web.admin_runtime') }}"><strong>Review runtime health</strong><span>Private challenge setting, remote servers and user instances.</span><small>Open managed instances →</small></a>
   </section>
 {% endblock %}

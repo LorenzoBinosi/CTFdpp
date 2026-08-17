@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import datetime as dt
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -27,6 +29,19 @@ ALLOWED_OPERATIONS = {
     "update-deadline",
 }
 MAX_REQUEST_BYTES = 1_048_576
+MAX_FLAG_VALUE_BYTES = 512
+DEPLOYMENT_FIELDS = {
+    "image_digest",
+    "container_port",
+    "protocol",
+    "cpu_limit",
+    "memory_limit_bytes",
+    "pid_limit",
+    "storage_limit_bytes",
+    "healthcheck",
+    "remote_pool",
+    "flag_value",
+}
 
 
 class HelperError(RuntimeError):
@@ -79,10 +94,14 @@ def run(
     check: bool = True,
     input_bytes: bytes | None = None,
     timeout: int = 45,
+    environment_overrides: dict[str, str] | None = None,
+    sensitive_values: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     if CONFIG["CTFZONE_SYSTEMD_SCOPE"] == "user":
         environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if environment_overrides:
+        environment.update(environment_overrides)
     completed = subprocess.run(
         arguments,
         input=input_bytes,
@@ -94,12 +113,25 @@ def run(
     )
     if check and completed.returncode != 0:
         diagnostic = completed.stderr.decode("utf-8", "replace").strip()
+        for sensitive_value in sensitive_values:
+            if sensitive_value:
+                diagnostic = diagnostic.replace(sensitive_value, "[redacted]")
         raise HelperError(diagnostic[:1000] or f"command failed: {arguments[0]}")
     return completed
 
 
-def engine(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    return run([CONFIG["CTFZONE_CONTAINER_ENGINE"], *arguments], check=check)
+def engine(
+    *arguments: str,
+    check: bool = True,
+    environment_overrides: dict[str, str] | None = None,
+    sensitive_values: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[bytes]:
+    return run(
+        [CONFIG["CTFZONE_CONTAINER_ENGINE"], *arguments],
+        check=check,
+        environment_overrides=environment_overrides,
+        sensitive_values=sensitive_values,
+    )
 
 
 def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
@@ -658,6 +690,10 @@ def validate_deployment(request: dict[str, Any]) -> dict[str, Any]:
     deployment = request.get("deployment")
     if not isinstance(deployment, dict):
         raise HelperError("deployment is required")
+    unknown_fields = set(deployment).difference(DEPLOYMENT_FIELDS)
+    if unknown_fields:
+        raise HelperError("deployment contains unsupported fields")
+    deployment = deployment.copy()
     image = deployment.get("image_digest")
     if not isinstance(image, str) or not IMAGE_RE.fullmatch(image):
         raise HelperError("image must be pinned to a sha256 digest")
@@ -712,7 +748,34 @@ def validate_deployment(request: dict[str, Any]) -> dict[str, Any]:
                 or not 1 <= value <= 300
             ):
                 raise HelperError(f"healthcheck {key} is invalid")
+    flag_value = deployment.get("flag_value")
+    if flag_value is not None:
+        if not isinstance(flag_value, str) or not flag_value or "\x00" in flag_value:
+            raise HelperError("flag_value is invalid")
+        try:
+            encoded_flag_value = flag_value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise HelperError("flag_value is invalid") from error
+        if len(encoded_flag_value) > MAX_FLAG_VALUE_BYTES:
+            raise HelperError("flag_value is invalid")
     return deployment
+
+
+def flag_fingerprint(flag_value: str | None) -> str | None:
+    if flag_value is None:
+        return None
+    return hashlib.sha256(flag_value.encode("utf-8")).hexdigest()
+
+
+def same_flag_configuration(state: dict[str, Any], fingerprint: str | None) -> bool:
+    stored = state.get("flag_fingerprint")
+    if stored is not None and (
+        not isinstance(stored, str)
+        or len(stored) != 64
+        or any(character not in "0123456789abcdef" for character in stored)
+    ):
+        return False
+    return hmac.compare_digest(stored or "", fingerprint or "")
 
 
 def ensure_network(identifier: str) -> str:
@@ -746,6 +809,8 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
     if expires_at <= dt.datetime.now(dt.timezone.utc):
         raise HelperError("cannot start an instance with an elapsed deadline")
     deployment = validate_deployment(request)
+    flag_value = deployment.pop("flag_value", None)
+    requested_flag_fingerprint = flag_fingerprint(flag_value)
     existing = inspect_raw(identifier)
     try:
         previous_state = read_state(identifier)
@@ -760,7 +825,30 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
             "effective_generation": effective_generation,
         }
     previous_generation = state_generation(previous_state, existing)
+    if existing is not None and previous_state is not None:
+        if previous_generation is None:
+            remove_irrecoverable_instance_unlocked(identifier, existing)
+            return {
+                "absent": True,
+                "stale_generation": True,
+                "effective_generation": requested_generation,
+            }
+        if not same_flag_configuration(previous_state, requested_flag_fingerprint):
+            raise HelperError("existing container flag configuration does not match request")
     if previous_generation is not None and previous_generation > requested_generation:
+        return {
+            "absent": False,
+            "stale_generation": True,
+            "effective_generation": previous_generation,
+        }
+    if (
+        existing is not None
+        and previous_generation is not None
+        and previous_generation < requested_generation
+    ):
+        # An existing container cannot have its immutable creation labels or
+        # environment advanced in place. Refuse rather than claim that a newer
+        # generation, potentially with different secret material, was applied.
         return {
             "absent": False,
             "stale_generation": True,
@@ -821,9 +909,21 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
                 )
             if healthcheck.get("retries"):
                 arguments.extend(["--health-retries", str(int(healthcheck["retries"]))])
+        engine_environment = None
+        sensitive_values: tuple[str, ...] = ()
+        if flag_value is not None:
+            # Pass only the variable name on the command line. The container
+            # engine reads the value from its short-lived process environment.
+            arguments.extend(["--env", "CTFZONE_FLAG"])
+            engine_environment = {"CTFZONE_FLAG": flag_value}
+            sensitive_values = (flag_value,)
         arguments.append(deployment["image_digest"])
         try:
-            engine(*arguments)
+            engine(
+                *arguments,
+                environment_overrides=engine_environment,
+                sensitive_values=sensitive_values,
+            )
         except Exception:
             remove_network_verified(identifier)
             raise
@@ -837,6 +937,8 @@ def ensure_instance(request: dict[str, Any]) -> dict[str, Any]:
         "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
         "deployment": deployment,
     }
+    if requested_flag_fingerprint is not None:
+        state["flag_fingerprint"] = requested_flag_fingerprint
     try:
         # The new generation has its own unit. Install it before retiring the
         # previous unit, then make the generation switch durable in the state file.

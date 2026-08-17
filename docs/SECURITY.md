@@ -48,10 +48,10 @@ Reports are especially useful for:
 - challenge visibility, scoring integrity, flag handling, and account isolation;
 - BFF proxy boundaries, file upload/download authorization, Markdown rendering,
   redirects, and browser security headers;
-- controller command claiming, idempotency, expiry, reconciliation, and remote
-  execution;
-- SSH helper restrictions, container escape, host-key validation, or secret
-  mounts;
+- controller runtime-command and object-operation claiming, idempotency,
+  generation fencing, expiry, and reconciliation;
+- browser SSH ticketing, destination policy, host-key validation, terminal
+  isolation, or secret mounts;
 - PostgreSQL constraints, query authorization, data exposure, and backup safety;
 - Caddy site/storage-origin routing, TLS, signed S3 requests, storage CORS, or
   unintended exposure of internal services.
@@ -118,15 +118,41 @@ Reports are especially useful for:
   Buffering the bounded portal body before proxying prevents a slow client from
   tying up a Python worker. Keep the backend's storage-completion timeout below
   its Gunicorn worker timeout so verified promotion has a deterministic budget.
-- Run the controller as its unprivileged user with a dedicated key, pinned host
-  keys, and the restricted remote helper. Do not give it a general-purpose root
-  shell. Its storage credentials are for bounded reconciliation/deletion work,
-  not general storage administration.
+- Run the controller as its unprivileged user. Its storage credentials are for
+  bounded reconciliation/deletion work, not general storage administration.
+  Mount its SSH identity and pinned `known_hosts` read-only. On every runtime
+  host, force that key through `ctfzone-runtime-helper ssh-dispatch`, disable
+  forwarding, and keep the dedicated account out of privileged groups. The
+  controller must never receive a Docker or Podman socket.
+- Treat the browser SSH console as full access to the registered Unix account,
+  not as a read-only viewer. Keep its keys confined to the gateway. The
+  browser receives only a 30-second one-use ticket; only the isolated SSH
+  gateway may read `ssh_gateway_identities`, open outbound SSH, or carry PTY
+  bytes. Require an exact, independently confirmed SSH host key before issuing
+  terminal tickets, reject private/control-plane destinations, disable every
+  form of forwarding, and bound session lifetime, idle time, dimensions, and
+  buffering. Never log tickets, terminal input/output, commands, private keys,
+  or environment contents. Deleting a portal record does not revoke the remote
+  `authorized_keys` entry; remove that line on the host as well.
 - PostgreSQL is the source of truth for object ownership, authorization,
   lifecycle, and history; the S3-compatible store holds only bytes. Back up and
   restore the database and bucket as a coordinated set, test recovery, and
   protect both backups as production secrets. The controller should reconcile
   expired pending uploads and durable deletion work after outages.
+- Treat competition-mode changes as destructive transitions. Use only the
+  signed preview and typed-confirmation workflow; do not edit `user_mode`
+  directly in PostgreSQL. Take a coordinated database/object-store backup and
+  review the fresh affected-row
+  counts before confirming. Preview tokens are short-lived and bound to the
+  administrator, source and target modes, and database snapshot; a stale or
+  replayed preview must be rejected. The transition retains audit metadata while
+  removing competition records and queuing participant- and team-owned
+  competition-byte cleanup. Previously issued presigned object URLs remain
+  bearer credentials until their bounded expiry (at most the configured
+  `PRESIGNED_URL_TTL_SECONDS`), so wait for storage cleanup when strict
+  byte-level revocation is required.
+  Active private instances block the transition; terminate them first so team
+  ownership and participant credentials cannot change beneath a live workload.
 - Keep container images, Rust and Python dependencies, PostgreSQL, Caddy, and
   challenge hosts patched.
 - Review logs and exports before sharing them; they can contain IP addresses,

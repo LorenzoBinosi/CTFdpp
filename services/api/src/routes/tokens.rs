@@ -11,7 +11,7 @@ use sqlx::FromRow;
 
 use crate::{
     AppState,
-    auth::{CurrentUser, require_verified_email},
+    auth::{CurrentUser, require_verified_email, revalidate_current_credential},
     error::ApiError,
     routes::Success,
 };
@@ -87,6 +87,10 @@ pub(super) async fn create_token(
     OsRng.fill_bytes(&mut random);
     let value = format!("ctfzone_{}", hex::encode(random));
 
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    revalidate_current_credential(&mut transaction, &user, state.auth.session_lifetime_seconds)
+        .await?;
     let token = sqlx::query_as::<_, TokenRow>(
         r#"
         INSERT INTO ctfzone.tokens (type, user_id, created, expiration, description, value)
@@ -105,9 +109,10 @@ pub(super) async fn create_token(
     .bind(expiration)
     .bind(request.description)
     .bind(value)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
 
     Ok(Json(Success::new(admin_view(&token))).into_response())
 }
@@ -134,13 +139,40 @@ pub(super) async fn delete_token(
     Path(token_id): Path<i32>,
 ) -> Result<Json<SimpleSuccess>, ApiError> {
     require_verified_email(&state.database, &user).await?;
-    let token = find_visible_token(&state, &user, token_id).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    revalidate_current_credential(&mut transaction, &user, state.auth.session_lifetime_seconds)
+        .await?;
+    let token = sqlx::query_as::<_, TokenRow>(
+        r#"
+        SELECT
+            id,
+            type AS token_type,
+            user_id,
+            created,
+            expiration,
+            description,
+            value
+        FROM ctfzone.tokens
+        WHERE id = $1
+          AND type = 'user'
+          AND ($2 OR user_id = $3)
+        "#,
+    )
+    .bind(token_id)
+    .bind(user.is_admin())
+    .bind(user.id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Token not found"))?;
 
     sqlx::query("DELETE FROM ctfzone.tokens WHERE id = $1")
         .bind(token.id)
-        .execute(&state.database)
+        .execute(&mut *transaction)
         .await
         .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
 
     Ok(Json(SimpleSuccess { success: true }))
 }

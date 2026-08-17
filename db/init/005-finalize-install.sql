@@ -3,32 +3,6 @@
 -- been committed before an interrupted initialization finished.
 BEGIN;
 
--- Older portal snapshots only enforced case-sensitive allowlist uniqueness.
--- Keep the earliest reservation for each normalized address, canonicalize the
--- stored value, then make every future write case-insensitively unique.
-DELETE FROM ctfzone.registration_email_allowlist AS candidate
-USING (
-    SELECT id
-    FROM (
-        SELECT
-            id,
-            row_number() OVER (
-                PARTITION BY lower(email)
-                ORDER BY created, id
-            ) AS duplicate_number
-        FROM ctfzone.registration_email_allowlist
-    ) AS ranked
-    WHERE duplicate_number > 1
-) AS duplicate
-WHERE candidate.id = duplicate.id;
-
-UPDATE ctfzone.registration_email_allowlist
-SET email = lower(email)
-WHERE email IS DISTINCT FROM lower(email);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_email_allowlist_normalized_unique
-    ON ctfzone.registration_email_allowlist (lower(email));
-
 -- Email-verification bearer tokens are single-use and short lived. Only their
 -- SHA-256 hashes are persisted; the raw token exists solely in the email.
 CREATE TABLE IF NOT EXISTS ctfzone.email_verification_tokens (
@@ -68,13 +42,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_email_verification_active_user
     ON ctfzone.email_verification_tokens (user_id)
     WHERE used_at IS NULL AND invalidated_at IS NULL;
 
+-- Competition-mode changes deliberately destroy score ownership, every team
+-- identity, and every membership in both directions. Keep the
+-- operator-approved snapshot in a durable audit record committed with the
+-- destructive reset. The API exposes no mutation route for this history.
+CREATE TABLE IF NOT EXISTS ctfzone.user_mode_transitions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_user_id integer REFERENCES ctfzone.users(id) ON DELETE SET NULL,
+    source_mode text NOT NULL CHECK (source_mode IN ('users', 'teams')),
+    target_mode text NOT NULL CHECK (target_mode IN ('users', 'teams')),
+    affected jsonb NOT NULL,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT user_mode_transition_changes_mode CHECK (source_mode <> target_mode),
+    CONSTRAINT user_mode_transition_affected_object CHECK (jsonb_typeof(affected) = 'object')
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_mode_transitions_created
+    ON ctfzone.user_mode_transitions (created_at DESC, id DESC);
+
 -- `users.verified` is proof that the current address completed the token flow,
 -- not an administrative account flag. Keep the invariant in PostgreSQL too so
 -- a future write path cannot silently bypass the mail confirmation endpoint.
-UPDATE ctfzone.users SET verified = false WHERE verified IS NULL;
-ALTER TABLE ctfzone.users ALTER COLUMN verified SET DEFAULT false;
-ALTER TABLE ctfzone.users ALTER COLUMN verified SET NOT NULL;
-
 CREATE OR REPLACE FUNCTION ctfzone.require_email_verification_proof()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -287,19 +275,10 @@ CREATE INDEX idx_object_operations_object_history
     ON ctfzone.object_operations
        (object_id, operation, status, object_revision, completed_at DESC);
 
--- The legacy portal relation now points at immutable object metadata. The
--- textual location remains for a clean v1 compatibility surface and can be
--- removed once every consumer uses object IDs.
-ALTER TABLE ctfzone.files
-    ADD COLUMN object_id uuid REFERENCES ctfzone.stored_objects(id) ON DELETE RESTRICT;
-CREATE UNIQUE INDEX uq_files_object_id
-    ON ctfzone.files (object_id)
-    WHERE object_id IS NOT NULL;
-
 -- A target or owning principal must not disappear while its object bytes remain
 -- authorized and detached from the lifecycle queue. Parent deletion first locks
--- every linked object in a stable order, removes compatibility relations, and
--- revision-fences cleanup before the parent foreign keys become NULL.
+-- every linked object in a stable order and revision-fences cleanup before the
+-- parent foreign keys become NULL.
 CREATE FUNCTION ctfzone.schedule_linked_object_deletion()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -346,22 +325,6 @@ BEGIN
     LOOP
         NULL;
     END LOOP;
-
-    -- Object-backed compatibility rows are removed for every association type.
-    EXECUTE format(
-        'DELETE FROM ctfzone.files WHERE object_id IN ('
-        'SELECT id FROM ctfzone.stored_objects WHERE %s)',
-        association_filter
-    ) USING OLD.id;
-
-    -- Target tables can also have legacy rows without object metadata. Remove
-    -- those so the old page/solution foreign keys cannot block parent deletion.
-    IF parent_kind IN ('challenge', 'page', 'solution') THEN
-        EXECUTE format(
-            'DELETE FROM ctfzone.files WHERE %I = $1',
-            association_column
-        ) USING OLD.id;
-    END IF;
 
     FOR object_row IN EXECUTE format(
         'SELECT id,status,revision,upload_expires_at '
@@ -463,6 +426,12 @@ DO $$
 BEGIN
     IF to_regclass('ctfzone.users') IS NULL
         OR to_regclass('ctfzone.challenges') IS NULL
+        OR to_regclass('ctfzone.flags') IS NULL
+        OR to_regclass('ctfzone.challenge_categories') IS NULL
+        OR to_regclass('ctfzone.admin_create_idempotency') IS NULL
+        OR to_regclass('ctfzone.user_challenge_flags') IS NULL
+        OR to_regclass('ctfzone.flag_sharing_events') IS NULL
+        OR to_regclass('ctfzone.user_mode_transitions') IS NULL
         OR to_regclass('ctfzone.runtime_settings') IS NULL
         OR to_regclass('ctfzone.challenge_runtime_configs') IS NULL
         OR to_regclass('ctfzone.remote_servers') IS NULL

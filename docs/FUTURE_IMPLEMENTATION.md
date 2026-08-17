@@ -1,12 +1,13 @@
 # CTFZone future implementation
 
-Status: Proposed roadmap beyond the 1.0.0 private-instance and object-storage baseline
-Last updated: 2026-08-12
+Status: Proposed roadmap beyond the 1.0.0 platform
+Last updated: 2026-08-17
 
 This document summarizes the planned architecture for scheduled events, King of
 the Hill, attack/defense simulations, and speedrun challenges. It extends the
-implemented controller architecture without adding another central CTFZone
-service.
+implemented classic private-instance controller; the event arenas, judges,
+patch pipelines, and signed remote-fact protocol described here remain future
+work.
 
 ## 1. Architectural decision
 
@@ -16,7 +17,9 @@ CTFZone keeps four central service types behind Caddy:
 2. Rust API for authentication, event management, submissions, scoring, and
    artifact authorization.
 3. PostgreSQL as the authoritative state and history store.
-4. Rust controller for remote orchestration.
+4. Rust controller for classic private instances and durable object
+   maintenance, extensible with reviewed event-mode workers in a future
+   release.
 
 There will not be a controller process or container for every challenge. There
 will be one **controller service** with several bounded asynchronous worker
@@ -44,7 +47,8 @@ future machine facts -- scoped integration ingress --> private Rust API
 | Authentication, registration, and authorization | Rust API |
 | Event and challenge configuration | Rust API and PostgreSQL |
 | Score calculation and leaderboard projections | Rust API |
-| Runtime placement and lifecycle | Controller |
+| Classic per-participant private instances | Implemented controller worker |
+| Future shared arena placement and lifecycle | Controller extension |
 | Arena, judge, and patch execution | Remote host/agent |
 | Challenge observations and results | Remote agent to Rust API |
 | PCAP generation | Remote host |
@@ -60,11 +64,11 @@ images, hosts, commands, limits, storage keys, or deployment operations.
 
 ## 3. Controller shape
 
-The controller service will contain these logical workers:
+The controller already contains the classic private-instance reconciler and
+object-maintenance worker. Future event modes add these logical workers:
 
 ```text
 controller
-|-- personal runtime reconciler
 |-- shared arena reconciler
 |-- execution-job dispatcher
 |-- patch deployment worker
@@ -76,7 +80,7 @@ Each arena, instance, or job has a durable state machine in PostgreSQL. A Tokio
 task handles it only while work exists; no permanent in-memory worker is needed
 per challenge.
 
-The existing remote vocabulary will grow to typed, idempotent operations such
+The future remote vocabulary should use typed, idempotent operations such
 as:
 
 ```text
@@ -121,7 +125,7 @@ Planned core entities are:
 - `events`: description, publication and registration windows, start/end,
   capacity, participant mode, visibility, and lifecycle state;
 - `event_challenges`: challenge binding, mode, schedule overrides, scoring and
-  runtime snapshots, and remote integration;
+  execution snapshots, and remote integration;
 - `event_participants`: user/team registration, approval state, and frozen team
   roster;
 - `event_rounds`: A/D ticks, KOTH sampling periods, or speedrun heats;
@@ -138,12 +142,11 @@ draft -> published -> registration_open -> scheduled
                               \-> cancelled
 ```
 
-The controller sleeps until the nearest event/runtime boundary or PostgreSQL
+The controller sleeps until the nearest event boundary or PostgreSQL
 notification. If it restarts after a boundary, reconciliation performs the
 overdue start or cleanup. Remote host timers remain the final termination guard.
 
-Personal private instances keep their current one-active-instance rule. Event
-arenas and attempts use event-scoped concurrency rules, such as one active
+Event arenas and attempts use event-scoped concurrency rules, such as one active
 speedrun attempt per participant and event.
 
 ## 6. Signed remote facts
@@ -235,8 +238,7 @@ future UI improvement that requires a reviewed incremental/streaming SHA-256
 implementation (preferably off the main thread); the higher API-side object
 limit must not be used to justify unbounded browser memory.
 
-Asynchronous work uses durable execution jobs, separate from personal runtime
-commands:
+Asynchronous work uses durable execution jobs:
 
 ```text
 judge-submission

@@ -104,15 +104,7 @@ function configPanelFromHash() {
   );
   const nested = fragment ? document.getElementById(fragment)?.closest("[data-config-panel]") : null;
   if (direct || nested) return (direct || nested)?.dataset.configPanel;
-  // The API combined the former Registration and Accounts sections. Keep old
-  // bookmarks useful while the catalog remains the source of the new section.
-  const legacyAlias = new Map([
-    ["registration", "accounts"],
-    ["config-registration", "accounts"],
-  ]).get(fragment);
-  return configPanels.some(panel => panel.dataset.configPanel === legacyAlias)
-    ? legacyAlias
-    : undefined;
+  return undefined;
 }
 
 function updateConfigHash(selection) {
@@ -223,31 +215,460 @@ const challengeForm = document.querySelector("[data-challenge-form]");
 if (challengeForm) {
   const typeField = challengeForm.elements.type;
   const dynamicFields = challengeForm.querySelector("[data-dynamic-fields]");
+  const staticValueField = challengeForm.querySelector("[data-static-value]");
   const syncChallengeType = () => {
     const dynamic = typeField?.value === "dynamic";
     dynamicFields?.classList.toggle("visible", dynamic);
     for (const input of dynamicFields?.querySelectorAll("input, select") || []) input.disabled = !dynamic;
+    if (staticValueField) staticValueField.hidden = dynamic;
+    if (challengeForm.elements.value) challengeForm.elements.value.disabled = dynamic;
   };
   typeField?.addEventListener("change", syncChallengeType);
   syncChallengeType();
 
-  challengeForm.addEventListener("submit", async event => {
-    event.preventDefault();
-    if (!challengeForm.reportValidity()) return;
-    const submit = challengeForm.querySelector('button[type="submit"]');
-    setBusy(submit, true);
+  const categoryDialog = document.querySelector("[data-category-dialog]");
+  const categoryDialogForm = categoryDialog?.querySelector("[data-category-dialog-form]");
+  const categorySelect = challengeForm.querySelector("[data-category-select]");
+  const categoryHelp = challengeForm.querySelector("[data-category-help]");
+  const categoryError = categoryDialog?.querySelector("[data-category-dialog-error]");
+  const categoryCreateHeaders = new Map();
+  let categoryReturnFocus = null;
 
+  const closeCategoryDialog = () => {
+    if (!categoryDialog) return;
+    if (typeof categoryDialog.close === "function" && categoryDialog.open) categoryDialog.close();
+    else categoryDialog.removeAttribute("open");
+    categoryReturnFocus?.focus({ preventScroll: true });
+    categoryReturnFocus = null;
+  };
+
+  challengeForm.querySelector("[data-open-category-dialog]")?.addEventListener("click", event => {
+    if (!categoryDialog || !categoryDialogForm) return;
+    categoryReturnFocus = event.currentTarget;
+    categoryDialogForm.reset();
+    if (categoryError) categoryError.textContent = "";
+    if (typeof categoryDialog.showModal === "function") categoryDialog.showModal();
+    else categoryDialog.setAttribute("open", "");
+    window.requestAnimationFrame(() => categoryDialogForm.elements.category_name?.focus());
+  });
+  for (const button of categoryDialog?.querySelectorAll("[data-close-category-dialog]") || []) {
+    button.addEventListener("click", closeCategoryDialog);
+  }
+  categoryDialog?.addEventListener("click", event => {
+    if (event.target === categoryDialog) closeCategoryDialog();
+  });
+  categoryDialog?.addEventListener("close", () => {
+    categoryReturnFocus?.focus({ preventScroll: true });
+    categoryReturnFocus = null;
+  });
+  categoryDialogForm?.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (!categoryDialogForm.reportValidity()) return;
+    const submit = categoryDialogForm.querySelector('button[type="submit"]');
+    setBusy(submit, true, "Creating…");
+    if (categoryError) categoryError.textContent = "";
+    try {
+      const categoryName = categoryDialogForm.elements.category_name.value.trim();
+      const categoryKey = categoryName.toLocaleLowerCase();
+      if (!categoryCreateHeaders.has(categoryKey)) {
+        categoryCreateHeaders.set(categoryKey, idempotencyHeaders());
+      }
+      const result = await apiRequest("/api/v1/admin/challenge-categories", {
+        method: "POST",
+        headers: categoryCreateHeaders.get(categoryKey),
+        body: { name: categoryName },
+      });
+      const category = result.data;
+      if (!Number.isSafeInteger(Number(category?.id)) || !category?.name) {
+        throw new Error("The category service returned an invalid category.");
+      }
+      let option = Array.from(categorySelect?.options || [])
+        .find(candidate => candidate.value === String(category.id));
+      if (!option && categorySelect) {
+        option = new Option(category.name, String(category.id));
+        categorySelect.add(option);
+      }
+      if (option && categorySelect) {
+        option.textContent = category.name;
+        categorySelect.value = String(category.id);
+        categorySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      if (categoryHelp) categoryHelp.textContent = "Category created and selected. It is now available to other challenges.";
+      setBusy(submit, false);
+      closeCategoryDialog();
+      showToast(`Category “${category.name}” created.`);
+    } catch (error) {
+      if (categoryError) categoryError.textContent = error.message || "The category could not be created.";
+      setBusy(submit, false);
+    }
+  });
+
+  const wizard = challengeForm.querySelector("[data-wizard-step]") ? challengeForm : null;
+  const challengeCreateStorageKey = "ctfzone.admin.challenge-create-idempotency";
+  let challengeCreateHeaders;
+  if (wizard) {
+    let key;
+    try {
+      key = window.sessionStorage.getItem(challengeCreateStorageKey);
+      if (!key) {
+        key = idempotencyHeaders()["idempotency-key"];
+        window.sessionStorage.setItem(challengeCreateStorageKey, key);
+      }
+    } catch (_error) {
+      key = idempotencyHeaders()["idempotency-key"];
+    }
+    challengeCreateHeaders = { "idempotency-key": key };
+  }
+  const randomTokenPlaceholder = "{{RANDOM_TOKEN}}";
+  const flagByteLength = value => new TextEncoder().encode(value).length;
+  const exposureValue = () => challengeForm.elements.exposure?.value || "";
+  const flagTypeValue = () => challengeForm.elements.flag_type?.value || "static";
+  const randomTokenCountIn = value => value.split(randomTokenPlaceholder).length - 1;
+  const randomTokenCount = () => {
+    const content = challengeForm.elements.flag_content?.value || "";
+    return randomTokenCountIn(content);
+  };
+  const hasUnsupportedGeneratedPlaceholder = value => {
+    const withoutRandomToken = value.split(randomTokenPlaceholder).join("");
+    return withoutRandomToken.includes("{{") || withoutRandomToken.includes("}}");
+  };
+  const leetScope = template => {
+    const tokenStart = template.indexOf(randomTokenPlaceholder);
+    const tokenEnd = tokenStart < 0 ? -1 : tokenStart + randomTokenPlaceholder.length;
+    const isTokenIndex = index => tokenStart >= 0 && index >= tokenStart && index < tokenEnd;
+    let open = -1;
+    let close = -1;
+    for (let index = 0; index < template.length; index += 1) {
+      if (template[index] === "{" && !isTokenIndex(index)) {
+        open = index;
+        break;
+      }
+    }
+    for (let index = template.length - 1; index >= 0; index -= 1) {
+      if (template[index] === "}" && !isTokenIndex(index)) {
+        close = index;
+        break;
+      }
+    }
+    return open >= 0 && open < close
+      ? { start: open + 1, end: close }
+      : { start: 0, end: template.length };
+  };
+  const leetEligibleCount = () => {
+    const template = challengeForm.elements.flag_content?.value || "";
+    const scope = leetScope(template);
+    let eligible = 0;
+    for (let cursor = 0; cursor < template.length;) {
+      if (template.startsWith(randomTokenPlaceholder, cursor)) {
+        cursor += randomTokenPlaceholder.length;
+        continue;
+      }
+      const character = String.fromCodePoint(template.codePointAt(cursor));
+      if (cursor >= scope.start && cursor < scope.end && /[aeiost]/i.test(character)) eligible += 1;
+      cursor += character.length;
+    }
+    return eligible;
+  };
+  const leetSample = template => {
+    const scope = leetScope(template);
+    const leetMap = { a: "4", e: "3", i: "1", o: "0", s: "5", t: "7" };
+    let rendered = "";
+    for (let cursor = 0; cursor < template.length;) {
+      if (template.startsWith(randomTokenPlaceholder, cursor)) {
+        rendered += "<uuid>";
+        cursor += randomTokenPlaceholder.length;
+        continue;
+      }
+      const character = String.fromCodePoint(template.codePointAt(cursor));
+      const replacement = cursor >= scope.start && cursor < scope.end
+        ? leetMap[character.toLowerCase()]
+        : undefined;
+      rendered += replacement || character;
+      cursor += character.length;
+    }
+    return rendered;
+  };
+
+  const syncPersonalization = () => {
+    if (!wizard) return;
+    const privateExact = exposureValue() === "private" && flagTypeValue() === "static";
+    const options = challengeForm.querySelector("[data-private-flag-options]");
+    if (options) options.hidden = !privateExact;
+    const contentInput = challengeForm.elements.flag_content;
+    const count = randomTokenCount();
+    const renderedBytes = flagByteLength(contentInput?.value || "")
+      + (count === 1 ? 36 - flagByteLength(randomTokenPlaceholder) : 0);
+    const leet = Boolean(challengeForm.elements.leet_variation?.checked);
+    const personalized = privateExact && (count === 1 || leet);
+    const unsupportedPlaceholder = personalized
+      && hasUnsupportedGeneratedPlaceholder(challengeForm.elements.flag_content?.value || "");
+    const accept = challengeForm.elements.accept_other_users;
+    if (accept) {
+      accept.disabled = !personalized;
+      if (!personalized) accept.checked = false;
+    }
+    const tokenStatus = challengeForm.querySelector("[data-random-token-status]");
+    if (tokenStatus) {
+      tokenStatus.textContent = count === 0 ? "No random token" : count === 1 ? "UUID token detected" : "Too many tokens";
+      tokenStatus.classList.toggle("good", count === 1);
+      tokenStatus.classList.toggle("bad", count > 1);
+    }
+    const leetInput = challengeForm.elements.leet_variation;
+    if (leetInput) leetInput.disabled = !privateExact;
+    contentInput?.setCustomValidity(
+      flagByteLength(contentInput.value) > 512
+        ? "The flag template must be at most 512 UTF-8 bytes."
+        : count > 1
+        ? "Use {{RANDOM_TOKEN}} at most once."
+        : privateExact && count === 1 && renderedBytes > 512
+          ? "The generated flag must be at most 512 UTF-8 bytes after UUID replacement."
+        : exposureValue() === "public" && count > 0
+          ? "Random tokens are available only for private challenges."
+          : unsupportedPlaceholder
+            ? "Generated flags support only the exact {{RANDOM_TOKEN}} placeholder."
+            : "",
+    );
+    const eligible = leetEligibleCount();
+    const sample = leetSample(contentInput?.value || "flag{this_is_a_flag}");
+    leetInput?.setCustomValidity(
+      privateExact && leet && eligible === 0
+        ? "Leet variation requires at least one a, e, i, o, s, or t in the literal template."
+        : privateExact && leet && eligible > 62
+          ? "Leet variation supports at most 62 eligible letters."
+          : "",
+    );
+    const caseSetting = challengeForm.querySelector("[data-case-sensitive-setting]");
+    if (caseSetting) caseSetting.hidden = personalized;
+    const preview = challengeForm.querySelector("[data-flag-example]");
+    if (!preview || !privateExact) return;
+    preview.classList.remove("good", "warning");
+    if (leet && eligible === 0) {
+      preview.textContent = "No leet-eligible letters found. Add at least one a, e, i, o, s, or t to the literal template.";
+      preview.classList.add("warning");
+    } else if (leet && eligible > 62) {
+      preview.textContent = `${eligible} leet-eligible letters found; reduce the template to at most 62 before continuing.`;
+      preview.classList.add("warning");
+    } else if (leet && count === 0) {
+      const capacity = eligible <= 52
+        ? ((1n << BigInt(eligible)) - 1n).toLocaleString()
+        : "more than 4 quadrillion";
+      preview.textContent = `Example: ${sample}. Finite capacity: ${capacity} unique non-original leet variation${capacity === "1" ? "" : "s"}. Activation is refused after exhaustion; assignments persist from first activation.`;
+      preview.classList.add("warning");
+    } else if (leet && count === 1) {
+      preview.textContent = `Example: ${sample}. ${eligible} leet-eligible position${eligible === 1 ? "" : "s"}; the UUIDv4 token guarantees uniqueness. Assignments persist from first activation.`;
+      preview.classList.add("good");
+    } else if (count === 1) {
+      preview.textContent = "A UUIDv4 will replace the token for each participant. The generated assignment persists from first activation.";
+      preview.classList.add("good");
+    } else {
+      preview.textContent = "This is one shared exact flag. Add {{RANDOM_TOKEN}} or enable leet variation to personalize it.";
+    }
+    const reviewLabel = personalized
+      ? [count === 1 ? "Random token" : "", leet ? "Leet variation" : ""].filter(Boolean).join(" + ")
+      : "Exact match";
+    for (const review of challengeForm.querySelectorAll("[data-review-flag]")) review.textContent = reviewLabel;
+  };
+
+  const syncFlagType = () => {
+    if (!wizard) return;
+    const regex = flagTypeValue() === "regex";
+    const staticFields = challengeForm.querySelector("[data-static-flag-fields]");
+    const regexFields = challengeForm.querySelector("[data-regex-flag-fields]");
+    if (staticFields) staticFields.hidden = regex;
+    if (regexFields) regexFields.hidden = !regex;
+    if (challengeForm.elements.flag_content) challengeForm.elements.flag_content.disabled = regex;
+    if (challengeForm.elements.case_sensitive) challengeForm.elements.case_sensitive.disabled = regex;
+    if (challengeForm.elements.leet_variation) challengeForm.elements.leet_variation.disabled = regex;
+    const regexInput = challengeForm.elements.flag_regex_content;
+    if (regexInput) regexInput.disabled = !regex;
+    regexInput?.setCustomValidity(
+      regex && flagByteLength(regexInput.value) > 512
+        ? "The regular expression must be at most 512 UTF-8 bytes."
+        : regex && randomTokenCountIn(regexInput.value) > 0
+          ? "Random tokens are not available for regular expression flags."
+          : "",
+    );
+    if (regex && challengeForm.elements.accept_other_users) {
+      challengeForm.elements.accept_other_users.checked = false;
+      challengeForm.elements.accept_other_users.disabled = true;
+    }
+    for (const review of challengeForm.querySelectorAll("[data-review-flag]")) {
+      review.textContent = regex ? "Regular expression" : "Exact match";
+    }
+    syncPersonalization();
+  };
+
+  const syncGlobalRuntimeGate = ({ enforce = false } = {}) => {
+    if (!wizard) return;
+    const runtimeFields = challengeForm.querySelector("[data-challenge-runtime-fields]");
+    const gateAlreadyEnabled = runtimeFields?.dataset.globalGateEnabled === "true";
+    const enableGate = challengeForm.elements.enable_global_gate;
+    const requestedState = challengeForm.elements.state?.value || "hidden";
+    const gateReady = gateAlreadyEnabled || Boolean(enableGate?.checked);
+    challengeForm.elements.state?.setCustomValidity("");
+    enableGate?.setCustomValidity(
+      enforce && exposureValue() === "private" && requestedState !== "hidden" && !gateReady
+        ? "Enable private challenge launches globally, or save this challenge as a hidden draft."
+        : "",
+    );
+    enableGate?.closest(".challenge-global-gate")?.classList.toggle("confirmed", Boolean(enableGate.checked));
+  };
+
+  const syncExposure = () => {
+    if (!wizard) return;
+    const exposure = exposureValue();
+    const publicExplanation = challengeForm.querySelector("[data-public-explanation]");
+    const privateExplanation = challengeForm.querySelector("[data-private-explanation]");
+    const publicConnectionNote = challengeForm.querySelector("[data-public-connection-note]");
+    const privateConnectionNote = challengeForm.querySelector("[data-private-connection-note]");
+    const runtimeSettings = challengeForm.querySelector("[data-challenge-runtime-fields]");
+    if (publicExplanation) publicExplanation.hidden = exposure !== "public";
+    if (privateExplanation) privateExplanation.hidden = exposure !== "private";
+    if (publicConnectionNote) publicConnectionNote.hidden = exposure !== "public";
+    if (privateConnectionNote) privateConnectionNote.hidden = exposure !== "private";
+    if (runtimeSettings) runtimeSettings.hidden = exposure !== "private";
+    for (const control of runtimeSettings?.querySelectorAll("input, select, textarea") || []) {
+      control.disabled = exposure !== "private";
+    }
+    for (const review of challengeForm.querySelectorAll("[data-review-exposure]")) {
+      review.textContent = exposure === "private" ? "Private instance" : exposure === "public" ? "Public challenge" : "—";
+    }
+    const summary = challengeForm.querySelector("[data-submit-summary]");
+    if (summary) summary.textContent = exposure === "private" ? "Jeopardy · private instance" : "Jeopardy · public challenge";
+    syncFlagType();
+    syncGlobalRuntimeGate();
+  };
+
+  if (wizard) {
+    const panels = Array.from(challengeForm.querySelectorAll("[data-wizard-step]"));
+    const triggers = Array.from(challengeForm.querySelectorAll("[data-wizard-step-trigger]"));
+    const announcement = challengeForm.querySelector("[data-wizard-announcement]");
+    const stepNames = ["Challenge type", "Availability", "Details", "Flag", "Connection"];
+    let currentStep = 1;
+    let furthestStep = 1;
+
+    const setCrossFieldValidity = step => {
+      if (step === 4) syncPersonalization();
+      const minimum = challengeForm.elements.minimum;
+      minimum?.setCustomValidity(
+        step === 3 && typeField?.value === "dynamic" && asNumber(challengeForm, "minimum", 100) > asNumber(challengeForm, "initial", 500)
+          ? "Minimum score cannot exceed the initial score."
+          : "",
+      );
+      if (step !== 5) return;
+      syncGlobalRuntimeGate({ enforce: true });
+      const image = challengeForm.elements.image_digest;
+      if (exposureValue() === "private" && image) {
+        const validDigest = /^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$/.test(image.value.trim());
+        image.setCustomValidity(validDigest ? "" : "Enter an immutable image reference ending in @sha256: and 64 lowercase hexadecimal characters.");
+      } else image?.setCustomValidity("");
+      const maximumTtl = challengeForm.elements.maximum_ttl_minutes;
+      const defaultTtl = asNumber(challengeForm, "default_ttl_minutes", 30);
+      maximumTtl?.setCustomValidity(
+        exposureValue() === "private" && asNumber(challengeForm, "maximum_ttl_minutes", 60) < defaultTtl
+          ? "Maximum lifetime must be at least the default lifetime."
+          : "",
+      );
+    };
+
+    const validateStep = step => {
+      setCrossFieldValidity(step);
+      const panel = panels.find(candidate => Number(candidate.dataset.wizardStep) === step);
+      const invalid = Array.from(panel?.querySelectorAll("input, select, textarea") || [])
+        .find(control => !control.disabled && !control.checkValidity());
+      if (!invalid) return true;
+      invalid.reportValidity();
+      invalid.focus({ preventScroll: true });
+      invalid.scrollIntoView({ behavior: reducedMotionQuery.matches ? "auto" : "smooth", block: "center" });
+      return false;
+    };
+
+    const showStep = (step, { focus = true } = {}) => {
+      currentStep = Math.min(panels.length, Math.max(1, step));
+      furthestStep = Math.max(furthestStep, currentStep);
+      for (const panel of panels) panel.hidden = Number(panel.dataset.wizardStep) !== currentStep;
+      for (const trigger of triggers) {
+        const triggerStep = Number(trigger.dataset.wizardStepTrigger);
+        const item = trigger.closest("[data-wizard-progress-item]");
+        const active = triggerStep === currentStep;
+        trigger.disabled = triggerStep > furthestStep;
+        item?.classList.toggle("active", active);
+        item?.classList.toggle("complete", triggerStep < currentStep);
+        if (active) trigger.setAttribute("aria-current", "step");
+        else trigger.removeAttribute("aria-current");
+      }
+      if (announcement) announcement.textContent = `Step ${currentStep} of ${panels.length}: ${stepNames[currentStep - 1]}`;
+      const title = panels.find(panel => Number(panel.dataset.wizardStep) === currentStep)?.querySelector("h2");
+      if (focus) {
+        title?.focus({ preventScroll: true });
+        challengeForm.querySelector("[data-wizard-progress-item].active")?.scrollIntoView({ behavior: reducedMotionQuery.matches ? "auto" : "smooth", block: "nearest", inline: "center" });
+      }
+    };
+
+    for (const trigger of triggers) {
+      trigger.addEventListener("click", () => {
+        const target = Number(trigger.dataset.wizardStepTrigger);
+        if (target > currentStep) {
+          for (let step = currentStep; step < target; step += 1) {
+            showStep(step, { focus: false });
+            if (!validateStep(step)) return;
+          }
+        }
+        showStep(target);
+      });
+    }
+    for (const panel of panels) {
+      panel.querySelector("[data-wizard-next]")?.addEventListener("click", () => {
+        if (validateStep(currentStep)) showStep(currentStep + 1);
+      });
+      panel.querySelector("[data-wizard-back]")?.addEventListener("click", () => showStep(currentStep - 1));
+    }
+    for (const radio of challengeForm.querySelectorAll('input[name="exposure"]')) radio.addEventListener("change", syncExposure);
+    for (const radio of challengeForm.querySelectorAll('input[name="flag_type"]')) radio.addEventListener("change", syncFlagType);
+    challengeForm.elements.flag_content?.addEventListener("input", syncPersonalization);
+    challengeForm.elements.flag_regex_content?.addEventListener("input", syncFlagType);
+    challengeForm.elements.leet_variation?.addEventListener("change", syncPersonalization);
+    challengeForm.elements.image_digest?.addEventListener("input", () => challengeForm.elements.image_digest.setCustomValidity(""));
+    challengeForm.elements.maximum_ttl_minutes?.addEventListener("input", () => challengeForm.elements.maximum_ttl_minutes.setCustomValidity(""));
+    challengeForm.elements.minimum?.addEventListener("input", () => challengeForm.elements.minimum.setCustomValidity(""));
+    challengeForm.elements.state?.addEventListener("change", syncGlobalRuntimeGate);
+    challengeForm.elements.enable_global_gate?.addEventListener("change", syncGlobalRuntimeGate);
+    syncExposure();
+    showStep(1, { focus: false });
+  }
+
+  const privateEditGate = challengeForm.querySelector("[data-private-edit-gate]");
+  const syncPrivateEditGate = () => {
+    if (!privateEditGate) return;
+    const gateAlreadyEnabled = privateEditGate.dataset.globalGateEnabled === "true";
+    const enableGate = challengeForm.elements.enable_global_gate;
+    const requestedState = challengeForm.elements.state?.value || "hidden";
+    const gateReady = gateAlreadyEnabled || Boolean(enableGate?.checked);
+    challengeForm.elements.state?.setCustomValidity(
+      requestedState !== "hidden" && !gateReady
+        ? "Enable private challenge launches globally, or keep this challenge hidden."
+        : "",
+    );
+    enableGate?.closest(".challenge-global-gate")?.classList.toggle("confirmed", Boolean(enableGate.checked));
+  };
+  if (privateEditGate) {
+    challengeForm.elements.state?.addEventListener("change", syncPrivateEditGate);
+    challengeForm.elements.enable_global_gate?.addEventListener("change", syncPrivateEditGate);
+    syncPrivateEditGate();
+  }
+
+  const commonChallengePayload = () => {
     const dynamic = typeField?.value === "dynamic";
     const payload = {
       name: challengeForm.elements.name.value.trim(),
-      category: challengeForm.elements.category.value.trim(),
+      category_id: Number(challengeForm.elements.category_id.value),
       description: challengeForm.elements.description.value,
-      connection_info: challengeForm.elements.connection_info.value.trim() || null,
+      attribution: challengeForm.elements.attribution?.value.trim() || null,
+      connection_info: challengeForm.elements.connection_info?.value.trim() || null,
       type: typeField?.value || "standard",
       function: dynamic ? challengeForm.elements.function.value : "static",
       value: dynamic ? asNumber(challengeForm, "initial", 500) : asNumber(challengeForm, "value", 500),
       state: challengeForm.elements.state.value,
-      logic: "any",
       max_attempts: asNumber(challengeForm, "max_attempts", 0),
       position: asNumber(challengeForm, "position", 0),
     };
@@ -256,41 +677,125 @@ if (challengeForm) {
       payload.minimum = asNumber(challengeForm, "minimum", 100);
       payload.decay = asNumber(challengeForm, "decay", 50);
     }
+    return payload;
+  };
+
+  const createFlagPayload = () => {
+    const regex = flagTypeValue() === "regex";
+    const leet = Boolean(challengeForm.elements.leet_variation?.checked);
+    const generated = exposureValue() === "private" && !regex && (randomTokenCount() === 1 || leet);
+    return {
+      type: regex ? "regex" : generated ? "generated" : "static",
+      content: (regex ? challengeForm.elements.flag_regex_content.value : challengeForm.elements.flag_content.value).trim(),
+      data: regex
+        ? {}
+        : generated
+          ? { leet_variation: leet, accept_other_users: Boolean(challengeForm.elements.accept_other_users?.checked) }
+          : { case_sensitive: Boolean(challengeForm.elements.case_sensitive?.checked) },
+    };
+  };
+
+  const optionalMiB = name => {
+    const value = challengeForm.elements[name]?.value?.trim();
+    return value ? Number(value) * 1024 * 1024 : null;
+  };
+  const createRuntimePayload = () => ({
+    runtime_mode: "managed",
+    enabled: true,
+    image_digest: challengeForm.elements.image_digest.value.trim(),
+    protocol: challengeForm.elements.runtime_protocol.value,
+    container_port: asNumber(challengeForm, "container_port"),
+    default_ttl_seconds: asNumber(challengeForm, "default_ttl_minutes", 30) * 60,
+    maximum_ttl_seconds: asNumber(challengeForm, "maximum_ttl_minutes", 60) * 60,
+    allow_extension: Boolean(challengeForm.elements.allow_extension.checked),
+    maximum_extensions: asNumber(challengeForm, "maximum_extensions", 2),
+    cpu_limit: challengeForm.elements.cpu_limit.value.trim() || null,
+    memory_limit_bytes: optionalMiB("memory_limit_mib"),
+    pid_limit: challengeForm.elements.pid_limit.value.trim() ? asNumber(challengeForm, "pid_limit") : null,
+    storage_limit_bytes: optionalMiB("storage_limit_mib"),
+    healthcheck: {},
+    remote_pool: challengeForm.elements.remote_pool.value.trim() || null,
+    enable_global_gate: Boolean(challengeForm.elements.enable_global_gate?.checked),
+  });
+
+  challengeForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    syncPrivateEditGate();
+    if (wizard) {
+      syncPersonalization();
+      syncFlagType();
+      syncGlobalRuntimeGate({ enforce: true });
+      const image = challengeForm.elements.image_digest;
+      if (exposureValue() === "private" && image) {
+        const validDigest = /^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$/.test(image.value.trim());
+        image.setCustomValidity(validDigest ? "" : "Enter an immutable image reference ending in @sha256: and 64 lowercase hexadecimal characters.");
+      }
+      const maximumTtl = challengeForm.elements.maximum_ttl_minutes;
+      maximumTtl?.setCustomValidity(
+        exposureValue() === "private"
+          && asNumber(challengeForm, "maximum_ttl_minutes", 60) < asNumber(challengeForm, "default_ttl_minutes", 30)
+          ? "Maximum lifetime must be at least the default lifetime."
+          : "",
+      );
+      const minimum = challengeForm.elements.minimum;
+      minimum?.setCustomValidity(
+        typeField?.value === "dynamic"
+          && asNumber(challengeForm, "minimum", 100) > asNumber(challengeForm, "initial", 500)
+          ? "Minimum score cannot exceed the initial score."
+          : "",
+      );
+    }
+    if (!challengeForm.reportValidity()) return;
+    const submit = challengeForm.querySelector('button[type="submit"]');
+    const fileInput = challengeForm.querySelector("[data-challenge-files]");
+    const uploadStatus = challengeForm.querySelector("[data-upload-status]");
+    const selectedFiles = Array.from(fileInput?.files || []);
+    let stagedDesiredState = null;
+    setBusy(submit, true);
 
     try {
       const mode = challengeForm.dataset.mode;
+      const payload = commonChallengePayload();
+      if (mode === "create") {
+        payload.logic = "any";
+        payload.challenge_type = challengeForm.elements.challenge_type.value;
+        payload.exposure = exposureValue();
+        payload.flag = createFlagPayload();
+        if (selectedFiles.length && payload.state !== "hidden") {
+          stagedDesiredState = payload.state;
+          payload.state = "hidden";
+        }
+        if (exposureValue() === "private") {
+          payload.runtime = createRuntimePayload();
+        }
+      } else {
+        if (challengeForm.elements.enable_global_gate?.checked) {
+          payload.enable_global_gate = true;
+        }
+      }
       const path = mode === "create"
         ? "/api/v1/challenges"
         : `/api/v1/challenges/${challengeForm.dataset.challengeId}`;
       const result = await apiRequest(path, {
         method: mode === "create" ? "POST" : "PATCH",
-        headers: mode === "create" ? idempotencyHeaders() : undefined,
+        headers: mode === "create" ? challengeCreateHeaders : undefined,
         body: payload,
       });
-      const challengeId = result.data?.id || challengeForm.dataset.challengeId;
-      const flag = challengeForm.elements.flag?.value?.trim();
-      if (mode === "create" && flag && challengeId) {
+      if (mode === "create") {
         try {
-          await apiRequest("/api/v1/flags", {
-            method: "POST",
-            headers: idempotencyHeaders(),
-            body: { challenge_id: Number(challengeId), type: "static", content: flag, data: null },
-          });
-        } catch (error) {
-          showToast(`Challenge created, but its flag was not saved: ${error.message}`, "warning", 6000);
-          window.setTimeout(() => { window.location.href = `/admin/challenges/${challengeId}`; }, 900);
-          return;
+          window.sessionStorage.removeItem(challengeCreateStorageKey);
+        } catch (_error) {
+          // Idempotency remains server-enforced when session storage is unavailable.
         }
       }
-      const fileInput = challengeForm.querySelector("[data-challenge-files]");
-      const uploadStatus = challengeForm.querySelector("[data-upload-status]");
+      const challengeId = result.data?.id || challengeForm.dataset.challengeId;
       let uploadedFiles = 0;
       try {
         uploadedFiles = await uploadChallengeFiles(fileInput, uploadStatus, challengeId);
       } catch (error) {
         if (uploadStatus) uploadStatus.textContent = `Upload stopped: ${error.message}`;
         showToast(
-          `Challenge ${mode === "create" ? "created" : "updated"}, but its files were not all attached: ${error.message}`,
+          `Challenge ${mode === "create" ? "created" : "updated"}, but its files were not all attached: ${error.message}${stagedDesiredState ? " It remains hidden until you retry." : ""}`,
           "warning",
           7000,
         );
@@ -300,6 +805,18 @@ if (challengeForm) {
           setBusy(submit, false);
         }
         return;
+      }
+      if (mode === "create" && stagedDesiredState) {
+        try {
+          await apiRequest(`/api/v1/challenges/${challengeId}`, {
+            method: "PATCH",
+            body: { state: stagedDesiredState },
+          });
+        } catch (error) {
+          showToast(`Challenge and files were saved, but publication failed: ${error.message}. The challenge remains hidden.`, "warning", 7000);
+          window.setTimeout(() => { window.location.href = `/admin/challenges/${challengeId}`; }, 1400);
+          return;
+        }
       }
       const fileMessage = uploadedFiles
         ? ` ${uploadedFiles} file${uploadedFiles === 1 ? "" : "s"} attached.`
@@ -457,6 +974,308 @@ for (const secret of document.querySelectorAll("[data-secret-control]")) {
   });
 }
 
+function acceptConfigPayload(section, payload) {
+  for (const input of section.querySelectorAll("[data-config-input]")) {
+    if (Object.hasOwn(payload, input.dataset.configKey)) {
+      input.dataset.initialControl = input.value;
+      delete input.dataset.forceDirty;
+    }
+  }
+  for (const secret of section.querySelectorAll("[data-secret-control]")) {
+    if (!Object.hasOwn(payload, secret.dataset.configKey)) continue;
+    secret.dataset.configured = String(payload[secret.dataset.configKey] !== null);
+    const status = secret.querySelector("[data-secret-status]");
+    status?.classList.toggle("good", secret.dataset.configured === "true");
+    if (status) status.textContent = secret.dataset.configured === "true" ? "Configured" : "Not configured";
+    secret.querySelector("[data-secret-action]").value = "keep";
+    secret.querySelector("[data-secret-value]").value = "";
+    secret.querySelector("[data-secret-value]").disabled = true;
+  }
+  markConfigSection(section);
+}
+
+const userModeDialog = document.querySelector("[data-user-mode-transition-dialog]");
+const userModeDialogTitle = userModeDialog?.querySelector("[data-user-mode-transition-title]");
+const userModeDialogSummary = userModeDialog?.querySelector("[data-user-mode-transition-summary]");
+const userModeDialogStatus = userModeDialog?.querySelector("[data-user-mode-transition-status]");
+const userModeDialogBlockers = userModeDialog?.querySelector("[data-user-mode-transition-blockers]");
+const userModeDialogBlockerList = userModeDialog?.querySelector("[data-user-mode-transition-blocker-list]");
+const userModeDialogLogicWarning = userModeDialog?.querySelector("[data-user-mode-transition-logic-warning]");
+const userModeDialogLogicMessage = userModeDialog?.querySelector("[data-user-mode-transition-logic-message]");
+const userModeDialogCounts = userModeDialog?.querySelector("[data-user-mode-transition-counts]");
+const userModeDialogExpiry = userModeDialog?.querySelector("[data-user-mode-transition-expiry]");
+const userModeDialogConfirmation = userModeDialog?.querySelector("[data-user-mode-transition-confirmation]");
+const userModeDialogPhrase = userModeDialog?.querySelector("[data-user-mode-transition-phrase]");
+const userModeDialogInput = userModeDialog?.querySelector("[data-user-mode-transition-confirmation-input]");
+const userModeDialogConfirm = userModeDialog?.querySelector("[data-user-mode-transition-confirm]");
+const userModeDialogRetry = userModeDialog?.querySelector("[data-user-mode-transition-retry]");
+const userModeDialogCancel = userModeDialog?.querySelector("[data-user-mode-transition-cancel]");
+const userModeDialogClose = userModeDialog?.querySelector("[data-user-mode-transition-close]");
+
+const userModeImpactLabels = {
+  participants: "Participant credentials rotated (accounts preserved)",
+  teams: "Teams deleted",
+  memberships: "Team memberships removed",
+  submissions: "Submissions deleted",
+  solves: "Solves deleted",
+  awards: "Awards deleted",
+  unlocks: "Challenge unlocks deleted",
+  tracking: "Challenge-open tracking deleted",
+  dynamic_challenges: "Dynamic challenge values reset",
+  team_logic_challenges: "Team-specific challenge definitions preserved",
+  team_notifications: "Team notifications deleted",
+  team_field_entries: "Team profile fields deleted",
+  team_comments: "Team comments deleted",
+  team_objects: "Team-owned object records matched (teams removed)",
+  user_objects: "Participant competition-object records matched",
+  sessions: "Participant browser sessions revoked",
+  api_tokens: "Participant API tokens revoked",
+  active_runtimes: "Active private instances (must be stopped)",
+};
+
+let pendingUserModeTransition = null;
+let userModeTransitionPreview = null;
+let userModeTransitionExecuting = false;
+let userModePreviewRequest = 0;
+
+function accountModeLabel(mode) {
+  return mode === "teams" ? "Teams" : "Individual users";
+}
+
+function setUserModeDialogStatus(message, tone = "") {
+  if (!userModeDialogStatus) return;
+  userModeDialogStatus.textContent = message;
+  userModeDialogStatus.classList.remove("danger", "warning", "good");
+  if (tone) userModeDialogStatus.classList.add(tone);
+}
+
+function userModePreviewExpiresAt(value) {
+  const date = new Date(value || "");
+  return Number.isFinite(date.getTime())
+    ? `Valid until ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+    : "Fresh preview required";
+}
+
+function syncUserModeConfirmation() {
+  const blocked = !userModeTransitionPreview || userModeTransitionPreview.blocked;
+  const matches = userModeDialogInput?.value === userModeTransitionPreview?.confirmation_phrase;
+  if (userModeDialogConfirm) {
+    userModeDialogConfirm.disabled = userModeTransitionExecuting || blocked || !matches;
+  }
+}
+
+function setUserModeDialogBusy(busy) {
+  userModeTransitionExecuting = busy;
+  userModeDialog?.setAttribute("aria-busy", String(busy));
+  if (userModeDialogInput) userModeDialogInput.disabled = busy || Boolean(userModeTransitionPreview?.blocked);
+  if (userModeDialogCancel) userModeDialogCancel.disabled = busy;
+  if (userModeDialogClose) userModeDialogClose.disabled = busy;
+  if (userModeDialogRetry) userModeDialogRetry.disabled = busy;
+  if (busy) setBusy(userModeDialogConfirm, true, "Switching…");
+  else {
+    setBusy(userModeDialogConfirm, false);
+    syncUserModeConfirmation();
+  }
+}
+
+function renderUserModeImpact(preview) {
+  if (!userModeDialogCounts) return;
+  userModeDialogCounts.replaceChildren();
+  const affected = preview?.affected && typeof preview.affected === "object"
+    ? preview.affected
+    : {};
+  for (const [key, label] of Object.entries(userModeImpactLabels)) {
+    const row = document.createElement("tr");
+    const description = document.createElement("td");
+    const count = document.createElement("td");
+    description.textContent = label;
+    count.className = "table-actions mono";
+    count.textContent = String(affected[key] ?? 0);
+    row.append(description, count);
+    userModeDialogCounts.append(row);
+  }
+}
+
+function renderUserModeBlockers(preview) {
+  if (!userModeDialogBlockerList || !userModeDialogBlockers) return;
+  userModeDialogBlockerList.replaceChildren();
+  const blockers = Array.isArray(preview?.blockers) ? preview.blockers : [];
+  for (const blocker of blockers) {
+    const item = document.createElement("li");
+    const count = blocker && blocker.count !== undefined ? ` (${blocker.count})` : "";
+    item.textContent = `${blocker?.message || "Resolve this blocker before continuing."}${count}`;
+    userModeDialogBlockerList.append(item);
+  }
+  userModeDialogBlockers.hidden = !preview?.blocked;
+}
+
+async function loadUserModeTransitionPreview({ refreshed = false } = {}) {
+  if (!pendingUserModeTransition || !userModeDialog) return;
+  const requestId = ++userModePreviewRequest;
+  const targetMode = pendingUserModeTransition.targetMode;
+  userModeTransitionPreview = null;
+  if (userModeDialogInput) {
+    userModeDialogInput.value = "";
+    userModeDialogInput.disabled = true;
+  }
+  if (userModeDialogPhrase) userModeDialogPhrase.textContent = "";
+  if (userModeDialogConfirmation) userModeDialogConfirmation.hidden = true;
+  if (userModeDialogBlockers) userModeDialogBlockers.hidden = true;
+  if (userModeDialogLogicWarning) userModeDialogLogicWarning.hidden = true;
+  if (userModeDialogRetry) userModeDialogRetry.hidden = true;
+  if (userModeDialogExpiry) userModeDialogExpiry.textContent = "Preview loading";
+  if (userModeDialogCounts) {
+    userModeDialogCounts.innerHTML = '<tr><td colspan="2" class="admin-empty-row">Loading affected record counts…</td></tr>';
+  }
+  setUserModeDialogStatus("Preparing a fresh transition preview…");
+  syncUserModeConfirmation();
+
+  try {
+    const parameters = new URLSearchParams({ target: targetMode });
+    const result = await apiRequest(`/api/v1/views/admin/user-mode-transition?${parameters}`);
+    if (requestId !== userModePreviewRequest || pendingUserModeTransition?.targetMode !== targetMode) return;
+    const preview = result.data;
+    if (!preview || preview.target_mode !== targetMode || !["users", "teams"].includes(preview.source_mode)) {
+      throw new Error("The API returned an invalid account-mode preview.");
+    }
+    if (preview.source_mode === preview.target_mode) {
+      acceptConfigPayload(pendingUserModeTransition.section, { user_mode: targetMode });
+      userModeDialog.close();
+      showToast(`${accountModeLabel(targetMode)} is already the active account mode.`, "warning");
+      window.setTimeout(() => window.location.reload(), 450);
+      return;
+    }
+    userModeTransitionPreview = preview;
+    if (userModeDialogTitle) userModeDialogTitle.textContent = `Switch to ${accountModeLabel(targetMode)}`;
+    if (userModeDialogSummary) {
+      userModeDialogSummary.textContent = targetMode === "teams"
+        ? "Participant accounts are preserved, but competition history, any existing teams and memberships, and participant/team competition objects are retired. Every participant starts without a team."
+        : "Participant accounts are preserved, but competition history, memberships, teams, and participant/team competition objects are retired.";
+    }
+    renderUserModeImpact(preview);
+    renderUserModeBlockers(preview);
+    const teamLogicChallenges = preview.affected?.team_logic_challenges ?? 0;
+    const showLogicWarning = targetMode === "users" && Number(teamLogicChallenges) > 0;
+    if (userModeDialogLogicMessage) {
+      userModeDialogLogicMessage.textContent = `${teamLogicChallenges} challenge definition${Number(teamLogicChallenges) === 1 ? "" : "s"} use team-specific logic. `
+        + `${Number(teamLogicChallenges) === 1 ? "It is" : "They are"} preserved, but must be reviewed after switching to individual users.`;
+    }
+    if (userModeDialogLogicWarning) userModeDialogLogicWarning.hidden = !showLogicWarning;
+    if (userModeDialogExpiry) userModeDialogExpiry.textContent = userModePreviewExpiresAt(preview.expires_at);
+    if (userModeDialogPhrase) userModeDialogPhrase.textContent = preview.confirmation_phrase || "";
+    const blocked = Boolean(preview.blocked || !preview.preview_token || !preview.confirmation_phrase);
+    if (userModeDialogConfirmation) userModeDialogConfirmation.hidden = blocked;
+    if (userModeDialogInput) userModeDialogInput.disabled = blocked;
+    if (userModeDialogRetry) userModeDialogRetry.hidden = !blocked;
+    if (blocked) {
+      setUserModeDialogStatus("Resolve every blocker, then refresh the preview.", "danger");
+    } else {
+      setUserModeDialogStatus(
+        refreshed
+          ? "The database changed while you were reviewing it. Counts were refreshed; review them and confirm again."
+          : "Review these fresh counts and type the confirmation phrase to continue.",
+        refreshed ? "warning" : "",
+      );
+      window.requestAnimationFrame(() => userModeDialogInput?.focus());
+    }
+    syncUserModeConfirmation();
+  } catch (error) {
+    if (requestId !== userModePreviewRequest) return;
+    if (error.status === 401) {
+      window.location.assign("/login");
+      return;
+    }
+    userModeTransitionPreview = null;
+    if (userModeDialogExpiry) userModeDialogExpiry.textContent = "Preview unavailable";
+    if (userModeDialogRetry) userModeDialogRetry.hidden = false;
+    setUserModeDialogStatus(
+      error.message || "The transition preview could not be loaded.",
+      "danger",
+    );
+    syncUserModeConfirmation();
+  }
+}
+
+function openUserModeTransition(section, targetMode) {
+  if (!userModeDialog) {
+    showToast("The account-mode transition panel is unavailable. Refresh this page and try again.", "error", 5500);
+    return;
+  }
+  if (!["users", "teams"].includes(targetMode)) {
+    showToast("Choose a valid account mode.", "error", 5500);
+    return;
+  }
+  pendingUserModeTransition = { section, targetMode };
+  userModeTransitionPreview = null;
+  document.body.classList.add("user-mode-dialog-open");
+  if (typeof userModeDialog.showModal === "function") userModeDialog.showModal();
+  else userModeDialog.setAttribute("open", "");
+  loadUserModeTransitionPreview();
+}
+
+function closeUserModeTransition() {
+  if (!userModeDialog || userModeTransitionExecuting) return;
+  if (typeof userModeDialog.close === "function") userModeDialog.close();
+  else userModeDialog.removeAttribute("open");
+}
+
+userModeDialogInput?.addEventListener("input", syncUserModeConfirmation);
+userModeDialogInput?.addEventListener("keydown", event => {
+  if (event.key !== "Enter" || userModeDialogConfirm?.disabled) return;
+  event.preventDefault();
+  userModeDialogConfirm.click();
+});
+userModeDialogCancel?.addEventListener("click", closeUserModeTransition);
+userModeDialogClose?.addEventListener("click", closeUserModeTransition);
+userModeDialogRetry?.addEventListener("click", () => loadUserModeTransitionPreview());
+userModeDialog?.addEventListener("cancel", event => {
+  if (userModeTransitionExecuting) event.preventDefault();
+});
+userModeDialog?.addEventListener("close", () => {
+  userModePreviewRequest += 1;
+  document.body.classList.remove("user-mode-dialog-open");
+  userModeTransitionPreview = null;
+  pendingUserModeTransition?.section.querySelector("[data-user-mode-input]")?.focus();
+  pendingUserModeTransition = null;
+});
+
+userModeDialogConfirm?.addEventListener("click", async () => {
+  const pending = pendingUserModeTransition;
+  const preview = userModeTransitionPreview;
+  if (!pending || !preview || preview.blocked) return;
+  if (userModeDialogInput?.value !== preview.confirmation_phrase) return;
+  setUserModeDialogBusy(true);
+  setUserModeDialogStatus("Applying the destructive transition. Do not close this page…", "warning");
+  try {
+    await apiRequest("/api/v1/configs/user-mode-transition", {
+      method: "POST",
+      body: {
+        target_mode: pending.targetMode,
+        confirmation: userModeDialogInput.value,
+        preview_token: preview.preview_token,
+      },
+    });
+    acceptConfigPayload(pending.section, { user_mode: pending.targetMode });
+
+    setUserModeDialogBusy(false);
+    closeUserModeTransition();
+    showToast(`Account mode switched to ${accountModeLabel(pending.targetMode)}.`);
+    window.setTimeout(() => window.location.reload(), 450);
+  } catch (error) {
+    setUserModeDialogBusy(false);
+    if (error.status === 401) {
+      window.location.assign("/login");
+      return;
+    }
+    if (error.status === 409) {
+      await loadUserModeTransitionPreview({ refreshed: true });
+      return;
+    }
+    setUserModeDialogStatus(error.message || "The account-mode transition failed.", "danger");
+    if (userModeDialogRetry) userModeDialogRetry.hidden = false;
+  }
+});
+
 for (const section of document.querySelectorAll("[data-config-section]")) {
   section.addEventListener("input", () => {
     syncConfigDependencies();
@@ -470,6 +1289,32 @@ for (const section of document.querySelectorAll("[data-config-section]")) {
   });
   section.addEventListener("submit", async event => {
     event.preventDefault();
+    const userModeInput = section.querySelector("[data-user-mode-input]");
+    const userModeDirty = Boolean(
+      userModeInput
+      && userModeInput.dataset.staticDisabled !== "true"
+      && userModeInput.value !== userModeInput.dataset.initialControl,
+    );
+    const anotherInputDirty = Array.from(section.querySelectorAll("[data-config-input]"))
+      .some(input => input !== userModeInput
+        && input.dataset.staticDisabled !== "true"
+        && input.value !== input.dataset.initialControl);
+    const anotherSecretDirty = Array.from(section.querySelectorAll("[data-secret-control]"))
+      .some(secret => {
+        const action = secret.querySelector("[data-secret-action]");
+        return Boolean(action
+          && action.dataset.staticDisabled !== "true"
+          && action.value !== "keep");
+      });
+    if (userModeDirty && (anotherInputDirty || anotherSecretDirty)) {
+      showToast(
+        "Switch account mode separately. Revert to the current mode and save other settings first; team-only settings can be saved after the switch.",
+        "warning",
+        7000,
+      );
+      userModeInput.focus();
+      return;
+    }
     if (!section.reportValidity()) return;
     const payload = {};
     const dangers = [];
@@ -478,7 +1323,7 @@ for (const section of document.querySelectorAll("[data-config-section]")) {
         if (input.disabled || input.value === input.dataset.initialControl) continue;
         payload[input.dataset.configKey] = configInputValue(input);
         const danger = input.closest("[data-config-setting]")?.dataset.configDanger;
-        if (danger) dangers.push(danger);
+        if (danger && input.dataset.configKey !== "user_mode") dangers.push(danger);
       }
       for (const secret of section.querySelectorAll("[data-secret-control]")) {
         const action = secret.querySelector("[data-secret-action]");
@@ -502,27 +1347,15 @@ for (const section of document.querySelectorAll("[data-config-section]")) {
       return;
     }
     if (dangers.length && !window.confirm(`${dangers.join("\n\n")}\n\nSave this change?`)) return;
+    if (Object.hasOwn(payload, "user_mode")) {
+      openUserModeTransition(section, payload.user_mode);
+      return;
+    }
     const buttons = section.querySelectorAll('button[type="submit"]');
     for (const button of buttons) setBusy(button, true);
     try {
       await apiRequest("/api/v1/configs", { method: "PATCH", body: payload });
-      for (const input of section.querySelectorAll("[data-config-input]")) {
-        if (Object.hasOwn(payload, input.dataset.configKey)) {
-          input.dataset.initialControl = input.value;
-          delete input.dataset.forceDirty;
-        }
-      }
-      for (const secret of section.querySelectorAll("[data-secret-control]")) {
-        if (!Object.hasOwn(payload, secret.dataset.configKey)) continue;
-        secret.dataset.configured = String(payload[secret.dataset.configKey] !== null);
-        const status = secret.querySelector("[data-secret-status]");
-        status?.classList.toggle("good", secret.dataset.configured === "true");
-        if (status) status.textContent = secret.dataset.configured === "true" ? "Configured" : "Not configured";
-        secret.querySelector("[data-secret-action]").value = "keep";
-        secret.querySelector("[data-secret-value]").value = "";
-        secret.querySelector("[data-secret-value]").disabled = true;
-      }
-      markConfigSection(section);
+      acceptConfigPayload(section, payload);
       showToast(`${keys.length} setting${keys.length === 1 ? "" : "s"} saved atomically.`);
     } catch (error) {
       showToast(error.message || "This configuration section could not be saved.", "error", 5500);
@@ -695,54 +1528,495 @@ document.querySelector("[data-registration-allowlist]")?.addEventListener("click
   }
 });
 
-const runtimeSetting = document.querySelector("[data-runtime-setting]");
-runtimeSetting?.addEventListener("change", async () => {
-  const previous = !runtimeSetting.checked;
-  runtimeSetting.disabled = true;
+const machineEnrollmentForm = document.querySelector("[data-machine-enrollment-form]");
+machineEnrollmentForm?.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!machineEnrollmentForm.reportValidity()) return;
+  const button = machineEnrollmentForm.querySelector('button[type="submit"]');
+  const hostname = machineEnrollmentForm.elements.hostname.value.trim();
+  if (hostname.includes("://")) {
+    showToast("Enter a hostname or IP address, not a URL.", "error", 5500);
+    machineEnrollmentForm.elements.hostname.focus();
+    return;
+  }
+  const sshUser = machineEnrollmentForm.elements.name.value.trim();
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(sshUser) || ["root", "toor"].includes(sshUser)) {
+    showToast("Enter an existing non-root Linux username using lowercase letters, numbers, underscores, or hyphens.", "error", 5500);
+    machineEnrollmentForm.elements.name.focus();
+    return;
+  }
+  const body = {
+    name: sshUser,
+    hostname,
+    ssh_port: Number(machineEnrollmentForm.elements.ssh_port.value),
+  };
+  setBusy(button, true, "Registering…");
   try {
-    await apiRequest("/api/v1/admin/runtime/settings/private-challenges", {
-      method: "PATCH",
-      body: { enabled: runtimeSetting.checked },
+    await apiRequest("/api/v1/admin/ssh/hosts", {
+      method: "POST",
+      headers: idempotencyHeaders(),
+      body,
     });
-    const label = document.querySelector("[data-runtime-setting-label]");
-    if (label) label.textContent = runtimeSetting.checked ? "Enabled" : "Disabled";
-    showToast(`Private challenge instances ${runtimeSetting.checked ? "enabled" : "disabled"}.`);
+    showToast("Host registered. Preparing its browser-console access key.");
+    window.setTimeout(() => window.location.reload(), 500);
   } catch (error) {
-    runtimeSetting.checked = previous;
-    showToast(error.message || "The runtime setting could not be changed.", "error", 5500);
-  } finally {
-    runtimeSetting.disabled = false;
+    showToast(error.message || "The machine could not be registered.", "error", 5500);
+    setBusy(button, false);
   }
 });
 
-for (const button of document.querySelectorAll("[data-reconcile-instance]")) {
+for (const button of document.querySelectorAll("[data-machine-refresh]")) {
+  button.addEventListener("click", () => window.location.reload());
+}
+
+for (const button of document.querySelectorAll("[data-retry-machine]")) {
   button.addEventListener("click", async () => {
-    setBusy(button, true, "Queued…");
+    setBusy(button, true, "Retrying…");
     try {
-      await apiRequest(`/api/v1/admin/runtime/instances/${button.dataset.reconcileInstance}/reconcile`, { method: "POST" });
-      showToast("Reconciliation queued for the controller.");
+      await apiRequest(
+        `/api/v1/admin/ssh/hosts/${encodeURIComponent(button.dataset.retryMachine)}/identity/retry`,
+        { method: "POST" },
+      );
+      showToast("Access-key preparation queued.");
+      window.setTimeout(() => window.location.reload(), 450);
     } catch (error) {
-      showToast(error.message || "Reconciliation could not be queued.", "error", 5500);
-    } finally {
+      showToast(error.message || "Access-key preparation could not be retried.", "error", 5500);
       setBusy(button, false);
     }
   });
 }
 
-for (const button of document.querySelectorAll("[data-terminate-instance]")) {
+async function copyMachineValue(button) {
+  const card = button.closest("[data-machine-card]");
+  const value = card?.querySelector("[data-machine-authorized-line]")?.textContent || "";
+  if (!value) return;
+  let fallback = null;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      fallback = document.createElement("textarea");
+      fallback.className = "sr-only";
+      fallback.value = value;
+      fallback.setAttribute("readonly", "");
+      document.body.append(fallback);
+      fallback.select();
+      const copied = document.execCommand("copy");
+      if (!copied) throw new Error("Clipboard unavailable");
+    }
+    showToast("authorized_keys line copied.");
+  } catch (_error) {
+    showToast("Copy failed. Select the text and copy it manually.", "error", 5500);
+  } finally {
+    fallback?.remove();
+  }
+}
+
+for (const button of document.querySelectorAll("[data-machine-copy]")) {
+  button.addEventListener("click", () => copyMachineValue(button));
+}
+
+for (const button of document.querySelectorAll("[data-remove-machine]")) {
   button.addEventListener("click", async () => {
-    if (!window.confirm("Request termination of this managed instance?")) return;
-    setBusy(button, true, "Stopping…");
+    if (!window.confirm(
+      "Remove this host? The record and portal-held access key will be deleted. The installed authorized_keys line remains on the remote account and must be removed manually.",
+    )) return;
+    setBusy(button, true, "Removing…");
     try {
-      await apiRequest(`/api/v1/instances/${button.dataset.terminateInstance}/terminate`, { method: "POST" });
-      showToast("Termination requested. The controller will reconcile it asynchronously.");
-      window.setTimeout(() => window.location.reload(), 600);
+      await apiRequest(
+        `/api/v1/admin/ssh/hosts/${encodeURIComponent(button.dataset.removeMachine)}`,
+        { method: "DELETE" },
+      );
+      button.closest("[data-machine-card]")?.remove();
+      showToast("Host removed.");
+      window.setTimeout(() => window.location.reload(), 350);
     } catch (error) {
-      showToast(error.message || "Termination could not be requested.", "error", 5500);
+      showToast(error.message || "The host could not be removed.", "error", 5500);
       setBusy(button, false);
     }
   });
 }
+
+const SSH_WEBSOCKET_PATH = "/bff/ssh/terminal";
+const SSH_WEBSOCKET_PROTOCOL = "ctfzone.ssh.v1";
+const SSH_MAX_BUFFERED_INPUT = 1024 * 1024;
+const sshHostKeyDialog = document.querySelector("[data-host-key-dialog]");
+const sshHostKeyConfirm = sshHostKeyDialog?.querySelector("[data-host-key-confirm]");
+const sshHostKeyTrust = sshHostKeyDialog?.querySelector("[data-host-key-trust]");
+const sshTerminalDialog = document.querySelector("[data-ssh-terminal-dialog]");
+const sshTerminalContainer = sshTerminalDialog?.querySelector("[data-ssh-terminal]");
+const sshTerminalStatus = sshTerminalDialog?.querySelector("[data-ssh-terminal-status]");
+let activeSshSession = null;
+
+function boundedTerminalSize(terminal) {
+  return {
+    cols: Math.min(500, Math.max(20, Number(terminal?.cols) || 120)),
+    rows: Math.min(200, Math.max(5, Number(terminal?.rows) || 40)),
+  };
+}
+
+function validFingerprint(value) {
+  return typeof value === "string"
+    && /^SHA256:[A-Za-z0-9+/]{43}$/.test(value);
+}
+
+function validPublicHostKey(value, algorithm) {
+  if (algorithm !== "ssh-ed25519" || typeof value !== "string") return false;
+  const match = /^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})$/.exec(value);
+  if (!match) return false;
+  try {
+    const decoded = globalThis.atob(match[1]);
+    const prefix = "\0\0\0\x0bssh-ed25519\0\0\0\x20";
+    return decoded.length === prefix.length + 32 && decoded.startsWith(prefix);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function validUuid(value) {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function requestSshTicket(hostId, purpose) {
+  if (!validUuid(hostId) || !["probe", "terminal"].includes(purpose)) {
+    throw new Error("The SSH connection request is invalid.");
+  }
+  const { data } = await apiRequest(
+    `/api/v1/admin/ssh/hosts/${encodeURIComponent(hostId)}/tickets`,
+    { method: "POST", body: { purpose } },
+  );
+  const path = data?.websocket_path;
+  const expiry = Date.parse(data?.expires_at || "");
+  if (
+    typeof data?.ticket !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(data.ticket)
+    || data?.purpose !== purpose
+    || path !== SSH_WEBSOCKET_PATH
+    || !Number.isFinite(expiry)
+    || expiry <= Date.now()
+    || expiry > Date.now() + 5 * 60 * 1000
+  ) {
+    throw new Error("The SSH gateway returned an invalid connection ticket.");
+  }
+  return { ticket: data.ticket, path };
+}
+
+function openSshGateway(ticketData, { terminal = null, onControl, onBinary }) {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${window.location.host}${ticketData.path}`, SSH_WEBSOCKET_PROTOCOL);
+  socket.binaryType = "arraybuffer";
+  let oneTimeTicket = ticketData.ticket;
+  socket.addEventListener("open", () => {
+    const size = boundedTerminalSize(terminal);
+    socket.send(JSON.stringify({
+      type: "auth",
+      ticket: oneTimeTicket,
+      cols: size.cols,
+      rows: size.rows,
+      term: "xterm-256color",
+    }));
+    oneTimeTicket = "";
+  }, { once: true });
+  socket.addEventListener("close", () => { oneTimeTicket = ""; }, { once: true });
+  socket.addEventListener("message", async event => {
+    if (typeof event.data === "string") {
+      if (event.data.length > 8192) {
+        socket.close(1008, "control frame too large");
+        return;
+      }
+      let control;
+      try { control = JSON.parse(event.data); } catch (_error) {
+        socket.close(1008, "invalid control frame");
+        return;
+      }
+      onControl?.(control, socket);
+      return;
+    }
+    let bytes;
+    if (event.data instanceof ArrayBuffer) bytes = new Uint8Array(event.data);
+    else if (event.data instanceof Blob) bytes = new Uint8Array(await event.data.arrayBuffer());
+    else {
+      socket.close(1008, "invalid terminal frame");
+      return;
+    }
+    onBinary?.(bytes, socket);
+  });
+  return socket;
+}
+
+function machineTarget(card) {
+  return `${card?.dataset.machineUser || "invalid"}@${card?.dataset.machineHost || "invalid"}:${card?.dataset.machinePort || "0"}`;
+}
+
+function safeSshDiagnostic(value, fallback) {
+  const message = typeof value === "string" ? value : fallback;
+  return message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300) || fallback;
+}
+
+function clearHostKeyDialog() {
+  if (!sshHostKeyDialog) return;
+  for (const key of ["hostId", "candidateId", "hostRevision", "fingerprint"]) {
+    delete sshHostKeyDialog.dataset[key];
+  }
+  sshHostKeyDialog.querySelector("[data-host-key-target]").textContent = "";
+  sshHostKeyDialog.querySelector("[data-host-key-algorithm]").textContent = "";
+  sshHostKeyDialog.querySelector("[data-host-key-fingerprint]").textContent = "";
+  sshHostKeyDialog.querySelector("[data-host-key-public]").textContent = "";
+  if (sshHostKeyConfirm) sshHostKeyConfirm.checked = false;
+  if (sshHostKeyTrust) sshHostKeyTrust.disabled = true;
+}
+
+sshHostKeyConfirm?.addEventListener("change", () => {
+  if (sshHostKeyTrust) sshHostKeyTrust.disabled = !sshHostKeyConfirm.checked;
+});
+sshHostKeyDialog?.addEventListener("close", clearHostKeyDialog);
+
+for (const button of document.querySelectorAll("[data-probe-machine]")) {
+  button.addEventListener("click", async () => {
+    const card = button.closest("[data-machine-card]");
+    const hostId = button.dataset.probeMachine;
+    setBusy(button, true, "Inspecting…");
+    let received = false;
+    try {
+      const ticket = await requestSshTicket(hostId, "probe");
+      const socket = openSshGateway(ticket, {
+        onControl(control, connection) {
+          if (control?.type === "host_key") {
+            const revision = Number(control.host_revision);
+            if (
+              received
+              || !validUuid(control.session_id)
+              || !validUuid(control.candidate_id)
+              || !Number.isSafeInteger(revision)
+              || revision <= 0
+              || typeof control.algorithm !== "string"
+              || !validFingerprint(control.fingerprint)
+              || !validPublicHostKey(control.public_key, control.algorithm)
+            ) {
+              connection.close(1008, "invalid host-key result");
+              return;
+            }
+            received = true;
+            clearHostKeyDialog();
+            sshHostKeyDialog.dataset.hostId = hostId;
+            sshHostKeyDialog.dataset.candidateId = control.candidate_id;
+            sshHostKeyDialog.dataset.hostRevision = String(revision);
+            sshHostKeyDialog.dataset.fingerprint = control.fingerprint;
+            sshHostKeyDialog.querySelector("[data-host-key-target]").textContent = machineTarget(card);
+            sshHostKeyDialog.querySelector("[data-host-key-algorithm]").textContent = control.algorithm;
+            sshHostKeyDialog.querySelector("[data-host-key-fingerprint]").textContent = control.fingerprint;
+            sshHostKeyDialog.querySelector("[data-host-key-public]").textContent = control.public_key;
+            sshHostKeyDialog.showModal();
+            connection.close(1000, "probe complete");
+          } else if (control?.type === "error") {
+            received = true;
+            showToast(safeSshDiagnostic(control.message, "The SSH host-key inspection failed."), "error", 6000);
+            connection.close(1000, "probe failed");
+          } else {
+            connection.close(1008, "unexpected probe response");
+          }
+        },
+        onBinary(_bytes, connection) {
+          connection.close(1008, "unexpected probe data");
+        },
+      });
+      socket.addEventListener("close", () => {
+        if (!received) showToast("The SSH host-key inspection ended without a result.", "error", 6000);
+        setBusy(button, false);
+      }, { once: true });
+      socket.addEventListener("error", () => {
+        received = true;
+        showToast("The SSH gateway could not inspect this host.", "error", 6000);
+      }, { once: true });
+    } catch (error) {
+      showToast(safeSshDiagnostic(error?.message, "The SSH host-key inspection could not start."), "error", 6000);
+      setBusy(button, false);
+    }
+  });
+}
+
+sshHostKeyTrust?.addEventListener("click", async () => {
+  if (!sshHostKeyDialog || !sshHostKeyConfirm?.checked) return;
+  const hostId = sshHostKeyDialog.dataset.hostId;
+  const candidateId = sshHostKeyDialog.dataset.candidateId;
+  const fingerprint = sshHostKeyDialog.dataset.fingerprint;
+  const revision = Number(sshHostKeyDialog.dataset.hostRevision);
+  if (!validUuid(hostId) || !validUuid(candidateId) || !validFingerprint(fingerprint) || !Number.isSafeInteger(revision)) {
+    showToast("The inspected host-key result is no longer valid.", "error", 5500);
+    clearHostKeyDialog();
+    sshHostKeyDialog.close();
+    return;
+  }
+  setBusy(sshHostKeyTrust, true, "Trusting…");
+  try {
+    await apiRequest(
+      `/api/v1/admin/ssh/hosts/${encodeURIComponent(hostId)}/host-key/trust`,
+      { method: "POST", body: { candidate_id: candidateId, fingerprint, revision } },
+    );
+    clearHostKeyDialog();
+    sshHostKeyDialog.close();
+    showToast("Host identity trusted. The browser terminal is now available.");
+    window.setTimeout(() => window.location.reload(), 450);
+  } catch (error) {
+    showToast(error.message || "The host key could not be trusted.", "error", 6000);
+    setBusy(sshHostKeyTrust, false);
+  }
+});
+
+function setTerminalStatus(message, kind = "pending") {
+  if (!sshTerminalStatus) return;
+  sshTerminalStatus.textContent = message;
+  sshTerminalStatus.className = `status-pill ${kind}`;
+}
+
+function disposeActiveSshSession() {
+  if (!activeSshSession) return;
+  activeSshSession.resizeObserver?.disconnect();
+  if (activeSshSession.resizeHandler) {
+    window.removeEventListener("resize", activeSshSession.resizeHandler);
+  }
+  activeSshSession.socket?.close(1000, "administrator disconnected");
+  activeSshSession.inputDisposable?.dispose();
+  activeSshSession.terminal?.dispose();
+  activeSshSession = null;
+  if (sshTerminalContainer) sshTerminalContainer.replaceChildren();
+  setTerminalStatus("Disconnected");
+}
+
+for (const button of document.querySelectorAll("[data-connect-machine]")) {
+  button.addEventListener("click", async () => {
+    if (button.disabled || button.getAttribute("aria-disabled") === "true") return;
+    const TerminalClass = globalThis.Terminal;
+    const FitAddonClass = globalThis.FitAddon?.FitAddon;
+    if (!sshTerminalDialog || !sshTerminalContainer || !TerminalClass || !FitAddonClass) {
+      showToast("The browser terminal assets are unavailable.", "error", 6000);
+      return;
+    }
+    disposeActiveSshSession();
+    const card = button.closest("[data-machine-card]");
+    const target = machineTarget(card);
+    const expectedHostFingerprint = card?.dataset.machineHostKeyFingerprint;
+    if (!validFingerprint(expectedHostFingerprint)) {
+      showToast("The trusted host-key fingerprint is unavailable. Inspect the host key again.", "error", 6000);
+      return;
+    }
+    sshTerminalDialog.querySelector("[data-ssh-terminal-target]").textContent = target;
+    sshTerminalDialog.showModal();
+    const terminal = new TerminalClass({
+      allowProposedApi: false,
+      convertEol: true,
+      cursorBlink: true,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      fontSize: 13,
+      // Remote terminal output must never navigate the administrator's browser.
+      // xterm's null/default OSC-8 handler opens links, so provide an inert one.
+      linkHandler: {
+        activate() {},
+        hover() {},
+        leave() {},
+      },
+      scrollback: 5000,
+      theme: { background: "#101820", foreground: "#dce6ee", cursor: "#78b7ff" },
+      windowOptions: {},
+    });
+    const fitAddon = new FitAddonClass();
+    terminal.loadAddon(fitAddon);
+    terminal.open(sshTerminalContainer);
+    fitAddon.fit();
+    terminal.focus();
+    const session = { terminal, fitAddon, socket: null, ready: false, inputDisposable: null, resizeObserver: null, resizeHandler: null };
+    activeSshSession = session;
+    setTerminalStatus("Authorizing…");
+    try {
+      const ticket = await requestSshTicket(button.dataset.connectMachine, "terminal");
+      if (activeSshSession !== session) return;
+      session.socket = openSshGateway(ticket, {
+        terminal,
+        onControl(control, connection) {
+          if (control?.type === "ready" && !session.ready) {
+            if (
+              !validUuid(control.session_id)
+              || !validFingerprint(control.host_key_fingerprint)
+              || control.host_key_fingerprint !== expectedHostFingerprint
+            ) {
+              connection.close(1008, "invalid terminal identity");
+              return;
+            }
+            session.ready = true;
+            setTerminalStatus("Connected", "good");
+            terminal.focus();
+          } else if (control?.type === "exit" && session.ready && Number.isInteger(control.code) && control.code >= 0 && control.code <= 255) {
+            terminal.writeln(`\r\n[Remote shell exited with status ${control.code}]`);
+            setTerminalStatus("Exited");
+            connection.close(1000, "remote shell exited");
+          } else if (control?.type === "error") {
+            terminal.writeln(`\r\n[Connection error: ${safeSshDiagnostic(control.message || control.code, "unknown error")}]`);
+            setTerminalStatus("Connection failed", "bad");
+            connection.close(1000, "connection failed");
+          } else {
+            connection.close(1008, "unexpected terminal response");
+          }
+        },
+        onBinary(bytes, connection) {
+          if (!session.ready || bytes.byteLength > 1024 * 1024) {
+            connection.close(1008, "invalid terminal data");
+            return;
+          }
+          terminal.write(bytes);
+        },
+      });
+      session.inputDisposable = terminal.onData(data => {
+        if (session.ready && session.socket?.readyState === WebSocket.OPEN) {
+          const encoded = new TextEncoder().encode(data);
+          for (let offset = 0; offset < encoded.byteLength; offset += 16 * 1024) {
+            if (session.socket.bufferedAmount > SSH_MAX_BUFFERED_INPUT) {
+              terminal.writeln("\r\n[Connection closed: terminal input exceeded the browser buffer limit.]");
+              setTerminalStatus("Connection failed", "bad");
+              session.socket.close(1008, "terminal input backpressure");
+              return;
+            }
+            session.socket.send(encoded.slice(offset, offset + 16 * 1024));
+          }
+        }
+      });
+      session.socket.addEventListener("close", () => {
+        session.ready = false;
+        if (activeSshSession === session) setTerminalStatus("Disconnected");
+      });
+      session.socket.addEventListener("error", () => {
+        setTerminalStatus("Connection failed", "bad");
+      });
+      const resizeTerminal = () => {
+        if (activeSshSession !== session) return;
+        fitAddon.fit();
+        if (session.ready && session.socket?.readyState === WebSocket.OPEN) {
+          if (session.socket.bufferedAmount > SSH_MAX_BUFFERED_INPUT) return;
+          const size = boundedTerminalSize(terminal);
+          session.socket.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+        }
+      };
+      if (globalThis.ResizeObserver) {
+        session.resizeObserver = new globalThis.ResizeObserver(resizeTerminal);
+        session.resizeObserver.observe(sshTerminalContainer);
+      } else {
+        session.resizeHandler = resizeTerminal;
+        window.addEventListener("resize", resizeTerminal);
+      }
+    } catch (error) {
+      terminal.writeln(`\r\n[${safeSshDiagnostic(error?.message, "The SSH connection could not start.")}]`);
+      setTerminalStatus("Connection failed", "bad");
+    }
+  });
+}
+
+for (const button of document.querySelectorAll("[data-ssh-terminal-close], [data-ssh-terminal-disconnect]")) {
+  button.addEventListener("click", () => {
+    disposeActiveSshSession();
+    sshTerminalDialog?.close();
+  });
+}
+sshTerminalDialog?.addEventListener("close", disposeActiveSshSession);
 
 function finishSessionRevocation(data, message) {
   showToast(message);

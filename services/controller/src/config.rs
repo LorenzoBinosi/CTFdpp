@@ -45,6 +45,9 @@ impl Config {
         };
         let remote_operation_timeout =
             Duration::from_secs(positive_u64("REMOTE_OPERATION_TIMEOUT_SECONDS", 60)?);
+        if remote_operation_timeout < Duration::from_secs(60) {
+            anyhow::bail!("REMOTE_OPERATION_TIMEOUT_SECONDS must be at least 60");
+        }
         let stale_claim_after =
             Duration::from_secs(positive_u64("STALE_CLAIM_AFTER_SECONDS", 300)?);
         validate_lease_window(stale_claim_after, remote_operation_timeout)?;

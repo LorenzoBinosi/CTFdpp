@@ -44,12 +44,20 @@ _REQUIRED_ADMIN_TEMPLATES = (
     "users.html",
     "user_form.html",
     "config.html",
-    "runtime.html",
+    "machines.html",
     "records.html",
     "sessions.html",
-    "placeholder.html",
 )
-_REQUIRED_ADMIN_ASSETS = ("css/admin.css", "js/admin.js")
+_REQUIRED_ADMIN_ASSETS = (
+    "css/admin.css",
+    "js/admin.js",
+    "vendor/xterm/xterm.css",
+    "vendor/xterm/xterm.js",
+    "vendor/xterm/addon-fit.js",
+    "vendor/xterm/LICENSE",
+    "vendor/xterm/LICENSE.addon-fit",
+    "vendor/xterm/VERSIONS",
+)
 _REQUIRED_SHARED_ASSETS = ("js/api.js", "js/storage.js", "js/ui.js")
 
 

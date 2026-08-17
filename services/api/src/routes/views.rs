@@ -38,11 +38,6 @@ struct OverviewCounts {
     challenges: i64,
     users: i64,
     teams: i64,
-    instances: i64,
-    active_instances: i64,
-    ready_instances: i64,
-    pending_instances: i64,
-    failed_instances: i64,
 }
 
 pub(super) async fn challenges(
@@ -101,15 +96,7 @@ pub(super) async fn admin_overview(
         SELECT
           (SELECT COUNT(*) FROM ctfzone.challenges) AS challenges,
           (SELECT COUNT(*) FROM ctfzone.users) AS users,
-          (SELECT COUNT(*) FROM ctfzone.teams) AS teams,
-          (SELECT COUNT(*) FROM ctfzone.runtime_instances) AS instances,
-          (SELECT COUNT(*) FROM ctfzone.runtime_instances WHERE active) AS active_instances,
-          (SELECT COUNT(*) FROM ctfzone.runtime_instances WHERE observed_state='ready') AS ready_instances,
-          (SELECT COUNT(*) FROM ctfzone.runtime_instances
-             WHERE active AND observed_state IN ('requested','starting','stopping','cleanup_pending','unknown'))
-             AS pending_instances,
-          (SELECT COUNT(*) FROM ctfzone.runtime_instances WHERE observed_state='failed')
-             AS failed_instances
+          (SELECT COUNT(*) FROM ctfzone.teams) AS teams
         "#,
     )
     .fetch_one(&state.database)
@@ -130,20 +117,11 @@ pub(super) async fn admin_overview(
         "challenges": counts.challenges,
         "users": counts.users,
         "teams": counts.teams,
-        "instances": counts.instances,
-    });
-    let runtime = json!({
-        "total": counts.instances,
-        "active": counts.active_instances,
-        "ready": counts.ready_instances,
-        "pending": counts.pending_instances,
-        "failed": counts.failed_instances,
     });
 
     Ok(Json(Success::new(json!({
         "bootstrap": bootstrap,
         "stats": stats,
-        "runtime": runtime,
         "recent_submissions": recent_submissions,
     })))
     .into_response())

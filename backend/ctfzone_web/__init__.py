@@ -6,12 +6,14 @@ experience and talks to the Rust API over HTTP.
 
 from __future__ import annotations
 
+import ipaddress
+import math
 import os
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask
+from flask import Flask, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .api import ApiClient
@@ -19,11 +21,18 @@ from .frontends import FrontendRegistry, assets
 from .views import web
 
 
+# The Rust transition route has a proven 59-second worst-case window:
+# authentication (4s), execute pre-commit work including pool acquisition
+# (45s), PostgreSQL-capped COMMIT (8s), and activity recording (2s).
+TRANSITION_API_MAX_SECONDS = 59.0
+TRANSITION_TIMEOUT_HEADROOM_SECONDS = 5.0
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     # Frontend files are served only through the explicitly isolated asset
     # routes below.  Disabling Flask's implicit /static route prevents a player
     # frontend from accidentally reaching administration assets (and vice
-    # versa) through a legacy shared directory.
+    # versa) through Flask's implicit shared directory.
     app = Flask(__name__, static_folder=None, template_folder=None)
     app.config.from_mapping(
         API_BASE_URL=os.getenv("API_BASE_URL", "http://api:8080"),
@@ -34,6 +43,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         API_EMAIL_TIMEOUT_SECONDS=float(
             os.getenv("API_EMAIL_TIMEOUT_SECONDS", "20")
         ),
+        API_TRANSITION_TIMEOUT_SECONDS=float(
+            os.getenv("API_TRANSITION_TIMEOUT_SECONDS", "65")
+        ),
+        GUNICORN_WORKER_TIMEOUT_SECONDS=float(os.getenv("TIMEOUT", "75")),
         BACKEND_SERVICE_TOKEN=os.getenv("BACKEND_SERVICE_TOKEN"),
         FRONTENDS_ROOT=os.getenv(
             "FRONTENDS_ROOT", str(Path(__file__).resolve().parent / "frontends")
@@ -68,6 +81,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         raise RuntimeError(
             "BACKEND_SERVICE_TOKEN is required for the private Rust API boundary"
         )
+    _validate_transition_timeout_hierarchy(app)
 
     storage_url = str(app.config.get("OBJECT_STORAGE_PUBLIC_URL") or "").strip()
     storage_origin = ""
@@ -112,13 +126,23 @@ def create_app(test_config: dict | None = None) -> Flask:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-        connect_sources = "'self'"
+        connect_sources = ["'self'"]
+        websocket_origin = _same_origin_websocket_source(request.scheme, request.host)
+        if websocket_origin:
+            connect_sources.append(websocket_origin)
         if app.config["OBJECT_STORAGE_ORIGIN"]:
-            connect_sources += " " + app.config["OBJECT_STORAGE_ORIGIN"]
+            connect_sources.append(app.config["OBJECT_STORAGE_ORIGIN"])
+        style_sources = ["'self'"]
+        # xterm creates runtime <style> elements for its viewport, cell
+        # dimensions and theme, and also applies per-cell style attributes.
+        # Limit the required exception to the one page that hosts the terminal;
+        # scripts remain self-only and terminal bytes never enter HTML or CSS.
+        if request.path == "/admin/machines":
+            style_sources.append("'unsafe-inline'")
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
-            f"script-src 'self'; connect-src {connect_sources}; frame-ancestors 'self'; "
+            f"default-src 'self'; img-src 'self' data:; style-src {' '.join(style_sources)}; "
+            f"script-src 'self'; connect-src {' '.join(connect_sources)}; frame-ancestors 'self'; "
             "form-action 'self'; base-uri 'self'",
         )
         if response.mimetype == "text/html":
@@ -126,6 +150,89 @@ def create_app(test_config: dict | None = None) -> Flask:
         return response
 
     return app
+
+
+def _same_origin_websocket_source(scheme: str, raw_host: str) -> str:
+    """Serialize the trusted request origin as one exact CSP WebSocket source."""
+
+    if scheme not in {"http", "https"} or not isinstance(raw_host, str):
+        return ""
+    if not raw_host or len(raw_host) > 261 or not raw_host.isascii():
+        return ""
+    try:
+        parsed = urlsplit(f"//{raw_host}")
+        port = parsed.port
+    except ValueError:
+        return ""
+    hostname = parsed.hostname
+    if (
+        not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc != raw_host
+    ):
+        return ""
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        dns_name = hostname[:-1] if hostname.endswith(".") else hostname
+        labels = dns_name.split(".")
+        if (
+            not dns_name
+            or len(dns_name) > 253
+            or any(
+                not (1 <= len(label) <= 63)
+                or not label[0].isalnum()
+                or not label[-1].isalnum()
+                or any(not character.isalnum() and character != "-" for character in label)
+                for label in labels
+            )
+        ):
+            return ""
+        serialized_host = hostname.lower()
+    else:
+        serialized_host = (
+            f"[{address.compressed}]" if address.version == 6 else address.compressed
+        )
+
+    if port is not None:
+        serialized_host += f":{port}"
+    websocket_scheme = "wss" if scheme == "https" else "ws"
+    return f"{websocket_scheme}://{serialized_host}"
+
+
+def _validate_transition_timeout_hierarchy(app: Flask) -> None:
+    bff_timeout = float(app.config["API_TRANSITION_TIMEOUT_SECONDS"])
+    worker_timeout = float(app.config["GUNICORN_WORKER_TIMEOUT_SECONDS"])
+    for name, value in (
+        ("API_TRANSITION_TIMEOUT_SECONDS", bff_timeout),
+        ("GUNICORN_WORKER_TIMEOUT_SECONDS", worker_timeout),
+    ):
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError(f"{name} must be a positive finite number")
+
+    minimum_bff_timeout = (
+        TRANSITION_API_MAX_SECONDS + TRANSITION_TIMEOUT_HEADROOM_SECONDS
+    )
+    if bff_timeout < minimum_bff_timeout:
+        raise RuntimeError(
+            "API_TRANSITION_TIMEOUT_SECONDS must be at least "
+            f"{minimum_bff_timeout:g} seconds: the Rust API can use "
+            f"{TRANSITION_API_MAX_SECONDS:g} seconds and requires "
+            f"{TRANSITION_TIMEOUT_HEADROOM_SECONDS:g} seconds of proxy headroom"
+        )
+
+    minimum_worker_timeout = bff_timeout + TRANSITION_TIMEOUT_HEADROOM_SECONDS
+    if worker_timeout < minimum_worker_timeout:
+        raise RuntimeError(
+            "GUNICORN_WORKER_TIMEOUT_SECONDS must be at least "
+            f"{minimum_worker_timeout:g} seconds: it must exceed the transition "
+            f"BFF timeout by {TRANSITION_TIMEOUT_HEADROOM_SECONDS:g} seconds"
+        )
 
 
 __all__ = ["create_app"]

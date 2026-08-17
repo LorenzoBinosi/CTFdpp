@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
+    configuration_lock::{begin_configuration_shared_transaction, lock_configuration_shared},
     journal::{JournalIntent, OperationJournal},
     remote::{RemoteExecutor, RemoteOperation, RemoteResult, RemoteServer},
     state::{ControllerMode, SharedStatus},
@@ -424,7 +425,7 @@ async fn enqueue_active_inspections(pool: &PgPool, minimum_age: Option<StdDurati
 }
 
 async fn create_termination_command(pool: &PgPool, instance_id: Uuid, reason: &str) -> Result<()> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     let queued =
         create_termination_command_in_transaction(&mut transaction, instance_id, reason).await?;
     transaction.commit().await?;
@@ -439,6 +440,10 @@ async fn create_termination_command_in_transaction(
     instance_id: Uuid,
     reason: &str,
 ) -> Result<Option<(Uuid, i32)>> {
+    // Keep this helper safe if a future caller supplies its own transaction.
+    // The lock is re-entrant when the caller already used the fenced begin
+    // helper, and it must precede the runtime row lock below.
+    lock_configuration_shared(transaction).await?;
     let row = sqlx::query_as::<_, OverdueRow>(
         r#"
         SELECT id,generation,private_challenges_revision,
@@ -523,9 +528,9 @@ async fn process_available_commands(
 ) -> Result<()> {
     // Deliberate v1 concurrency bound: one in-flight runtime command globally.
     // Together with the singleton PostgreSQL lease, this preserves per-instance
-    // ordering and makes select_remote_server -> mark_starting an atomic logical
-    // reservation. Do not add parallelism until placement reservations are a
-    // first-class row/constraint and per-instance ordering remains serialized.
+    // ordering. Host selection and placement are also committed under the
+    // selected remote-server row lock. Do not add parallelism until
+    // per-instance command ordering remains explicitly serialized.
     while !*shutdown.borrow() {
         // The advisory lock is bound to this dedicated connection. Check it
         // before every claim so a worker whose lease connection died cannot
@@ -649,13 +654,25 @@ async fn execute_start(
     // `mark_starting` persists placement before the remote call. A reclaimed
     // command must reuse that host; selecting again could leave one generation
     // running on two hosts if the first claimant lost leadership in flight.
-    let server = if let Some(server_id) = instance.remote_server_id {
-        load_remote_server(pool, server_id).await?
+    let (server, marked_starting) = if let Some(server_id) = instance.remote_server_id {
+        let server = load_remote_server(pool, server_id).await?;
+        let marked = mark_starting(pool, command, instance, &server).await?;
+        (server, marked)
     } else {
-        select_remote_server(pool, &instance.deployment_snapshot).await?
+        match select_and_mark_starting(pool, command, instance).await? {
+            Some(server) => (server, true),
+            None => {
+                return cancel_command(
+                    pool,
+                    command,
+                    "instance generation changed before remote workload startup",
+                )
+                .await;
+            }
+        }
     };
-    let payload = remote_payload(command, instance, "start");
-    if !mark_starting(pool, command, instance, &server).await? {
+    let payload = remote_payload(command, instance, RemoteOperation::EnsureInstance, "start");
+    if !marked_starting {
         return cancel_command(
             pool,
             command,
@@ -693,7 +710,12 @@ async fn execute_start(
         .await?;
     let committed = finish_start(pool, command, instance, &server, &result).await?;
     if !committed {
-        let cleanup_payload = remote_payload(command, instance, "generation_changed_after_start");
+        let cleanup_payload = remote_payload(
+            command,
+            instance,
+            RemoteOperation::StopInstance,
+            "generation_changed_after_start",
+        );
         let cleanup_intent = journal_intent(
             command,
             instance,
@@ -770,7 +792,12 @@ async fn execute_terminate(
         .await;
     }
     if let Some(server) = server.as_ref() {
-        let payload = remote_payload(command, instance, "terminate");
+        let payload = remote_payload(
+            command,
+            instance,
+            RemoteOperation::StopInstance,
+            "terminate",
+        );
         journal
             .intent(journal_intent(
                 command,
@@ -839,7 +866,7 @@ async fn execute_extend(
         .remote_server_id
         .context("instance has no remote server for extension")?;
     let server = load_remote_server(pool, server_id).await?;
-    let payload = remote_payload(command, instance, "extend");
+    let payload = remote_payload(command, instance, RemoteOperation::UpdateDeadline, "extend");
     journal
         .intent(journal_intent(
             command,
@@ -903,7 +930,12 @@ async fn execute_inspect(
         return cancel_command(pool, command, "instance has no remote server to inspect").await;
     };
     let server = load_remote_server(pool, server_id).await?;
-    let payload = remote_payload(command, instance, "inspect");
+    let payload = remote_payload(
+        command,
+        instance,
+        RemoteOperation::InspectInstance,
+        "inspect",
+    );
     journal
         .intent(journal_intent(
             command,
@@ -951,7 +983,18 @@ async fn execute_inspect(
     Ok(())
 }
 
-fn remote_payload(command: &CommandRow, instance: &InstanceRow, reason: &str) -> Value {
+fn remote_payload(
+    command: &CommandRow,
+    instance: &InstanceRow,
+    operation: RemoteOperation,
+    reason: &str,
+) -> Value {
+    let mut deployment = instance.deployment_snapshot.clone();
+    if !matches!(operation, RemoteOperation::EnsureInstance) {
+        if let Some(deployment) = deployment.as_object_mut() {
+            deployment.remove("flag_value");
+        }
+    }
     json!({
         "instance_id": instance.id,
         "owner_user_id": instance.owner_user_id,
@@ -959,7 +1002,7 @@ fn remote_payload(command: &CommandRow, instance: &InstanceRow, reason: &str) ->
         "generation": command.generation,
         "expires_at": instance.desired_expires_at,
         "maximum_expires_at": instance.maximum_expires_at,
-        "deployment": instance.deployment_snapshot,
+        "deployment": deployment,
         "reason": reason,
         "command_payload": command.payload,
         "remote_container_id": instance.remote_container_id,
@@ -1024,23 +1067,31 @@ fn journal_intent<'a>(
     }
 }
 
-async fn select_remote_server(pool: &PgPool, snapshot: &Value) -> Result<RemoteServer> {
+async fn select_remote_server_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    snapshot: &Value,
+) -> Result<RemoteServer> {
     let requested_pool = snapshot.get("remote_pool").and_then(Value::as_str);
     sqlx::query_as::<_, RemoteServer>(
         r#"
         SELECT s.id,s.name,s.hostname,s.ssh_port,s.ssh_user,s.helper_path,
                s.identity_file,s.host_key_alias,s.pool,s.capacity
         FROM ctfzone.remote_servers s
-        LEFT JOIN ctfzone.runtime_instances i ON i.remote_server_id=s.id AND i.active
         WHERE s.enabled AND ($1::text IS NULL OR s.pool=$1)
-        GROUP BY s.id
-        HAVING COUNT(i.id) < s.capacity
-        ORDER BY COUNT(i.id),s.name
+          AND (
+              SELECT COUNT(*) FROM ctfzone.runtime_instances i
+              WHERE i.remote_server_id=s.id AND i.active
+          ) < s.capacity
+        ORDER BY (
+            SELECT COUNT(*) FROM ctfzone.runtime_instances i
+            WHERE i.remote_server_id=s.id AND i.active
+        ),s.name
+        FOR UPDATE OF s SKIP LOCKED
         LIMIT 1
         "#,
     )
     .bind(requested_pool)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **transaction)
     .await?
     .context("no enabled remote server has available capacity")
 }
@@ -1065,7 +1116,7 @@ async fn mark_starting(
     instance: &InstanceRow,
     server: &RemoteServer,
 ) -> Result<bool> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(false);
@@ -1100,6 +1151,48 @@ async fn mark_starting(
     Ok(true)
 }
 
+async fn select_and_mark_starting(
+    pool: &PgPool,
+    command: &CommandRow,
+    instance: &InstanceRow,
+) -> Result<Option<RemoteServer>> {
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
+    if !lock_command_claim(&mut transaction, command).await? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    let server =
+        select_remote_server_locked(&mut transaction, &instance.deployment_snapshot).await?;
+    let update = sqlx::query(
+        r#"
+        UPDATE ctfzone.runtime_instances SET observed_state='starting',
+            remote_server_id=$1,activated_at=COALESCE(activated_at,now()),
+            last_observed_at=now(),failure_code=NULL,failure_message=NULL
+        WHERE id=$2 AND generation=$3 AND active AND desired_state='running'
+        "#,
+    )
+    .bind(server.id)
+    .bind(instance.id)
+    .bind(command.generation)
+    .execute(&mut *transaction)
+    .await?;
+    if update.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    append_event(
+        &mut transaction,
+        instance.id,
+        "instance.starting",
+        "controller",
+        None,
+        json!({"command_id": command.id, "remote_server_id": server.id}),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Some(server))
+}
+
 async fn finish_start(
     pool: &PgPool,
     command: &CommandRow,
@@ -1113,7 +1206,7 @@ async fn finish_start(
     if effective_expires_at > instance.maximum_expires_at {
         bail!("remote helper returned a deadline beyond the maximum lifetime");
     }
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         bail!("runtime command claim lease was lost after remote startup");
@@ -1174,7 +1267,7 @@ async fn mark_stopping(
     command: &CommandRow,
     instance: &InstanceRow,
 ) -> Result<bool> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(false);
@@ -1217,7 +1310,7 @@ async fn finish_termination(
     } else {
         "instance.terminated"
     };
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(false);
@@ -1274,7 +1367,7 @@ async fn finish_extension(
     if effective > instance.maximum_expires_at || effective <= Utc::now() {
         bail!("remote helper returned an invalid extended deadline");
     }
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(false);
@@ -1316,7 +1409,7 @@ async fn finish_inspection(
     result: &RemoteResult,
 ) -> Result<bool> {
     let absent = result.absent.unwrap_or(false);
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(false);
@@ -1440,7 +1533,7 @@ async fn reject_start(
     instance: &InstanceRow,
     gate: &RuntimeGate,
 ) -> Result<()> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(());
@@ -1489,7 +1582,7 @@ async fn expire_unstarted_instance(
     command: &CommandRow,
     instance: &InstanceRow,
 ) -> Result<()> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(());
@@ -1527,7 +1620,7 @@ async fn cancel_stale_command(
     command: &CommandRow,
     instance: &InstanceRow,
 ) -> Result<()> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = begin_configuration_shared_transaction(pool).await?;
     if !lock_command_claim(&mut transaction, command).await? {
         transaction.rollback().await?;
         return Ok(());
@@ -1657,7 +1750,7 @@ async fn schedule_retry(
 ) -> Result<()> {
     let message = truncate(message, 1000);
     if command.attempts >= config.max_command_attempts {
-        let mut transaction = pool.begin().await?;
+        let mut transaction = begin_configuration_shared_transaction(pool).await?;
         let failed = sqlx::query(
             r#"
             UPDATE ctfzone.runtime_commands
@@ -1861,6 +1954,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_runtime_instance_writer_takes_the_configuration_fence_first() {
+        let source = include_str!("worker.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("worker source must contain production code");
+        let mut writers = 0;
+        for function in source.split("async fn ").skip(1) {
+            let mutation = [
+                "UPDATE ctfzone.runtime_instances",
+                "INSERT INTO ctfzone.runtime_instances",
+                "DELETE FROM ctfzone.runtime_instances",
+            ]
+            .into_iter()
+            .filter_map(|marker| function.find(marker))
+            .min();
+            let Some(mutation) = mutation else {
+                continue;
+            };
+            writers += 1;
+            let fence = [
+                "begin_configuration_shared_transaction(pool)",
+                "lock_configuration_shared(transaction)",
+            ]
+            .into_iter()
+            .filter_map(|marker| function.find(marker))
+            .min()
+            .expect("runtime_instances writer is missing the CONFIG-S fence");
+            assert!(
+                fence < mutation,
+                "runtime_instances writer takes the CONFIG-S fence after its mutation"
+            );
+        }
+        assert!(
+            writers > 0,
+            "runtime writer audit did not inspect any writers"
+        );
+        assert!(
+            !source.contains("let mut transaction = pool.begin().await?"),
+            "runtime worker transactions must use the CONFIG-S fenced begin helper"
+        );
+    }
+
+    #[test]
+    fn new_placement_locks_the_remote_host_before_persisting_it() {
+        let source = include_str!("worker.rs");
+        let selector = source
+            .split("async fn select_remote_server_locked")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn load_remote_server").next())
+            .expect("locked remote-server selector must exist");
+        assert!(selector.contains("FOR UPDATE OF s SKIP LOCKED"));
+
+        let placement = source
+            .split("async fn select_and_mark_starting")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn finish_start").next())
+            .expect("atomic placement function must exist");
+        let lock = placement
+            .find("select_remote_server_locked")
+            .expect("placement must lock its selected host");
+        let update = placement
+            .find("UPDATE ctfzone.runtime_instances")
+            .expect("placement must persist the selected host");
+        assert!(lock < update);
+    }
+
+    #[test]
     fn truncates_errors_on_character_boundaries() {
         assert_eq!(truncate("aé日", 2), "aé");
     }
@@ -1919,5 +2079,69 @@ mod tests {
         };
         assert!(require_remote_ready(&exited, "startup").is_err());
         assert!(require_remote_ready(&RemoteResult::default(), "startup").is_err());
+    }
+
+    #[test]
+    fn personalized_flag_is_dispatched_only_for_instance_startup() {
+        let now = Utc::now();
+        let instance_id = Uuid::new_v4();
+        let command = CommandRow {
+            id: Uuid::new_v4(),
+            claim_token: Uuid::new_v4(),
+            instance_id,
+            kind: "start".to_owned(),
+            generation: 1,
+            setting_revision: 1,
+            challenge_runtime_revision: 1,
+            payload: json!({}),
+            attempts: 1,
+        };
+        let instance = InstanceRow {
+            id: instance_id,
+            owner_user_id: 7,
+            challenge_id: 11,
+            deployment_snapshot: json!({
+                "image_digest": format!("example/challenge@sha256:{}", "a".repeat(64)),
+                "container_port": 31337,
+                "flag_value": "flag{personalized-secret}",
+            }),
+            desired_state: "running".to_owned(),
+            desired_expires_at: now,
+            maximum_expires_at: now,
+            expires_at: now,
+            remote_server_id: None,
+            remote_container_id: None,
+            generation: 1,
+            active: true,
+        };
+
+        let start = remote_payload(
+            &command,
+            &instance,
+            RemoteOperation::EnsureInstance,
+            "start",
+        );
+        assert_eq!(
+            start
+                .pointer("/deployment/flag_value")
+                .and_then(Value::as_str),
+            Some("flag{personalized-secret}")
+        );
+
+        for operation in [
+            RemoteOperation::InspectInstance,
+            RemoteOperation::StopInstance,
+            RemoteOperation::UpdateDeadline,
+        ] {
+            let payload = remote_payload(&command, &instance, operation, "non-start");
+            assert!(payload.pointer("/deployment/flag_value").is_none());
+            assert_eq!(
+                payload
+                    .pointer("/deployment/container_port")
+                    .and_then(Value::as_i64),
+                Some(31337)
+            );
+            assert!(!payload.to_string().contains("personalized-secret"));
+        }
     }
 }

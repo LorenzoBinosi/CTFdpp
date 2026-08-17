@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS ctfzone.remote_servers (
     host_key_alias text,
     pool text,
     capacity integer NOT NULL DEFAULT 100 CHECK (capacity > 0),
-    enabled boolean NOT NULL DEFAULT true,
+    enabled boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );

@@ -10,9 +10,6 @@ use crate::{
     routes::Success,
 };
 
-// Admission inputs are read together so the response can report the effective
-// legacy-compatible mode. Only `registration_access_mode` is serialized; the
-// code and domain rule values remain private to the API process.
 const BOOTSTRAP_CONFIG_KEYS: &[&str] = &[
     "ctf_name",
     "ctf_description",
@@ -29,9 +26,6 @@ const BOOTSTRAP_CONFIG_KEYS: &[&str] = &[
     "account_visibility",
     "registration_visibility",
     "registration_access_mode",
-    "registration_code",
-    "domain_whitelist",
-    "domain_blacklist",
 ];
 
 #[derive(Serialize)]
@@ -115,9 +109,6 @@ pub(super) async fn data(
     let user_mode = config(&configs, "user_mode", "users");
     let registration_access_mode = crate::browser_auth::effective_registration_access_mode(
         configs.get("registration_access_mode").map(String::as_str),
-        configs.get("registration_code").map(String::as_str),
-        configs.get("domain_whitelist").map(String::as_str),
-        configs.get("domain_blacklist").map(String::as_str),
     )
     .to_owned();
     let authenticated = user.is_some();

@@ -1,14 +1,16 @@
-"""A deliberately small Markdown renderer with an escape-first policy.
+"""A small Markdown renderer with an escape-first, allowlisted HTML policy.
 
-Challenge authors get headings, lists, emphasis, links, and code. Raw HTML is
-shown as text rather than accepted, keeping the BFF safe without a large parser
-or sanitizer dependency.
+Challenge authors get headings, lists, emphasis, links, code, and a deliberately
+limited set of structural HTML tags. Attributes and URL schemes are rebuilt
+from an allowlist; scripts, styles, media, event handlers, and unknown tags are
+rendered as text instead of becoming active player-page content.
 """
 
 from __future__ import annotations
 
 import re
 from html import escape
+from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 from markupsafe import Markup
@@ -18,6 +20,47 @@ _LINK = re.compile(r"\[([^\]\n]+)]\(([^)\s]+)\)")
 _CODE = re.compile(r"`([^`\n]+)`")
 _BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
 _ITALIC = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+_ALLOWED_HTML_TAGS = frozenset(
+    {
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "code",
+        "details",
+        "div",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "hr",
+        "i",
+        "kbd",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "span",
+        "strong",
+        "sub",
+        "summary",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+)
+_VOID_HTML_TAGS = frozenset({"br", "hr"})
+_BLOCK_HTML = re.compile(
+    r"^</?(?:blockquote|details|div|h[1-4]|hr|ol|p|pre|summary|table|tbody|td|th|thead|tr|ul)(?:\s|/?>)",
+    re.IGNORECASE,
+)
 
 
 def _safe_href(value: str) -> str | None:
@@ -29,9 +72,71 @@ def _safe_href(value: str) -> str | None:
     return None
 
 
+class _HtmlTokenParser(HTMLParser):
+    def __init__(self, tokens: dict[str, str]) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tokens = tokens
+        self.output: list[str] = []
+
+    def _token(self, html: str) -> None:
+        token = f"\x00HTML{len(self.tokens)}\x00"
+        self.tokens[token] = html
+        self.output.append(token)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if tag not in _ALLOWED_HTML_TAGS:
+            self.output.append(escape(self.get_starttag_text() or f"<{tag}>", quote=True))
+            return
+        if tag == "a":
+            values = {name.casefold(): value for name, value in attrs if value is not None}
+            href = _safe_href(values.get("href", ""))
+            title = values.get("title")
+            attributes = ""
+            if href is not None:
+                attributes += f' href="{escape(href, quote=True)}"'
+                attributes += ' target="_blank" rel="noopener noreferrer"'
+            if title:
+                attributes += f' title="{escape(title, quote=True)}"'
+            self._token(f"<a{attributes}>")
+            return
+        self._token(f"<{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.casefold() in _ALLOWED_HTML_TAGS and tag.casefold() not in _VOID_HTML_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag in _ALLOWED_HTML_TAGS and tag not in _VOID_HTML_TAGS:
+            self._token(f"</{tag}>")
+        elif tag not in _VOID_HTML_TAGS:
+            self.output.append(escape(f"</{tag}>", quote=True))
+
+    def handle_data(self, data: str) -> None:
+        self.output.append(escape(data, quote=True))
+
+    def handle_comment(self, data: str) -> None:
+        self.output.append(escape(f"<!--{data}-->", quote=True))
+
+    def handle_decl(self, decl: str) -> None:
+        self.output.append(escape(f"<!{decl}>", quote=True))
+
+    def handle_pi(self, data: str) -> None:
+        self.output.append(escape(f"<?{data}>", quote=True))
+
+
+def _escape_with_safe_html(raw: str, tokens: dict[str, str]) -> str:
+    parser = _HtmlTokenParser(tokens)
+    parser.feed(raw)
+    parser.close()
+    return "".join(parser.output)
+
+
 def _inline(raw: str) -> str:
-    value = escape(raw, quote=True)
     tokens: dict[str, str] = {}
+    value = _escape_with_safe_html(raw, tokens)
 
     def code(match: re.Match[str]) -> str:
         token = f"\x00CODE{len(tokens)}\x00"
@@ -107,6 +212,11 @@ def render_markdown(raw: object) -> Markup:
         if item:
             flush_paragraph()
             list_items.append(_inline(item.group(1)))
+            continue
+        if _BLOCK_HTML.match(stripped):
+            flush_paragraph()
+            flush_list()
+            output.append(_inline(stripped))
             continue
         flush_list()
         paragraph.append(line)

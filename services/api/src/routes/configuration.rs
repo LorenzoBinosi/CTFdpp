@@ -148,7 +148,6 @@ struct CatalogSetting {
     depends_on: Option<CatalogDependency>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group: Option<CatalogGroup>,
-    advanced: bool,
 }
 
 #[derive(Serialize)]
@@ -285,7 +284,7 @@ const TEAM_DISBANDING: &[OptionDefinition] = &[
 const MAIL_PROVIDERS: &[OptionDefinition] = &[
     OptionDefinition {
         value: "auto",
-        label: "Automatic (legacy)",
+        label: "Automatic",
     },
     OptionDefinition {
         value: "disabled",
@@ -303,14 +302,14 @@ const MAIL_PROVIDERS: &[OptionDefinition] = &[
 
 const ACCOUNT_GROUPS: &[GroupDefinition] = &[
     GroupDefinition {
-        id: "account_type",
-        title: "Account type",
-        description: "Choose whether participants compete as individual users or teams.",
-    },
-    GroupDefinition {
         id: "participant_accounts",
         title: "Participant accounts",
         description: "Common identity, capacity, and account policies for every participant.",
+    },
+    GroupDefinition {
+        id: "account_type",
+        title: "Account type",
+        description: "Choose whether participants compete as individual users or teams.",
     },
     GroupDefinition {
         id: "team_accounts",
@@ -325,11 +324,11 @@ const ACCOUNT_GROUPS: &[GroupDefinition] = &[
 ];
 
 const ACCOUNT_SETTING_ORDER: &[&str] = &[
-    "user_mode",
     "num_users",
     "password_min_length",
     "name_changes",
     "verify_emails",
+    "user_mode",
     "team_creation",
     "team_size",
     "num_teams",
@@ -376,12 +375,6 @@ const SECTIONS: &[SectionDefinition] = &[
         id: "email",
         title: "Email delivery",
         description: "SMTP or Mailgun delivery used for administrator messages.",
-        groups: &[],
-    },
-    SectionDefinition {
-        id: "advanced",
-        title: "Advanced legacy",
-        description: "Preserved legacy configuration not currently interpreted by CTFZone.",
         groups: &[],
     },
 ];
@@ -436,9 +429,11 @@ const SETTINGS: &[SettingDefinition] = &[
         required: true,
         read_only: false,
         warning: Some(
-            "Changing competition mode after participants or competition activity exist is blocked.",
+            "Changing competition mode permanently resets submissions, solves, awards, unlocks, tracking, and dynamic challenge scores.",
         ),
-        danger: Some("This changes score ownership and participant workflows."),
+        danger: Some(
+            "Use the dedicated impact preview and confirmation flow. This action cannot be undone.",
+        ),
         depends_on: None,
     },
     SettingDefinition {
@@ -970,6 +965,10 @@ fn setting(key: &str) -> Option<&'static SettingDefinition> {
     SETTINGS.iter().find(|definition| definition.key == key)
 }
 
+pub(super) fn is_known_setting(key: &str) -> bool {
+    setting(key).is_some()
+}
+
 pub(super) async fn catalog(database: &PgPool) -> Result<ConfigurationCatalog, ApiError> {
     let stored_rows = sqlx::query_as::<_, StoredConfig>(
         "SELECT id,key,value FROM ctfzone.config ORDER BY key,id",
@@ -983,31 +982,6 @@ pub(super) async fn catalog(database: &PgPool) -> Result<ConfigurationCatalog, A
             stored.insert(key, (row.id, row.value));
         }
     }
-
-    let inferred_registration_mode = if stored
-        .get("registration_access_mode")
-        .and_then(|(_, value)| value.as_deref())
-        .is_none_or(|value| value.is_empty())
-    {
-        if stored
-            .get("registration_code")
-            .and_then(|(_, value)| value.as_deref())
-            .is_some_and(|value| !value.is_empty())
-        {
-            Some("access_code".to_owned())
-        } else if ["domain_whitelist", "domain_blacklist"].iter().any(|key| {
-            stored
-                .get(*key)
-                .and_then(|(_, value)| value.as_deref())
-                .is_some_and(|value| !value.is_empty())
-        }) {
-            Some("domain_rules".to_owned())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     let mut sections = SECTIONS
         .iter()
@@ -1026,13 +1000,7 @@ pub(super) async fn catalog(database: &PgPool) -> Result<ConfigurationCatalog, A
         .collect::<Vec<_>>();
     for definition in SETTINGS {
         let stored_value = stored.remove(definition.key).and_then(|(_, value)| value);
-        let mut catalog_setting = known_catalog_setting(definition, stored_value);
-        if definition.key == "registration_access_mode" {
-            if let Some(inferred) = inferred_registration_mode.as_ref() {
-                catalog_setting.value = Some(Value::String(inferred.clone()));
-                catalog_setting.effective = Some(Value::String(inferred.clone()));
-            }
-        }
+        let catalog_setting = known_catalog_setting(definition, stored_value);
         sections
             .iter_mut()
             .find(|section| section.id == definition.section)
@@ -1047,28 +1015,6 @@ pub(super) async fn catalog(database: &PgPool) -> Result<ConfigurationCatalog, A
                 .position(|key| *key == setting.key)
                 .unwrap_or(usize::MAX)
         });
-    }
-    let advanced = sections
-        .iter_mut()
-        .find(|section| section.id == "advanced")
-        .expect("advanced section is declared");
-    if let Some((_, stored_value)) = stored.remove("social_shares") {
-        let mut legacy = legacy_catalog_setting("social_shares".to_owned(), stored_value);
-        legacy.read_only = true;
-        legacy.warning = Some(
-            "Stored for compatibility, but player share pages are not implemented yet.".to_owned(),
-        );
-        advanced.settings.push(legacy);
-    }
-    let mut legacy = stored.into_iter().collect::<Vec<_>>();
-    legacy.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, (_, stored_value)) in legacy {
-        if key == crate::setup::COMPLETED_MARKER_KEY || key == "private_challenges" {
-            continue;
-        }
-        advanced
-            .settings
-            .push(legacy_catalog_setting(key, stored_value));
     }
     sections.retain(|section| !section.settings.is_empty());
 
@@ -1136,36 +1082,6 @@ fn known_catalog_setting(
                 values: values.iter().map(|value| (*value).to_owned()).collect(),
             }),
         group: account_group(definition.key).map(CatalogGroup::from),
-        advanced: false,
-    }
-}
-
-fn legacy_catalog_setting(key: String, stored_value: Option<String>) -> CatalogSetting {
-    let sensitive = is_sensitive_key(&key);
-    let configured = stored_value
-        .as_deref()
-        .is_some_and(|value| !value.is_empty());
-    let visible = (!sensitive).then(|| Value::String(stored_value.clone().unwrap_or_default()));
-    CatalogSetting {
-        label: key.clone(),
-        help: "Preserved legacy setting. CTFZone does not currently interpret this value."
-            .to_owned(),
-        setting_type: if sensitive { "secret" } else { "string" },
-        key,
-        value: visible.clone(),
-        default: None,
-        effective: visible.clone(),
-        stored: visible,
-        configured,
-        sensitive,
-        required: false,
-        read_only: false,
-        warning: Some("Advanced legacy setting; changing it may have no effect.".to_owned()),
-        danger: None,
-        options: Vec::new(),
-        depends_on: None,
-        group: None,
-        advanced: true,
     }
 }
 
@@ -1228,15 +1144,9 @@ pub(super) async fn normalize_mutations(
     transaction: &mut Transaction<'_, Postgres>,
     request: &Map<String, Value>,
 ) -> Result<Vec<(String, String)>, ApiError> {
-    let mut proposed = request.clone();
-    proposed.remove("clear_registration_access_modes");
-    if proposed.contains_key("private_challenges") {
-        return Err(ApiError::bad_request(
-            "Private challenge runtime settings use the controller settings endpoint",
-        ));
-    }
+    let proposed = request.clone();
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(0x4354_465A_i64)
+        .bind(super::user_mode_transition::CONFIGURATION_LOCK_KEY)
         .execute(&mut **transaction)
         .await
         .map_err(ApiError::database)?;
@@ -1268,14 +1178,8 @@ fn normalize_value(key: &str, value: Value, current: Option<&str>) -> Result<Str
             "The setup completion marker cannot be changed through configuration",
         ));
     }
-    if key == "social_shares" {
-        return Err(ApiError::bad_request(
-            "Social sharing cannot be enabled until player share pages are implemented",
-        ));
-    }
-    let Some(definition) = setting(key) else {
-        return generic_value(value);
-    };
+    let definition =
+        setting(key).ok_or_else(|| ApiError::bad_request("Unknown configuration setting"))?;
     if definition.read_only {
         return Err(ApiError::bad_request(format!(
             "{} is read-only",
@@ -1512,30 +1416,9 @@ async fn validate_user_mode_transition(
     if previous == requested {
         return Ok(());
     }
-    sqlx::query(
-        "LOCK TABLE ctfzone.users,ctfzone.teams,ctfzone.submissions,ctfzone.solves,ctfzone.awards IN SHARE MODE",
-    )
-    .execute(&mut **transaction)
-    .await
-    .map_err(ApiError::database)?;
-    let has_activity = sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS(SELECT 1 FROM ctfzone.users WHERE type <> 'admin')
-            OR EXISTS(SELECT 1 FROM ctfzone.teams)
-            OR EXISTS(SELECT 1 FROM ctfzone.submissions)
-            OR EXISTS(SELECT 1 FROM ctfzone.solves)
-            OR EXISTS(SELECT 1 FROM ctfzone.awards)
-        "#,
-    )
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(ApiError::database)?;
-    if has_activity {
-        return Err(ApiError::conflict(
-            "Competition mode cannot change after participants or competition activity exist",
-        ));
-    }
-    Ok(())
+    Err(ApiError::conflict(
+        "Competition mode changes require the dedicated impact preview and confirmation flow",
+    ))
 }
 
 fn validate_key(key: &str) -> Result<(), ApiError> {
@@ -1548,17 +1431,6 @@ fn validate_key(key: &str) -> Result<(), ApiError> {
         return Err(ApiError::bad_request("Configuration key is invalid"));
     }
     Ok(())
-}
-
-fn generic_value(value: Value) -> Result<String, ApiError> {
-    match value {
-        Value::String(value) => Ok(value),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::Null => Ok(String::new()),
-        _ => serde_json::to_string(&value)
-            .map_err(|_| ApiError::bad_request("Configuration value is invalid")),
-    }
 }
 
 fn text_value(value: Value, label: &str) -> Result<String, ApiError> {
@@ -1623,29 +1495,6 @@ pub(super) async fn upsert_normalized(
     .map_err(ApiError::database)
 }
 
-pub(super) async fn delete_legacy(
-    transaction: &mut Transaction<'_, Postgres>,
-    key: &str,
-) -> Result<u64, ApiError> {
-    validate_key(key)?;
-    if setting(key).is_some() || key == crate::setup::COMPLETED_MARKER_KEY {
-        return Err(ApiError::bad_request(
-            "Known configuration settings must be changed to their default value instead of deleted",
-        ));
-    }
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(0x4354_465A_i64)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::database)?;
-    sqlx::query("DELETE FROM ctfzone.config WHERE key=$1")
-        .bind(key)
-        .execute(&mut **transaction)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(ApiError::database)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1659,7 +1508,7 @@ mod tests {
             "registration_code",
             "mail_password",
             "mailgun_api_key",
-            "legacy_token",
+            "custom_token",
             "SMTP_PASSWORD",
             "CUSTOM_TOKEN",
             "MAILGUN_API_KEY",
@@ -1673,12 +1522,10 @@ mod tests {
             assert!(!serialized.contains(&sentinel));
             assert!(serialized.contains("\"configured\":true"));
         }
-        let catalog = legacy_catalog_setting("custom_secret".to_owned(), Some(sentinel.clone()));
-        assert!(!serde_json::to_string(&catalog).unwrap().contains(&sentinel));
     }
 
     #[test]
-    fn catalog_covers_every_known_runtime_setting() {
+    fn catalog_covers_every_known_setting() {
         let keys = SETTINGS
             .iter()
             .map(|setting| setting.key)
@@ -1732,12 +1579,22 @@ mod tests {
     }
 
     #[test]
+    fn automatic_mail_provider_has_release_copy() {
+        let automatic = MAIL_PROVIDERS
+            .iter()
+            .find(|provider| provider.value == "auto")
+            .expect("automatic provider exists");
+        assert_eq!(automatic.label, "Automatic");
+    }
+
+    #[test]
     fn catalog_sections_and_keys_are_unique_and_complete() {
         let section_ids = SECTIONS
             .iter()
             .map(|section| section.id)
             .collect::<HashSet<_>>();
         assert_eq!(section_ids.len(), SECTIONS.len());
+        assert!(!section_ids.contains("advanced"));
         let keys = SETTINGS
             .iter()
             .map(|setting| setting.key)
@@ -1773,11 +1630,11 @@ mod tests {
         assert_eq!(
             ACCOUNT_SETTING_ORDER,
             [
-                "user_mode",
                 "num_users",
                 "password_min_length",
                 "name_changes",
                 "verify_emails",
+                "user_mode",
                 "team_creation",
                 "team_size",
                 "num_teams",
@@ -1800,14 +1657,13 @@ mod tests {
                 .map(|group| group.id)
                 .collect::<Vec<_>>(),
             vec![
-                "account_type",
                 "participant_accounts",
+                "account_type",
                 "team_accounts",
                 "registration_access",
             ]
         );
         for (group, expected) in [
-            ("account_type", vec!["user_mode"]),
             (
                 "participant_accounts",
                 vec![
@@ -1817,6 +1673,7 @@ mod tests {
                     "verify_emails",
                 ],
             ),
+            ("account_type", vec!["user_mode"]),
             (
                 "team_accounts",
                 vec!["team_creation", "team_size", "num_teams", "team_disbanding"],
@@ -1847,6 +1704,46 @@ mod tests {
                 Some(("user_mode", &["teams"][..]))
             );
         }
+        let mode = setting("user_mode").unwrap();
+        assert_eq!(
+            mode.warning,
+            Some(
+                "Changing competition mode permanently resets submissions, solves, awards, unlocks, tracking, and dynamic challenge scores."
+            )
+        );
+        assert_eq!(
+            mode.danger,
+            Some(
+                "Use the dedicated impact preview and confirmation flow. This action cannot be undone."
+            )
+        );
+    }
+
+    #[test]
+    fn only_declared_settings_are_mutable() {
+        assert!(setting("user_mode").is_some());
+        assert!(is_known_setting("user_mode"));
+        assert!(!is_known_setting("custom_setting"));
+        assert!(normalize_value("custom_setting", json!("value"), None).is_err());
+        let source = include_str!("configuration.rs");
+        let transition_guard = source
+            .split_once("async fn validate_user_mode_transition(")
+            .expect("user mode transition guard exists")
+            .1
+            .split_once("fn validate_key(")
+            .expect("user mode transition guard has a boundary")
+            .0;
+        assert!(transition_guard.contains("previous == requested"));
+        assert!(transition_guard.contains("dedicated impact preview and confirmation flow"));
+        assert!(!transition_guard.contains("LOCK TABLE"));
+    }
+
+    #[test]
+    fn removed_compatibility_routes_are_absent() {
+        let routes = include_str!("mod.rs");
+        assert!(!routes.contains("administration::delete_config"));
+        assert!(!routes.contains("/api/v1/shares"));
+        assert!(!routes.contains("/api/v1/files"));
     }
 
     #[test]
@@ -1865,7 +1762,6 @@ mod tests {
         assert!(normalize_value("setup", json!(true), None).is_err());
         assert!(normalize_value("start", json!(-1), None).is_err());
         assert!(normalize_value("start", json!(253_402_300_800_i64), None).is_err());
-        assert!(normalize_value("social_shares", json!(true), None).is_err());
         assert!(normalize_value("mailgun_base_url", json!("file:///etc/passwd"), None).is_err());
         assert!(normalize_value("mailfrom_addr", json!("not-an-email"), None).is_err());
         assert!(normalize_value("mailfrom_addr", json!("CTF <ctf@example.org>"), None).is_ok());

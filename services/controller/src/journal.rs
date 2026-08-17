@@ -21,6 +21,7 @@ use crate::remote::{RemoteExecutor, RemoteOperation, RemoteResult, RemoteServer}
 // Historical records are already durable in PostgreSQL. The local journal only
 // needs the latest state for operations that PostgreSQL has not acknowledged.
 const COMPACTION_THRESHOLD_BYTES: u64 = 1024 * 1024;
+const REDACTED_FLAG_VALUE: &str = "[redacted]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -96,7 +97,7 @@ impl OperationJournal {
             remote_server: intent.remote_server.cloned(),
             effective_expires_at: intent.effective_expires_at,
             remote_result: None,
-            payload: Some(intent.payload.clone()),
+            payload: Some(redact_payload(intent.payload)),
             updated_at: Utc::now(),
         })
         .await
@@ -120,7 +121,7 @@ impl OperationJournal {
                 .effective_expires_at
                 .unwrap_or(intent.effective_expires_at),
             remote_result: Some(result.clone()),
-            payload: Some(intent.payload.clone()),
+            payload: Some(redact_payload(intent.payload)),
             updated_at: Utc::now(),
         })
         .await
@@ -271,7 +272,8 @@ impl OperationJournal {
                 continue;
             }
             match serde_json::from_str::<JournalRecord>(line) {
-                Ok(record) => {
+                Ok(mut record) => {
+                    record.payload = record.payload.as_ref().map(redact_payload);
                     let key = (record.instance_id, record.command_id);
                     if record.phase == JournalPhase::DatabaseAcknowledged {
                         current.remove(&key);
@@ -311,7 +313,10 @@ impl OperationJournal {
     }
 
     async fn append_locked(&self, record: &JournalRecord) -> Result<()> {
-        let mut encoded = serde_json::to_vec(record).context("failed to encode journal record")?;
+        let mut persisted = record.clone();
+        persisted.payload = persisted.payload.as_ref().map(redact_payload);
+        let mut encoded =
+            serde_json::to_vec(&persisted).context("failed to encode journal record")?;
         encoded.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
@@ -382,6 +387,22 @@ impl OperationJournal {
         }
         result
     }
+}
+
+fn redact_payload(payload: &Value) -> Value {
+    let mut redacted = payload.clone();
+    if let Some(deployment) = redacted
+        .get_mut("deployment")
+        .and_then(Value::as_object_mut)
+    {
+        if deployment.contains_key("flag_value") {
+            deployment.insert(
+                "flag_value".to_owned(),
+                Value::String(REDACTED_FLAG_VALUE.to_owned()),
+            );
+        }
+    }
+    redacted
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -505,6 +526,53 @@ mod tests {
             .unwrap();
         assert!(journal.current_unacknowledged().await.unwrap().is_empty());
         assert_eq!(fs::metadata(&path).await.unwrap().len(), 0);
+        fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intent_and_result_records_redact_flag_without_mutating_remote_payload() {
+        let (directory, path) = test_paths("flag-redaction");
+        let journal = OperationJournal::open(path.clone()).await.unwrap();
+        let instance_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let secret = "flag{journal-must-not-store-this}";
+        let payload = json!({
+            "instance_id": instance_id,
+            "deployment": {
+                "image_digest": "example@sha256:test",
+                "flag_value": secret,
+            }
+        });
+        let deadline = Utc::now() + Duration::minutes(30);
+
+        journal
+            .intent(intent(instance_id, command_id, &payload, None, deadline))
+            .await
+            .unwrap();
+        journal
+            .remote_result(
+                intent(instance_id, command_id, &payload, None, deadline),
+                &RemoteResult::default(),
+            )
+            .await
+            .unwrap();
+
+        // Journal redaction must not alter the payload subsequently sent over
+        // SSH to the remote helper.
+        assert_eq!(payload["deployment"]["flag_value"], secret);
+        let content = fs::read_to_string(&path).await.unwrap();
+        assert!(!content.contains(secret));
+        let records = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(
+                record["payload"]["deployment"]["flag_value"],
+                REDACTED_FLAG_VALUE
+            );
+        }
         fs::remove_dir_all(directory).await.unwrap();
     }
 

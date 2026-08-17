@@ -4,6 +4,14 @@ This helper is the only command the controller may execute on a challenge host. 
 
 It runs challenge images with a dedicated rootless Podman account, drops all Linux capabilities, enables `no-new-privileges`, applies configured CPU/memory/PID/storage limits, creates a separate bridge network for every instance, and assigns a random host port. `CTFZONE_NETWORK` is the network-name prefix (at most 30 characters), not a shared bridge. Images must be pinned as `repository@sha256:<64 hex characters>`.
 
+For personalized private challenges, the controller may supply one optional
+`deployment.flag_value`. The helper accepts a non-empty UTF-8 value of at most
+512 bytes with no NUL character and exposes it to the new container only as
+`CTFZONE_FLAG`. Arbitrary environment maps are rejected. The raw value is not
+written to the controller operation journal or the helper state file; helper
+state retains only a SHA-256 fingerprint so an idempotent retry cannot silently
+reuse a container with different flag material.
+
 Every launch also creates a generation-specific host-side systemd timer for the
 absolute expiry time. The timer removes the container without involving
 CTFZone. Extending an instance installs the new timer before retiring the old

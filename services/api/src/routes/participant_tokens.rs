@@ -7,7 +7,7 @@ use axum::{
 use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::json;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{AppState, auth::CurrentUser, error::ApiError, routes::Success};
@@ -34,8 +34,18 @@ pub(super) async fn get(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Json<Success<ParticipantTokenData>>, ApiError> {
-    let account = current_account(&state, &user).await?;
-    let token = load_token(&state, account).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
+    let account = current_account_in_transaction(&mut transaction, &user).await?;
+    let token = load_token_in_transaction(&mut transaction, account).await?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(serialize(token))))
 }
 
@@ -43,13 +53,22 @@ pub(super) async fn rotate(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Response, ApiError> {
-    let account = current_account(&state, &user).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::team_accounts::lock_team_membership(&mut transaction).await?;
+    let account = current_account_in_transaction(&mut transaction, &user).await?;
     if let Account::Team(team_id) = account {
         let captain_id = sqlx::query_scalar::<_, Option<i32>>(
             "SELECT captain_id FROM ctfzone.teams WHERE id = $1",
         )
         .bind(team_id)
-        .fetch_optional(&state.database)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(ApiError::database)?
         .flatten();
@@ -79,7 +98,7 @@ pub(super) async fn rotate(
         .bind(&value)
         .bind(user_id)
         .bind(cutoff)
-        .fetch_optional(&state.database)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(ApiError::database)?,
         Account::Team(team_id) => sqlx::query_as::<_, ParticipantTokenRow>(
@@ -98,16 +117,18 @@ pub(super) async fn rotate(
         .bind(&value)
         .bind(team_id)
         .bind(cutoff)
-        .fetch_optional(&state.database)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(ApiError::database)?,
     };
 
     if let Some(rotated) = rotated {
+        transaction.commit().await.map_err(ApiError::database)?;
         return Ok(Json(Success::new(serialize(rotated))).into_response());
     }
 
-    let current = load_token(&state, account).await?;
+    let current = load_token_in_transaction(&mut transaction, account).await?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok((
         StatusCode::TOO_MANY_REQUESTS,
         Json(json!({
@@ -121,17 +142,20 @@ pub(super) async fn rotate(
         .into_response())
 }
 
-async fn current_account(state: &AppState, user: &CurrentUser) -> Result<Account, ApiError> {
-    let mode = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM ctfzone.config WHERE key = 'user_mode' LIMIT 1",
-    )
-    .fetch_optional(&state.database)
-    .await
-    .map_err(ApiError::database)?
-    .flatten();
-
-    if mode.as_deref() == Some("teams") {
-        user.team_id
+async fn current_account_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    user: &CurrentUser,
+) -> Result<Account, ApiError> {
+    if super::user_mode_transition::transaction_user_mode(transaction).await? == "teams" {
+        let team_id = sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT team_id FROM ctfzone.users WHERE id=$1 AND type='user'",
+        )
+        .bind(user.id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten();
+        team_id
             .map(Account::Team)
             .ok_or_else(|| ApiError::forbidden("Join or create a team before using a team token"))
     } else {
@@ -139,7 +163,10 @@ async fn current_account(state: &AppState, user: &CurrentUser) -> Result<Account
     }
 }
 
-async fn load_token(state: &AppState, account: Account) -> Result<ParticipantTokenRow, ApiError> {
+async fn load_token_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    account: Account,
+) -> Result<ParticipantTokenRow, ApiError> {
     let token = match account {
         Account::User(user_id) => sqlx::query_as::<_, ParticipantTokenRow>(
             r#"
@@ -149,7 +176,7 @@ async fn load_token(state: &AppState, account: Account) -> Result<ParticipantTok
                 "#,
         )
         .bind(user_id)
-        .fetch_optional(&state.database)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(ApiError::database)?,
         Account::Team(team_id) => sqlx::query_as::<_, ParticipantTokenRow>(
@@ -160,7 +187,7 @@ async fn load_token(state: &AppState, account: Account) -> Result<ParticipantTok
                 "#,
         )
         .bind(team_id)
-        .fetch_optional(&state.database)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(ApiError::database)?,
     };

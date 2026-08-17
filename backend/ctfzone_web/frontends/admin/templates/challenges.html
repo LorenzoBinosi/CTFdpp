@@ -9,14 +9,14 @@
     </div>
     <div class="admin-table-wrap">
       <table class="admin-table" data-admin-table>
-        <thead><tr><th>ID</th><th>Challenge</th><th>Category</th><th>Type</th><th>Value</th><th>Solves</th><th><span class="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th>ID</th><th>Challenge</th><th>Category</th><th>Format</th><th>Value</th><th>Solves</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           {% for challenge in challenges %}
             <tr>
               <td class="mono muted">#{{ challenge.id }}</td>
               <td><a class="admin-primary-link" href="{{ url_for('web.admin_challenge_edit', challenge_id=challenge.id) }}">{{ challenge.name }}</a></td>
               <td><span class="category-badge">{{ challenge.category }}</span></td>
-              <td class="mono muted">{{ challenge.type or 'standard' }}</td>
+              <td class="mono muted">{{ (challenge.challenge_type or 'jeopardy') | replace('_', ' ') | title }}</td>
               <td><strong class="score-value">{{ challenge.value }} pts</strong></td>
               <td>{{ challenge.solves or 0 }}</td>
               <td class="table-actions"><a class="quiet-button" href="{{ url_for('web.admin_challenge_edit', challenge_id=challenge.id) }}">Edit</a></td>

@@ -47,6 +47,7 @@ pub(crate) struct AppState {
     pub(crate) rate_limiter: rate_limit::RateLimiter,
     pub(crate) setup_token: String,
     pub(crate) site_url: Url,
+    pub(crate) ssh_gateway_service_token: String,
 }
 
 #[derive(Serialize)]
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         rate_limiter: rate_limit::RateLimiter::default(),
         setup_token: config.setup_token,
         site_url: config.site_url,
+        ssh_gateway_service_token: config.ssh_gateway_service_token,
     });
     let listener = TcpListener::bind(config.bind_address)
         .await
@@ -127,10 +129,14 @@ fn router(state: AppState) -> Router {
             state.clone(),
             auth::require_backend_service,
         ));
+    let ssh_gateway_routes = routes::ssh_hosts::private_router().route_layer(
+        middleware::from_fn_with_state(state.clone(), auth::require_ssh_gateway_service),
+    );
 
     Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
+        .merge(ssh_gateway_routes)
         .merge(application_routes)
         .with_state(state)
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
@@ -154,7 +160,21 @@ async fn readiness(State(state): State<AppState>) -> Response {
         .send()
         .await
         .is_ok_and(|response| response.status().is_success());
-    match sqlx::query_as::<_, (Option<String>, bool, bool, bool, bool, bool, bool, bool)>(
+    match sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ),
+    >(
         r#"
         SELECT
             (SELECT value FROM ctfzone.release_metadata WHERE key = 'schema_version'),
@@ -163,17 +183,44 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 WHERE key = 'install_complete' AND value = '1.0.0'
             ),
             to_regclass('ctfzone.users') IS NOT NULL,
-            to_regclass('ctfzone.challenges') IS NOT NULL,
-            to_regclass('ctfzone.runtime_instances') IS NOT NULL,
+            to_regclass('ctfzone.challenges') IS NOT NULL
+                AND to_regclass('ctfzone.flags') IS NOT NULL
+                AND to_regclass('ctfzone.challenge_categories') IS NOT NULL
+                AND to_regclass('ctfzone.user_challenge_flags') IS NOT NULL
+                AND to_regclass('ctfzone.flag_sharing_events') IS NOT NULL
+                AND to_regclass('ctfzone.admin_create_idempotency') IS NOT NULL,
+            to_regclass('ctfzone.runtime_settings') IS NOT NULL
+                AND to_regclass('ctfzone.challenge_runtime_configs') IS NOT NULL
+                AND to_regclass('ctfzone.remote_servers') IS NOT NULL
+                AND to_regclass('ctfzone.runtime_instances') IS NOT NULL
+                AND to_regclass('ctfzone.runtime_commands') IS NOT NULL
+                AND to_regclass('ctfzone.runtime_instance_events') IS NOT NULL,
+            to_regclass('ctfzone.user_mode_transitions') IS NOT NULL,
             to_regclass('ctfzone.email_verification_tokens') IS NOT NULL,
             to_regclass('ctfzone.stored_objects') IS NOT NULL,
-            to_regclass('ctfzone.object_operations') IS NOT NULL
+            to_regclass('ctfzone.object_operations') IS NOT NULL,
+            to_regclass('ctfzone.ssh_hosts') IS NOT NULL
+                AND to_regclass('ctfzone.ssh_host_events') IS NOT NULL
+                AND to_regclass('ctfzone.ssh_host_identity_operations') IS NOT NULL
+                AND to_regclass('ctfzone.ssh_host_tickets') IS NOT NULL
+                AND to_regclass('ctfzone.ssh_host_key_candidates') IS NOT NULL
+                AND to_regclass('ctfzone.ssh_terminal_sessions') IS NOT NULL
+                AND (
+                    SELECT count(*) = 4
+                    FROM information_schema.columns
+                    WHERE table_schema='ctfzone'
+                      AND table_name='ssh_terminal_sessions'
+                      AND column_name IN (
+                          'browser_session_id','gateway_instance_id','host_revision',
+                          'trusted_host_key_fingerprint'
+                      )
+                )
         "#,
     )
     .fetch_one(&state.database)
     .await
     {
-        Ok((Some(version), true, true, true, true, true, true, true))
+        Ok((Some(version), true, true, true, true, true, true, true, true, true))
             if version == SCHEMA_VERSION && object_storage_ready =>
         {
             (
@@ -192,10 +239,12 @@ async fn readiness(State(state): State<AppState>) -> Response {
             install_complete,
             users_ready,
             challenges_ready,
-            runtimes_ready,
+            runtime_control_plane_ready,
+            user_mode_transitions_ready,
             email_verification_ready,
             objects_ready,
             object_operations_ready,
+            ssh_host_control_plane_ready,
         )) => {
             warn!(
                 observed_schema_version = ?version,
@@ -203,10 +252,12 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 install_complete,
                 users_ready,
                 challenges_ready,
-                runtimes_ready,
+                runtime_control_plane_ready,
+                user_mode_transitions_ready,
                 email_verification_ready,
                 objects_ready,
                 object_operations_ready,
+                ssh_host_control_plane_ready,
                 object_storage_ready,
                 "API readiness check found an incompatible database schema"
             );
@@ -223,10 +274,12 @@ async fn readiness(State(state): State<AppState>) -> Response {
                     "required_tables": {
                         "users": users_ready,
                         "challenges": challenges_ready,
-                        "runtime_instances": runtimes_ready,
+                        "runtime_control_plane": runtime_control_plane_ready,
+                        "user_mode_transitions": user_mode_transitions_ready,
                         "email_verification_tokens": email_verification_ready,
                         "stored_objects": objects_ready,
                         "object_operations": object_operations_ready,
+                        "ssh_host_control_plane": ssh_host_control_plane_ready,
                     },
                 })),
             )

@@ -39,13 +39,16 @@ pub(super) struct HistoryQuery {
 
 #[derive(Deserialize)]
 pub(super) struct SettingPatch {
-    enabled: bool,
+    pub(super) enabled: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RuntimeConfigInput {
-    runtime_mode: String,
-    enabled: bool,
+    pub(super) runtime_mode: String,
+    #[serde(default)]
+    pub(super) enable_global_gate: bool,
+    pub(super) enabled: bool,
     image_digest: Option<String>,
     protocol: String,
     container_port: Option<i32>,
@@ -63,6 +66,7 @@ pub(super) struct RuntimeConfigInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RemoteServerCreate {
     name: String,
     hostname: String,
@@ -71,23 +75,20 @@ pub(super) struct RemoteServerCreate {
     ssh_user: String,
     #[serde(default = "default_helper_path")]
     helper_path: String,
-    identity_file: Option<String>,
     host_key_alias: Option<String>,
     pool: Option<String>,
     #[serde(default = "default_capacity")]
     capacity: i32,
-    #[serde(default = "default_true")]
-    enabled: bool,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RemoteServerPatch {
     name: Option<String>,
     hostname: Option<String>,
     ssh_port: Option<i32>,
     ssh_user: Option<String>,
     helper_path: Option<String>,
-    identity_file: Option<String>,
     host_key_alias: Option<String>,
     pool: Option<String>,
     capacity: Option<i32>,
@@ -97,6 +98,7 @@ pub(super) struct RemoteServerPatch {
 #[derive(FromRow)]
 struct LaunchGate {
     challenge_state: String,
+    exposure: String,
     setting_enabled: bool,
     setting_revision: i64,
     runtime_mode: String,
@@ -172,7 +174,7 @@ struct RuntimeSettingView {
 }
 
 #[derive(FromRow, Serialize)]
-struct RuntimeConfigView {
+pub(super) struct RuntimeConfigView {
     challenge_id: i32,
     runtime_mode: String,
     enabled: bool,
@@ -202,6 +204,7 @@ struct RemoteServerView {
     ssh_port: i32,
     ssh_user: String,
     helper_path: String,
+    #[serde(skip_serializing)]
     identity_file: Option<String>,
     host_key_alias: Option<String>,
     pool: Option<String>,
@@ -238,41 +241,78 @@ pub(super) async fn ensure_instance(
     super::challenges::require_challenge_visibility(&state, Some(&user)).await?;
     super::challenges::require_ctf_time(&state, Some(&user)).await?;
     super::challenges::require_verified(&state, Some(&user)).await?;
-    if super::challenges::is_team_mode(&state).await? && !user.is_admin() && user.team_id.is_none()
-    {
-        return Err(ApiError::forbidden(
-            "Join a team before starting a challenge",
-        ));
-    }
 
     let gate = load_launch_gate(&state, challenge_id).await?;
     if !user.is_admin() && gate.challenge_state != "visible" {
         return Err(ApiError::not_found("Challenge not found"));
     }
-    if !gate.setting_enabled || !gate.runtime_enabled || gate.runtime_mode != "managed" {
+    if gate.exposure != "private"
+        || !gate.setting_enabled
+        || !gate.runtime_enabled
+        || gate.runtime_mode != "managed"
+    {
         return Err(ApiError::conflict(
             "This challenge does not currently provide a managed instance",
         ));
     }
-    let ttl = request
-        .ttl_seconds
-        .unwrap_or(i64::from(gate.default_ttl_seconds));
+    let requested_ttl = request.ttl_seconds;
+    let idempotency_key = idempotency_key(&headers, request.idempotency_key)?;
+
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    super::flag_policy::lock_challenge_definition(&mut transaction, challenge_id).await?;
+    let gate = load_launch_gate_tx(&mut transaction, challenge_id).await?;
+    if !user.is_admin() && gate.challenge_state != "visible" {
+        return Err(ApiError::not_found("Challenge not found"));
+    }
+    if gate.exposure != "private"
+        || !gate.setting_enabled
+        || !gate.runtime_enabled
+        || gate.runtime_mode != "managed"
+    {
+        return Err(ApiError::conflict(
+            "This challenge does not currently provide a managed instance",
+        ));
+    }
+    let ttl = requested_ttl.unwrap_or(i64::from(gate.default_ttl_seconds));
     if ttl < 60 || ttl > i64::from(gate.maximum_ttl_seconds) {
         return Err(ApiError::bad_request(
             "Requested lifetime is outside the challenge limits",
         ));
     }
-    let idempotency_key = idempotency_key(&headers, request.idempotency_key)?;
     let now = Utc::now();
     let desired_expires_at = now + Duration::seconds(ttl);
     let maximum_expires_at = now + Duration::seconds(i64::from(gate.maximum_ttl_seconds));
-
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    sqlx::query("SELECT id FROM ctfzone.users WHERE id=$1 FOR UPDATE")
-        .bind(user.id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?;
+    let team_mode =
+        super::user_mode_transition::transaction_user_mode(&mut transaction).await? == "teams";
+    if team_mode {
+        super::team_accounts::lock_team_membership(&mut transaction).await?;
+    }
+    let current_team_id = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT team_id FROM ctfzone.users WHERE id=$1 FOR UPDATE",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    let team_id = team_mode.then_some(current_team_id).flatten();
+    if team_mode && !user.is_admin() && team_id.is_none() {
+        return Err(ApiError::forbidden(
+            "Join a team before starting a challenge",
+        ));
+    }
+    super::challenges::require_full_challenge_access_in_transaction(
+        &mut transaction,
+        Some(&user),
+        challenge_id,
+    )
+    .await?;
     if let Some(existing) = active_instance_for_user(&mut transaction, user.id).await? {
         transaction.commit().await.map_err(ApiError::database)?;
         if existing.challenge_id == challenge_id {
@@ -284,7 +324,14 @@ pub(super) async fn ensure_instance(
         )));
     }
 
-    let deployment_snapshot = json!({
+    let flag_value = super::flag_policy::materialize_for_launch(
+        &mut transaction,
+        challenge_id,
+        user.id,
+        &state.auth.secret_key,
+    )
+    .await?;
+    let mut deployment_snapshot = json!({
         "image_digest": gate.image_digest,
         "protocol": gate.protocol,
         "container_port": gate.container_port,
@@ -295,6 +342,9 @@ pub(super) async fn ensure_instance(
         "healthcheck": gate.healthcheck,
         "remote_pool": gate.remote_pool,
     });
+    if let Some(flag_value) = flag_value {
+        deployment_snapshot["flag_value"] = json!(flag_value);
+    }
     let instance_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO ctfzone.runtime_instances (
@@ -307,7 +357,7 @@ pub(super) async fn ensure_instance(
         "#,
     )
     .bind(user.id)
-    .bind(user.team_id)
+    .bind(team_id)
     .bind(challenge_id)
     .bind(gate.setting_revision)
     .bind(gate.runtime_revision)
@@ -390,6 +440,13 @@ pub(super) async fn extend_instance(
 ) -> Result<Response, ApiError> {
     let idempotency_key = idempotency_key(&headers, request.idempotency_key)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let row = sqlx::query_as::<_, ExtensionState>(
         r#"
         SELECT i.active,i.desired_state,i.observed_state,i.desired_expires_at,
@@ -659,22 +716,61 @@ pub(super) async fn put_challenge_runtime(
     State(state): State<AppState>,
     user: CurrentUser,
     Path(challenge_id): Path<i32>,
-    Json(request): Json<RuntimeConfigInput>,
+    Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
+    let request = parse_direct_runtime_config(payload)?;
     validate_runtime_config(&request)?;
-    let challenge_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM ctfzone.challenges WHERE id=$1)",
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let (exposure, challenge_state) = sqlx::query_as::<_, (String, String)>(
+        "SELECT exposure,state FROM ctfzone.challenges WHERE id=$1 FOR UPDATE",
     )
     .bind(challenge_id)
-    .fetch_one(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(ApiError::database)?;
-    if !challenge_exists {
-        return Err(ApiError::not_found("Challenge not found"));
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge not found"))?;
+    if exposure != "private" {
+        return Err(ApiError::conflict(
+            "Public challenges cannot define managed runtime configuration",
+        ));
     }
-    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    let config = sqlx::query_as::<_, RuntimeConfigView>(
+    if request.runtime_mode != "managed" {
+        return Err(ApiError::bad_request(
+            "Private challenges require a managed runtime",
+        ));
+    }
+    if challenge_state != "hidden" && !request.enabled {
+        return Err(ApiError::conflict(
+            "Published private challenges require an enabled runtime",
+        ));
+    }
+    let config = upsert_runtime_config(&mut transaction, challenge_id, user.id, request).await?;
+    notify(
+        &mut transaction,
+        CHALLENGE_CHANNEL,
+        &challenge_id.to_string(),
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(Json(Success::new(config)).into_response())
+}
+
+pub(super) async fn upsert_runtime_config(
+    transaction: &mut Transaction<'_, Postgres>,
+    challenge_id: i32,
+    user_id: i32,
+    request: RuntimeConfigInput,
+) -> Result<RuntimeConfigView, ApiError> {
+    validate_runtime_config(&request)?;
+    sqlx::query_as::<_, RuntimeConfigView>(
         r#"
         INSERT INTO ctfzone.challenge_runtime_configs (
             challenge_id,runtime_mode,enabled,image_digest,protocol,container_port,
@@ -716,18 +812,41 @@ pub(super) async fn put_challenge_runtime(
     .bind(request.storage_limit_bytes)
     .bind(request.healthcheck)
     .bind(normalize_optional(request.remote_pool))
-    .bind(user.id)
-    .fetch_one(&mut *transaction)
+    .bind(user_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(ApiError::database)
+}
+
+pub(super) async fn prepare_private_challenge_gate(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: i32,
+    enable: bool,
+) -> Result<bool, ApiError> {
+    let (currently_enabled, current_revision) = sqlx::query_as::<_, (bool, i64)>(
+        "SELECT enabled,revision FROM ctfzone.runtime_settings WHERE key='private_challenges' FOR UPDATE",
+    )
+    .fetch_one(&mut **transaction)
     .await
     .map_err(ApiError::database)?;
-    notify(
-        &mut transaction,
-        CHALLENGE_CHANNEL,
-        &challenge_id.to_string(),
+    if currently_enabled || !enable {
+        return Ok(currently_enabled);
+    }
+    let revision = sqlx::query_scalar::<_, i64>(
+        r#"
+        UPDATE ctfzone.runtime_settings
+        SET enabled=true,revision=revision+1,updated_at=now(),updated_by_user_id=$1
+        WHERE key='private_challenges' AND revision=$2
+        RETURNING revision
+        "#,
     )
-    .await?;
-    transaction.commit().await.map_err(ApiError::database)?;
-    Ok(Json(Success::new(config)).into_response())
+    .bind(user_id)
+    .bind(current_revision)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?;
+    notify(transaction, SETTINGS_CHANNEL, &revision.to_string()).await?;
+    Ok(true)
 }
 
 pub(super) async fn list_remote_servers(
@@ -772,11 +891,11 @@ pub(super) async fn create_remote_server(
     .bind(request.ssh_port)
     .bind(request.ssh_user.trim())
     .bind(request.helper_path.trim())
-    .bind(normalize_optional(request.identity_file))
+    .bind(Option::<String>::None)
     .bind(normalize_optional(request.host_key_alias))
     .bind(normalize_optional(request.pool))
     .bind(request.capacity)
-    .bind(request.enabled)
+    .bind(false)
     .fetch_one(&state.database)
     .await
     .map_err(map_runtime_database_error)?;
@@ -800,14 +919,60 @@ pub(super) async fn update_remote_server(
     Json(request): Json<RemoteServerPatch>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let current = remote_server_by_id(&state, server_id).await?;
-    let name = request.name.unwrap_or(current.name);
-    let hostname = request.hostname.unwrap_or(current.hostname);
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let current =
+        sqlx::query_as::<_, RemoteServerView>(&remote_server_select("WHERE id=$1 FOR UPDATE"))
+            .bind(server_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("Remote server not found"))?;
+    let name = request.name.unwrap_or_else(|| current.name.clone());
+    let hostname = request.hostname.unwrap_or_else(|| current.hostname.clone());
     let ssh_port = request.ssh_port.unwrap_or(current.ssh_port);
-    let ssh_user = request.ssh_user.unwrap_or(current.ssh_user);
-    let helper_path = request.helper_path.unwrap_or(current.helper_path);
+    let ssh_user = request.ssh_user.unwrap_or_else(|| current.ssh_user.clone());
+    let helper_path = request
+        .helper_path
+        .unwrap_or_else(|| current.helper_path.clone());
     let capacity = request.capacity.unwrap_or(current.capacity);
-    let host_key_alias = request.host_key_alias.or(current.host_key_alias);
+    let host_key_alias = request
+        .host_key_alias
+        .or_else(|| current.host_key_alias.clone());
+    let identity_file = current.identity_file.clone();
+    let pool = request.pool.or_else(|| current.pool.clone());
+    let connection_changed = hostname.trim() != current.hostname
+        || ssh_port != current.ssh_port
+        || ssh_user.trim() != current.ssh_user
+        || helper_path.trim() != current.helper_path
+        || host_key_alias != current.host_key_alias;
+    if connection_changed {
+        let in_flight = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM ctfzone.runtime_instances i
+                WHERE i.remote_server_id=$1
+                  AND (
+                      i.active
+                      OR EXISTS (
+                          SELECT 1 FROM ctfzone.runtime_commands c
+                          WHERE c.instance_id=i.id
+                            AND c.status IN ('pending','claimed')
+                      )
+                  )
+            )
+            "#,
+        )
+        .bind(server_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if in_flight {
+            return Err(ApiError::conflict(
+                "Stop and fully reconcile every instance on this runtime host before changing its SSH target",
+            ));
+        }
+    }
     validate_remote_server(
         &name,
         &hostname,
@@ -832,15 +997,16 @@ pub(super) async fn update_remote_server(
     .bind(ssh_port)
     .bind(ssh_user.trim())
     .bind(helper_path.trim())
-    .bind(request.identity_file.or(current.identity_file))
+    .bind(identity_file)
     .bind(host_key_alias)
-    .bind(request.pool.or(current.pool))
+    .bind(pool)
     .bind(capacity)
     .bind(request.enabled.unwrap_or(current.enabled))
     .bind(server_id)
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(map_runtime_database_error)?;
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(server)).into_response())
 }
 
@@ -872,6 +1038,13 @@ pub(super) async fn reconcile_instance(
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let instance = instance_by_id_tx_locked(&mut transaction, instance_id).await?;
     if instance.remote_server_id.is_none() {
         return Err(ApiError::conflict("Instance has no assigned remote server"));
@@ -917,6 +1090,13 @@ async fn request_termination(
     reason: &str,
 ) -> Result<Response, ApiError> {
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let instance = instance_by_id_tx_locked(&mut transaction, instance_id).await?;
     if !user.is_admin() && instance.owner_user_id != user.id {
         return Err(ApiError::not_found("Instance not found"));
@@ -1011,7 +1191,7 @@ async fn list_instances(
 async fn load_launch_gate(state: &AppState, challenge_id: i32) -> Result<LaunchGate, ApiError> {
     sqlx::query_as::<_, LaunchGate>(
         r#"
-        SELECT COALESCE(c.state,'hidden') AS challenge_state,
+        SELECT COALESCE(c.state,'hidden') AS challenge_state,c.exposure,
                COALESCE(s.enabled,false) AS setting_enabled,
                COALESCE(s.revision,0) AS setting_revision,
                COALESCE(r.runtime_mode,'static') AS runtime_mode,
@@ -1033,6 +1213,32 @@ async fn load_launch_gate(state: &AppState, challenge_id: i32) -> Result<LaunchG
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Challenge not found"))
+}
+
+async fn load_launch_gate_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    challenge_id: i32,
+) -> Result<LaunchGate, ApiError> {
+    sqlx::query_as::<_, LaunchGate>(
+        r#"
+        SELECT c.state AS challenge_state,c.exposure,s.enabled AS setting_enabled,
+               s.revision AS setting_revision,r.runtime_mode,
+               r.enabled AS runtime_enabled,r.revision AS runtime_revision,r.image_digest,
+               r.protocol,r.container_port,r.default_ttl_seconds,r.maximum_ttl_seconds,
+               r.cpu_limit,r.memory_limit_bytes,r.pid_limit,r.storage_limit_bytes,
+               r.healthcheck,r.remote_pool
+        FROM ctfzone.challenges c
+        JOIN ctfzone.runtime_settings s ON s.key='private_challenges'
+        JOIN ctfzone.challenge_runtime_configs r ON r.challenge_id=c.id
+        WHERE c.id=$1
+        FOR KEY SHARE OF c,s,r
+        "#,
+    )
+    .bind(challenge_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::conflict("Managed runtime configuration is unavailable"))
 }
 
 async fn load_setting(state: &AppState) -> Result<RuntimeSettingView, ApiError> {
@@ -1263,8 +1469,80 @@ fn validate_runtime_config(request: &RuntimeConfigInput) -> Result<(), ApiError>
             "Invalid runtime resource or lifetime limit",
         ));
     }
-    if !request.healthcheck.is_object() {
-        return Err(ApiError::bad_request("Healthcheck must be a JSON object"));
+    if request.cpu_limit.as_deref().is_some_and(|value| {
+        value
+            .parse::<f64>()
+            .ok()
+            .is_none_or(|value| !value.is_finite() || !(0.01..=256.0).contains(&value))
+    }) {
+        return Err(ApiError::bad_request(
+            "CPU limit must be between 0.01 and 256",
+        ));
+    }
+    validate_healthcheck(&request.healthcheck)?;
+    Ok(())
+}
+
+fn parse_direct_runtime_config(payload: Value) -> Result<RuntimeConfigInput, ApiError> {
+    if payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("enable_global_gate"))
+    {
+        return Err(ApiError::bad_request(
+            "enable_global_gate is not accepted by the runtime endpoint; use challenge create or PATCH",
+        ));
+    }
+    serde_json::from_value(payload).map_err(|error| {
+        ApiError::bad_request(format!("Runtime configuration is invalid: {error}"))
+    })
+}
+
+fn validate_healthcheck(value: &Value) -> Result<(), ApiError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("Healthcheck must be a JSON object"))?;
+    const PERMITTED: [&str; 5] = [
+        "command",
+        "interval_seconds",
+        "timeout_seconds",
+        "retries",
+        "startup_timeout_seconds",
+    ];
+    if object.keys().any(|key| !PERMITTED.contains(&key.as_str())) {
+        return Err(ApiError::bad_request(
+            "Healthcheck contains unsupported fields",
+        ));
+    }
+    if let Some(command) = object.get("command") {
+        let command = command
+            .as_str()
+            .filter(|command| !command.is_empty() && command.len() <= 1000)
+            .ok_or_else(|| ApiError::bad_request("Healthcheck command is invalid"))?;
+        if command.contains('\0') {
+            return Err(ApiError::bad_request("Healthcheck command is invalid"));
+        }
+    }
+    for key in ["interval_seconds", "timeout_seconds", "retries"] {
+        if object.get(key).is_some_and(|value| {
+            value
+                .as_i64()
+                .is_none_or(|value| !(1..=300).contains(&value))
+        }) {
+            return Err(ApiError::bad_request(format!(
+                "Healthcheck {key} is invalid"
+            )));
+        }
+    }
+    // The controller's supported remote-operation window is at least 60s and
+    // reserves five seconds after startup for the helper response.
+    if object.get("startup_timeout_seconds").is_some_and(|value| {
+        value
+            .as_i64()
+            .is_none_or(|value| !(1..=55).contains(&value))
+    }) {
+        return Err(ApiError::bad_request(
+            "Healthcheck startup_timeout_seconds is invalid",
+        ));
     }
     Ok(())
 }
@@ -1273,8 +1551,10 @@ fn valid_image_digest(value: &str) -> bool {
     let Some((repository, digest)) = value.rsplit_once("@sha256:") else {
         return false;
     };
-    !repository.is_empty()
-        && !repository.starts_with('-')
+    repository
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
         && repository
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "._:/-".contains(character))
@@ -1396,10 +1676,6 @@ fn default_capacity() -> i32 {
     100
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn empty_object() -> Value {
     json!({})
 }
@@ -1407,6 +1683,65 @@ fn empty_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn function_segment<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("runtime function must exist");
+        let tail = &source[start..];
+        let end = tail.find(end).expect("next runtime function must exist");
+        &tail[..end]
+    }
+
+    #[test]
+    fn instance_writers_hold_the_shared_competition_mode_fence() {
+        let source = include_str!("runtimes.rs");
+        for segment in [
+            function_segment(
+                source,
+                "pub(super) async fn ensure_instance",
+                "pub(super) async fn challenge_instance",
+            ),
+            function_segment(
+                source,
+                "pub(super) async fn extend_instance",
+                "pub(super) async fn detail",
+            ),
+            function_segment(
+                source,
+                "pub(super) async fn reconcile_instance",
+                "async fn request_termination",
+            ),
+            function_segment(
+                source,
+                "async fn request_termination",
+                "async fn list_instances",
+            ),
+        ] {
+            assert!(segment.contains("lock_configuration_shared"));
+            assert!(segment.contains("revalidate_current_credential"));
+        }
+    }
+
+    #[test]
+    fn runtime_host_connection_edits_serialize_with_placement_and_cleanup() {
+        let source = include_str!("runtimes.rs");
+        let segment = function_segment(
+            source,
+            "pub(super) async fn update_remote_server",
+            "pub(super) async fn disable_remote_server",
+        );
+        let row_lock = segment
+            .find("WHERE id=$1 FOR UPDATE")
+            .expect("runtime-host update must lock the target row");
+        let usage_check = segment
+            .find("SELECT EXISTS")
+            .expect("connection edits must check active/open runtime work");
+        let mutation = segment
+            .find("UPDATE ctfzone.remote_servers")
+            .expect("runtime-host update must persist its changes");
+        assert!(row_lock < usage_check && usage_check < mutation);
+        assert!(segment.contains("i.active"));
+        assert!(segment.contains("c.status IN ('pending','claimed')"));
+    }
 
     #[test]
     fn validates_ssh_target_components() {
@@ -1417,9 +1752,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_host_api_never_accepts_or_serializes_controller_key_paths() {
+        let base = json!({
+            "name": "worker-1",
+            "hostname": "runtime-1.internal",
+            "ssh_user": "ctfzone_runtime"
+        });
+        assert!(serde_json::from_value::<RemoteServerCreate>(base.clone()).is_ok());
+        for field in ["identity_file", "enabled"] {
+            let mut hostile = base.clone();
+            hostile[field] = if field == "enabled" {
+                json!(true)
+            } else {
+                json!("/tmp/caller-selected-key")
+            };
+            assert!(serde_json::from_value::<RemoteServerCreate>(hostile).is_err());
+        }
+        assert!(
+            serde_json::from_value::<RemoteServerPatch>(json!({
+                "identity_file": "/tmp/caller-selected-key"
+            }))
+            .is_err()
+        );
+
+        let rendered = serde_json::to_value(RemoteServerView {
+            id: Uuid::new_v4(),
+            name: "worker-1".to_owned(),
+            hostname: "runtime-1.internal".to_owned(),
+            ssh_port: 22,
+            ssh_user: "ctfzone_runtime".to_owned(),
+            helper_path: default_helper_path(),
+            identity_file: Some("/etc/ctfzone/private-key".to_owned()),
+            host_key_alias: None,
+            pool: None,
+            capacity: 100,
+            enabled: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(rendered.get("identity_file").is_none());
+    }
+
+    #[test]
     fn rejects_invalid_runtime_limits() {
-        let invalid = RuntimeConfigInput {
+        let mut invalid = RuntimeConfigInput {
             runtime_mode: "managed".to_owned(),
+            enable_global_gate: false,
             enabled: true,
             image_digest: None,
             protocol: "tcp".to_owned(),
@@ -1436,6 +1815,124 @@ mod tests {
             remote_pool: None,
         };
         assert!(validate_runtime_config(&invalid).is_err());
+        invalid.image_digest = Some(
+            "registry.example/challenge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+        );
+        for cpu in ["not-a-number", "NaN", "0.009", "256.01"] {
+            invalid.cpu_limit = Some(cpu.to_owned());
+            assert!(validate_runtime_config(&invalid).is_err());
+        }
+        invalid.cpu_limit = Some("1.5".to_owned());
+        assert!(validate_runtime_config(&invalid).is_ok());
+
+        for healthcheck in [
+            json!({"unexpected": true}),
+            json!({"command": ""}),
+            json!({"command": "x".repeat(1001)}),
+            json!({"interval_seconds": 0}),
+            json!({"timeout_seconds": 301}),
+            json!({"retries": true}),
+            json!({"startup_timeout_seconds": 56}),
+        ] {
+            invalid.healthcheck = healthcheck;
+            assert!(validate_runtime_config(&invalid).is_err());
+        }
+        invalid.healthcheck = json!({
+            "command": "curl -fsS http://127.0.0.1:8080/healthz",
+            "interval_seconds": 5,
+            "timeout_seconds": 3,
+            "retries": 4,
+            "startup_timeout_seconds": 55
+        });
+        assert!(validate_runtime_config(&invalid).is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_runtime_put_rejects_global_gate_and_unknown_fields_as_bad_requests() {
+        let base = json!({
+            "runtime_mode": "managed",
+            "enabled": true,
+            "image_digest": "registry.example/challenge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "protocol": "tcp",
+            "container_port": 31337,
+            "default_ttl_seconds": 1800,
+            "maximum_ttl_seconds": 3600,
+            "allow_extension": true,
+            "maximum_extensions": 1,
+            "healthcheck": {}
+        });
+        assert!(parse_direct_runtime_config(base.clone()).is_ok());
+
+        for (field, expected_message) in [
+            (
+                "enable_global_gate",
+                "enable_global_gate is not accepted by the runtime endpoint; use challenge create or PATCH",
+            ),
+            ("enable_glboal_gate", "unknown field"),
+        ] {
+            let mut payload = base.clone();
+            payload[field] = json!(true);
+            let Err(error) = parse_direct_runtime_config(payload) else {
+                panic!("direct runtime input unexpectedly accepted {field}");
+            };
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read error response");
+            let body: Value = serde_json::from_slice(&body).expect("decode error response");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(expected_message)),
+                "unexpected response: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_revalidates_prerequisites_before_allocating_a_flag_or_instance() {
+        let source = include_str!("runtimes.rs");
+        let segment = function_segment(
+            source,
+            "pub(super) async fn ensure_instance",
+            "pub(super) async fn challenge_instance",
+        );
+        let access = segment
+            .find("require_full_challenge_access_in_transaction")
+            .expect("launch must revalidate full challenge access");
+        let flag = segment
+            .find("materialize_for_launch")
+            .expect("launch must materialize personalized flags");
+        let insert = segment
+            .find("INSERT INTO ctfzone.runtime_instances")
+            .expect("launch must create the runtime instance");
+        assert!(access < flag && flag < insert);
+    }
+
+    #[test]
+    fn runtime_configuration_is_private_challenge_only_and_transactional() {
+        let source = include_str!("runtimes.rs");
+        let segment = function_segment(
+            source,
+            "pub(super) async fn put_challenge_runtime",
+            "pub(super) async fn upsert_runtime_config",
+        );
+        for marker in [
+            "lock_configuration_shared",
+            "revalidate_current_credential",
+            "SELECT exposure,state",
+            "FOR UPDATE",
+            "exposure != \"private\"",
+            "request.runtime_mode != \"managed\"",
+            "challenge_state != \"hidden\" && !request.enabled",
+        ] {
+            assert!(
+                segment.contains(marker),
+                "missing runtime invariant: {marker}"
+            );
+        }
     }
 
     #[test]
@@ -1443,6 +1940,11 @@ mod tests {
         assert!(valid_image_digest(
             "registry.example/ctf/challenge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+        for prefix in ['.', '_', '/', ':', '-'] {
+            assert!(!valid_image_digest(&format!(
+                "{prefix}challenge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )));
+        }
         assert!(!valid_image_digest("registry.example/ctf/challenge:latest"));
         assert!(!valid_image_digest("sha256:aaaaaaaa"));
     }

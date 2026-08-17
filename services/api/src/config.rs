@@ -7,6 +7,7 @@ use reqwest::Url;
 pub struct Config {
     pub api_signing_key: String,
     pub backend_service_token: String,
+    pub ssh_gateway_service_token: String,
     pub bind_address: SocketAddr,
     pub database_url: String,
     pub database_max_connections: u32,
@@ -36,6 +37,7 @@ pub struct ObjectStorageConfig {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let backend_service_token = required_secret("BACKEND_SERVICE_TOKEN")?;
+        let ssh_gateway_service_token = required_secret("SSH_GATEWAY_SERVICE_TOKEN")?;
         let api_signing_key = required_secret("API_SIGNING_KEY")?;
 
         let bind_address = env::var("CTFZONE_API_BIND")
@@ -75,6 +77,7 @@ impl Config {
         Ok(Self {
             api_signing_key,
             backend_service_token,
+            ssh_gateway_service_token,
             bind_address,
             database_url,
             database_max_connections,

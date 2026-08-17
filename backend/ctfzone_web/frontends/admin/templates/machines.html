@@ -1,0 +1,222 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Open an interactive SSH shell from this browser without installing a local SSH client.</p>{% endblock %}
+{% block head_assets %}
+  <link rel="stylesheet" href="{{ url_for('frontend_assets.admin_asset', filename='vendor/xterm/xterm.css', v=frontend_asset_version) }}">
+{% endblock %}
+{% block vendor_scripts %}
+  <script src="{{ url_for('frontend_assets.admin_asset', filename='vendor/xterm/xterm.js', v=frontend_asset_version) }}"></script>
+  <script src="{{ url_for('frontend_assets.admin_asset', filename='vendor/xterm/addon-fit.js', v=frontend_asset_version) }}"></script>
+{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel machine-enrollment-panel">
+    <header class="admin-panel-heading">
+      <div>
+        <span class="eyebrow">SSH CONNECTION</span>
+        <h2>Register host</h2>
+        <p>Enter an existing non-root SSH account. CTFZone creates an access key for the browser console; it does not create or modify the remote account.</p>
+      </div>
+    </header>
+    <form class="machine-enrollment-form" data-machine-enrollment-form>
+      <div class="admin-field-grid machine-enrollment-grid">
+        <label class="admin-field">
+          <span>Existing SSH user</span>
+          <input name="name" type="text" maxlength="32" autocomplete="username" spellcheck="false" required pattern="[a-z_][a-z0-9_-]{0,31}" title="Use an existing non-root Linux username: lowercase letter or underscore first, then lowercase letters, numbers, underscores, or hyphens." placeholder="tecnico">
+        </label>
+        <label class="admin-field machine-host-field">
+          <span>Hostname or IP <small>not a URL</small></span>
+          <input name="hostname" type="text" maxlength="253" autocomplete="off" spellcheck="false" required pattern="[^\s/?#@]+" placeholder="server.example.org">
+        </label>
+        <label class="admin-field">
+          <span>SSH port</span>
+          <input name="ssh_port" type="number" min="1" max="65535" step="1" value="22" required inputmode="numeric">
+        </label>
+      </div>
+      <div class="machine-enrollment-actions">
+        <p>This is a real shell with the selected account's full permissions; it is not read-only. The private half of the access key stays in the isolated SSH gateway and is never returned to this page or placed in a URL.</p>
+        <button class="button" type="submit">Register host</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="machine-inventory" aria-labelledby="machine-inventory-heading">
+    <div class="machine-inventory-heading">
+      <div><span class="eyebrow">SSH CONNECTIONS</span><h2 id="machine-inventory-heading">Registered hosts</h2></div>
+      <span class="muted mono">{{ machines | length }} total</span>
+    </div>
+    <div class="machine-card-grid">
+      {% for machine in machines %}
+        {% if not machine.target_valid or machine.key_state == 'unknown' %}
+          {% set access_label = 'Invalid connection record' %}
+          {% set access_class = 'bad' %}
+        {% elif machine.key_error or machine.key_state == 'key_failed' %}
+          {% set access_label = 'Access key unavailable' %}
+          {% set access_class = 'bad' %}
+        {% elif machine.key_state == 'key_pending' %}
+          {% set access_label = 'Preparing access key' %}
+          {% set access_class = 'pending' %}
+        {% elif machine.key_ready %}
+          {% set access_label = 'Access key ready' %}
+          {% set access_class = 'good' %}
+        {% else %}
+          {% set access_label = 'Access setup incomplete' %}
+          {% set access_class = 'bad' %}
+        {% endif %}
+        {% if machine.host_key_trusted %}
+          {% set trust_label = 'Host identity trusted' %}
+          {% set trust_class = 'good' %}
+        {% else %}
+          {% set trust_label = 'Host identity unverified' %}
+          {% set trust_class = 'pending' %}
+        {% endif %}
+        <article class="admin-panel machine-card"
+                 data-machine-card="{{ machine.id }}"
+                 data-machine-user="{{ machine.ssh_user }}"
+                 data-machine-host="{{ machine.hostname }}"
+                 data-machine-port="{{ machine.ssh_port }}"{% if machine.host_key_fingerprint %}
+                 data-machine-host-key-fingerprint="{{ machine.host_key_fingerprint }}"{% endif %}>
+          <header class="machine-card-header">
+            <div class="machine-card-identity">
+              <span class="status-dot {{ 'off' if not machine.connect_ready }}" aria-hidden="true"></span>
+              <div>
+                <h3>{{ machine.ssh_user }}</h3>
+                <code>{{ machine.ssh_user }}@{{ machine.hostname }}:{{ machine.ssh_port }}</code>
+              </div>
+            </div>
+            <div class="machine-card-state">
+              <span class="status-pill {{ access_class }}">{{ access_label }}</span>
+              <span class="status-pill {{ trust_class }}">{{ trust_label }}</span>
+            </div>
+          </header>
+
+          <div class="machine-card-body">
+            <section class="machine-card-section machine-connection-section" aria-labelledby="machine-connection-heading-{{ loop.index }}">
+              <header class="machine-section-heading">
+                <span class="eyebrow">SSH</span>
+                <h4 id="machine-connection-heading-{{ loop.index }}">Connection details</h4>
+              </header>
+              <dl class="machine-connection-details">
+                <div class="machine-endpoint-detail"><dt>Hostname or IP</dt><dd class="mono" title="{{ machine.hostname }}">{{ machine.hostname }}</dd></div>
+                <div><dt>Port</dt><dd class="mono">{{ machine.ssh_port or 'Invalid' }}</dd></div>
+                <div><dt>User</dt><dd class="mono">{{ machine.ssh_user }}</dd></div>
+                <div class="machine-fingerprint-detail"><dt>Access-key fingerprint</dt><dd class="mono"{% if machine.ssh_key_fingerprint %} title="{{ machine.ssh_key_fingerprint }}"{% endif %}>{{ machine.ssh_key_fingerprint or 'Pending' }}</dd></div>
+                <div class="machine-fingerprint-detail"><dt>Trusted host-key fingerprint</dt><dd class="mono"{% if machine.host_key_fingerprint %} title="{{ machine.host_key_fingerprint }}"{% endif %}>{{ machine.host_key_fingerprint or 'Not trusted' }}</dd></div>
+              </dl>
+            </section>
+
+            <section class="machine-card-section machine-setup-section" aria-labelledby="machine-setup-heading-{{ loop.index }}">
+              <header class="machine-section-heading">
+                <span class="eyebrow">ACCESS</span>
+                <h4 id="machine-setup-heading-{{ loop.index }}">Authorize and verify</h4>
+              </header>
+
+              {% if not machine.target_valid or machine.key_state == 'unknown' %}
+                <div class="machine-stage-message danger" role="alert">
+                  <strong>Connection record is invalid</strong>
+                  <p>The API did not return a safe SSH username, host, port, or access-key state. Connection controls are disabled.</p>
+                </div>
+              {% elif machine.key_error or machine.key_state == 'key_failed' %}
+                <div class="machine-stage-message danger" role="alert">
+                  <strong>Access key unavailable</strong>
+                  <p>Key preparation failed{% if machine.key_error %} with error code <code>{{ machine.key_error }}</code>{% endif %}. No key or connection is offered.</p>
+                  <button class="secondary-button button-small" type="button" data-retry-machine="{{ machine.id }}">Retry key preparation</button>
+                </div>
+              {% elif machine.key_state == 'key_pending' %}
+                <div class="machine-stage-message warning" role="status">
+                  <strong>Preparing access key</strong>
+                  <p>Refresh shortly. Host inspection and the terminal remain disabled until the public key is ready.</p>
+                  <button class="secondary-button button-small" type="button" data-machine-refresh>Refresh status</button>
+                </div>
+              {% elif machine.key_ready %}
+                <ol class="machine-next-steps">
+                  <li>
+                    <strong>Authorize the browser console</strong>
+                    <span>Add this complete line to <code>~{{ machine.ssh_user }}/.ssh/authorized_keys</code>. It permits a shell and PTY while keeping SSH forwarding disabled.</span>
+                    <div class="machine-key-material">
+                      <div class="machine-code-heading">
+                        <span id="machine-authorized-line-label-{{ loop.index }}">authorized_keys line</span>
+                        <button class="button button-small" type="button" data-machine-copy aria-label="Copy authorized_keys line for {{ machine.ssh_user }}">Copy authorized_keys line</button>
+                      </div>
+                      <code aria-labelledby="machine-authorized-line-label-{{ loop.index }}" data-machine-authorized-line>{{ machine.authorized_keys_line }}</code>
+                      <p class="machine-key-safety">Replace any older line for this same key. Do not keep multiple entries with different SSH options.</p>
+                      {% if machine.authorized_key_cleanup_required %}
+                        <p class="machine-key-safety"><strong>Authorized-key cleanup required:</strong> remove the previous restricted key line from this account before authorizing the new browser-console key.</p>
+                      {% endif %}
+                    </div>
+                  </li>
+                  <li>
+                    <strong>Verify the server identity</strong>
+                    {% if machine.host_key_trusted %}
+                      <span>The pinned host-key fingerprint is <code>{{ machine.host_key_fingerprint }}</code>. Inspect again after an intentional server-key rotation.</span>
+                    {% else %}
+                      <span>Inspect the key, compare its fingerprint through an independent trusted channel, then explicitly trust it.</span>
+                    {% endif %}
+                    <div class="machine-step-actions">
+                      <button class="secondary-button button-small" type="button" data-probe-machine="{{ machine.id }}">{{ 'Inspect again' if machine.host_key_trusted else 'Inspect host key' }}</button>
+                      <button class="button button-small" type="button" data-connect-machine="{{ machine.id }}"{% if not machine.connect_ready %} disabled aria-disabled="true" title="Trust the inspected host key before connecting"{% endif %}>Connect</button>
+                    </div>
+                  </li>
+                </ol>
+              {% else %}
+                <div class="machine-stage-message danger" role="alert">
+                  <strong>Access setup incomplete</strong>
+                  <p>No valid public key is available. Connection controls are disabled.</p>
+                </div>
+              {% endif %}
+            </section>
+          </div>
+
+          <footer class="machine-card-footer">
+            <small>Revision {{ machine.revision }}{% if machine.updated_at %} · updated {{ machine.updated_at }}{% endif %}</small>
+            <button class="danger-button button-small" type="button" data-remove-machine="{{ machine.id }}">Remove host</button>
+          </footer>
+        </article>
+      {% else %}
+        <article class="admin-panel admin-empty-card machine-empty-card">
+          <span class="empty-glyph" aria-hidden="true">⌁</span>
+          <h2>No SSH connections registered</h2>
+          <p>Register an existing SSH account above. Its public key appears here when it is ready.</p>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  <dialog class="ssh-host-key-dialog" data-host-key-dialog aria-labelledby="ssh-host-key-title">
+    <form method="dialog" class="ssh-dialog-shell">
+      <header class="ssh-dialog-heading">
+        <div><span class="eyebrow">SERVER IDENTITY</span><h2 id="ssh-host-key-title">Compare host key</h2></div>
+        <button class="quiet-button button-small" type="submit" value="cancel" data-host-key-close aria-label="Close host-key comparison">Close</button>
+      </header>
+      <div class="ssh-host-key-body">
+        <p>Compare this fingerprint with one obtained through an independent trusted channel. A successful network probe alone does not prove the server's identity.</p>
+        <dl class="machine-connection-details">
+          <div class="machine-endpoint-detail"><dt>Target</dt><dd class="mono" data-host-key-target></dd></div>
+          <div><dt>Algorithm</dt><dd class="mono" data-host-key-algorithm></dd></div>
+          <div class="machine-fingerprint-detail"><dt>Observed fingerprint</dt><dd class="mono" data-host-key-fingerprint></dd></div>
+        </dl>
+        <div class="machine-key-material">
+          <div class="machine-code-heading"><span>Observed server public key</span></div>
+          <code data-host-key-public></code>
+        </div>
+        <label class="ssh-host-key-confirmation">
+          <input type="checkbox" data-host-key-confirm>
+          <span>I compared this fingerprint through a separate trusted channel.</span>
+        </label>
+      </div>
+      <footer class="ssh-dialog-actions">
+        <button class="quiet-button" type="submit" value="cancel">Cancel</button>
+        <button class="button" type="button" data-host-key-trust disabled>Trust this host key</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="ssh-terminal-dialog" data-ssh-terminal-dialog aria-labelledby="ssh-terminal-title">
+    <section class="ssh-terminal-shell">
+      <header class="ssh-terminal-heading">
+        <div><span class="eyebrow">INTERACTIVE SSH</span><h2 id="ssh-terminal-title" data-ssh-terminal-target>Terminal</h2></div>
+        <div class="ssh-terminal-heading-actions"><span class="status-pill pending" data-ssh-terminal-status>Disconnected</span><button class="quiet-button button-small" type="button" data-ssh-terminal-close>Close</button></div>
+      </header>
+      <div class="ssh-terminal-screen" data-ssh-terminal role="application" aria-label="Interactive SSH terminal"></div>
+      <footer class="ssh-terminal-footer"><span>Keystrokes are sent to the registered SSH account.</span><button class="danger-button button-small" type="button" data-ssh-terminal-disconnect>Disconnect</button></footer>
+    </section>
+  </dialog>
+{% endblock %}

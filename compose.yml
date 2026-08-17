@@ -39,6 +39,7 @@ services:
     networks:
       - edge
       - web
+      - ssh_web
       - objects
 
   backend:
@@ -52,6 +53,7 @@ services:
       API_EMAIL_TIMEOUT_SECONDS: ${BACKEND_EMAIL_API_TIMEOUT_SECONDS:-20}
       API_TIMEOUT_SECONDS: ${BACKEND_API_TIMEOUT_SECONDS:-5}
       API_STORAGE_TIMEOUT_SECONDS: ${BACKEND_STORAGE_API_TIMEOUT_SECONDS:-60}
+      API_TRANSITION_TIMEOUT_SECONDS: ${BACKEND_TRANSITION_API_TIMEOUT_SECONDS:-65}
       BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:?Set BACKEND_SERVICE_TOKEN in .env}
       BROWSER_SESSION_COOKIE_NAME: ${BROWSER_SESSION_COOKIE_NAME:-ctfzone_browser_session}
       BROWSER_SESSION_COOKIE_SECURE: ${BROWSER_SESSION_COOKIE_SECURE:-true}
@@ -100,6 +102,7 @@ services:
       RUST_LOG: ${RUST_LOG:-ctfzone_api=info,tower_http=info}
       SETUP_TOKEN: ${SETUP_TOKEN:?Set SETUP_TOKEN in .env}
       SESSION_LIFETIME_SECONDS: ${BROWSER_SESSION_LIFETIME_SECONDS:-604800}
+      SSH_GATEWAY_SERVICE_TOKEN: ${SSH_GATEWAY_SERVICE_TOKEN:?Set SSH_GATEWAY_SERVICE_TOKEN in .env}
     expose:
       - "8080"
     depends_on:
@@ -109,8 +112,46 @@ services:
         condition: service_healthy
     networks:
       - application
+      - ssh_control
       - data
       - objects
+      - egress
+
+  ssh-gateway:
+    build:
+      context: .
+      dockerfile: services/ssh-gateway/Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      API_BASE_URL: http://api:8080
+      CTFZONE_SSH_GATEWAY_BIND: 0.0.0.0:8091
+      RUST_LOG: ${SSH_GATEWAY_RUST_LOG:-ctfzone_ssh_gateway=info,tower_http=info}
+      SSH_ALLOWED_CIDRS: ${SSH_ALLOWED_CIDRS:?Set SSH_ALLOWED_CIDRS in .env}
+      SSH_ALLOWED_ORIGINS: ${CADDY_SITE_ADDRESS:?Set CADDY_SITE_ADDRESS in .env}
+      SSH_ALLOWED_PORTS: ${SSH_ALLOWED_PORTS:-22}
+      SSH_GATEWAY_SERVICE_TOKEN: ${SSH_GATEWAY_SERVICE_TOKEN:?Set SSH_GATEWAY_SERVICE_TOKEN in .env}
+      SSH_IDENTITY_DIRECTORY: /var/lib/ctfzone-ssh-gateway/identities
+      SSH_IDLE_TIMEOUT_SECONDS: ${SSH_IDLE_TIMEOUT_SECONDS:-600}
+      SSH_MAX_SESSION_SECONDS: ${SSH_MAX_SESSION_SECONDS:-1800}
+    expose:
+      - "8091"
+    volumes:
+      - ssh_gateway_identities:/var/lib/ctfzone-ssh-gateway/identities
+    tmpfs:
+      - /tmp:uid=10003,gid=10003,mode=1777
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - ssh_web
+      - ssh_control
       - egress
 
   controller:
@@ -126,6 +167,9 @@ services:
       OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:?Set OBJECT_STORAGE_ACCESS_KEY in .env}
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-ctfzone}
       OBJECT_STORAGE_INTERNAL_URL: http://storage:8333
+      OBJECT_MAINTENANCE_INTERVAL_SECONDS: ${OBJECT_MAINTENANCE_INTERVAL_SECONDS:-30}
+      OBJECT_MAINTENANCE_MAX_ATTEMPTS: ${OBJECT_MAINTENANCE_MAX_ATTEMPTS:-8}
+      OBJECT_MAINTENANCE_STALE_CLAIM_SECONDS: ${OBJECT_MAINTENANCE_STALE_CLAIM_SECONDS:-300}
       OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS: ${OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS:-900}
       OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-us-east-1}
       OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:?Set OBJECT_STORAGE_SECRET_KEY in .env}
@@ -220,7 +264,13 @@ services:
           )
           AND to_regclass('ctfzone.users') IS NOT NULL
           AND to_regclass('ctfzone.challenges') IS NOT NULL
+          AND to_regclass('ctfzone.flags') IS NOT NULL
           AND to_regclass('ctfzone.runtime_instances') IS NOT NULL
+          AND to_regclass('ctfzone.runtime_commands') IS NOT NULL
+          AND to_regclass('ctfzone.remote_servers') IS NOT NULL
+          AND to_regclass('ctfzone.ssh_hosts') IS NOT NULL
+          AND to_regclass('ctfzone.ssh_host_identity_operations') IS NOT NULL
+          AND to_regclass('ctfzone.ssh_host_tickets') IS NOT NULL
           AND to_regclass('ctfzone.email_verification_tokens') IS NOT NULL
           AND to_regclass('ctfzone.stored_objects') IS NOT NULL
           AND to_regclass('ctfzone.object_operations') IS NOT NULL"
@@ -238,6 +288,10 @@ networks:
     internal: true
   application:
     internal: true
+  ssh_control:
+    internal: true
+  ssh_web:
+    internal: true
   data:
     internal: true
   objects:
@@ -248,5 +302,6 @@ volumes:
   caddy_config:
   caddy_data:
   controller_journal:
+  ssh_gateway_identities:
   object_storage_data:
   postgres_data:

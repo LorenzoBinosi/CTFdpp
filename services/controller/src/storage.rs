@@ -10,7 +10,7 @@ use tokio::{sync::watch, time::Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::{config::Config, state::SharedStatus};
+use crate::state::SharedStatus;
 
 const INTERNAL_REQUEST_TTL: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -67,9 +67,10 @@ struct StagingCleanupGate {
 }
 
 impl StorageConfig {
-    pub(crate) fn from_env(controller: &Config) -> Result<Self> {
+    pub(crate) fn from_env() -> Result<Self> {
         let access_key = required("OBJECT_STORAGE_ACCESS_KEY")?;
         let secret_key = required("OBJECT_STORAGE_SECRET_KEY")?;
+        let database_url = required("DATABASE_URL")?;
         let bucket = env::var("OBJECT_STORAGE_BUCKET").unwrap_or_else(|_| "ctfzone".to_owned());
         validate_bucket(&bucket)?;
         let region = env::var("OBJECT_STORAGE_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
@@ -83,7 +84,9 @@ impl StorageConfig {
             "OBJECT_STORAGE_MAX_UPLOAD_DURATION_SECONDS",
             900,
         )?);
-        validate_storage_lease(controller.stale_claim_after)?;
+        let stale_claim_after =
+            Duration::from_secs(positive_u64("OBJECT_MAINTENANCE_STALE_CLAIM_SECONDS", 300)?);
+        validate_storage_lease(stale_claim_after)?;
 
         // Constructing the bucket here validates the endpoint/bucket/region
         // combination before either worker or the HTTP health server starts.
@@ -98,14 +101,14 @@ impl StorageConfig {
         Ok(Self {
             access_key,
             bucket,
-            database_url: controller.database_url.clone(),
+            database_url,
             internal_url,
             maintenance_interval,
-            max_attempts: controller.max_command_attempts,
+            max_attempts: positive_i32("OBJECT_MAINTENANCE_MAX_ATTEMPTS", 8)?,
             max_upload_duration,
             region,
             secret_key,
-            stale_claim_after: controller.stale_claim_after,
+            stale_claim_after,
         })
     }
 }
@@ -1117,10 +1120,23 @@ fn positive_u64(name: &str, default: u64) -> Result<u64> {
     Ok(value)
 }
 
+fn positive_i32(name: &str, default: i32) -> Result<i32> {
+    let value = env::var(name)
+        .ok()
+        .map(|value| value.parse::<i32>())
+        .transpose()
+        .with_context(|| format!("{name} must be a positive integer"))?
+        .unwrap_or(default);
+    if value <= 0 {
+        bail!("{name} must be a positive integer");
+    }
+    Ok(value)
+}
+
 fn validate_storage_lease(stale_claim_after: Duration) -> Result<()> {
     if stale_claim_after <= HTTP_TIMEOUT.saturating_add(Duration::from_secs(5)) {
         bail!(
-            "STALE_CLAIM_AFTER_SECONDS must exceed the object-storage HTTP timeout by more than 5 seconds"
+            "OBJECT_MAINTENANCE_STALE_CLAIM_SECONDS must exceed the object-storage HTTP timeout by more than 5 seconds"
         );
     }
     Ok(())

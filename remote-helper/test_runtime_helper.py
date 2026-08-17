@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import json
 import pathlib
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -18,6 +20,30 @@ helper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(helper)
 
 INSTANCE_ID = "11111111-1111-4111-8111-111111111111"
+IMAGE = "registry.example/challenge@sha256:" + "a" * 64
+
+
+def deployment(**values: object) -> dict[str, object]:
+    return {
+        "image_digest": IMAGE,
+        "container_port": 31337,
+        "protocol": "tcp",
+        **values,
+    }
+
+
+def ensure_request(flag_value: str | None = None) -> dict[str, object]:
+    runtime_deployment = deployment()
+    if flag_value is not None:
+        runtime_deployment["flag_value"] = flag_value
+    return {
+        "instance_id": INSTANCE_ID,
+        "owner_user_id": 7,
+        "challenge_id": 11,
+        "generation": 1,
+        "expires_at": "2099-01-01T00:00:00Z",
+        "deployment": runtime_deployment,
+    }
 
 
 class GenerationSafetyTests(unittest.TestCase):
@@ -454,6 +480,190 @@ class SweepRecoveryTests(unittest.TestCase):
 
         self.assertEqual(result, {"checked": 1, "removed": 0, "rearmed": 0})
         remove_network.assert_called_once_with(INSTANCE_ID)
+
+
+class FlagInjectionTests(unittest.TestCase):
+    def test_flag_value_is_bounded_and_arbitrary_environment_is_rejected(self) -> None:
+        self.assertEqual(
+            helper.validate_deployment({"deployment": deployment(flag_value="flag{ok}")})[
+                "flag_value"
+            ],
+            "flag{ok}",
+        )
+        for invalid in ("", "bad\x00flag", "é" * 257, "\ud800"):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaisesRegex(helper.HelperError, "flag_value is invalid"):
+                    helper.validate_deployment(
+                        {"deployment": deployment(flag_value=invalid)}
+                    )
+        for field in ("env", "environment"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    helper.HelperError, "deployment contains unsupported fields"
+                ):
+                    helper.validate_deployment(
+                        {"deployment": deployment(**{field: {"FLAG": "unsafe"}})}
+                    )
+
+    def test_new_container_receives_only_ctfzone_flag_and_state_omits_value(self) -> None:
+        secret = "flag{private-value}"
+        with tempfile.TemporaryDirectory() as directory:
+            instances = pathlib.Path(directory) / "instances"
+            with (
+                mock.patch.object(helper, "INSTANCES_DIRECTORY", instances),
+                mock.patch.object(helper, "read_tombstone", return_value=None),
+                mock.patch.object(helper, "inspect_raw", return_value=None),
+                mock.patch.object(helper, "read_state", return_value=None),
+                mock.patch.object(helper, "ensure_network", return_value="ctfzone-test"),
+                mock.patch.object(helper, "engine") as engine,
+                mock.patch.object(helper, "schedule_timer"),
+                mock.patch.object(helper, "wait_for_startup"),
+                mock.patch.object(
+                    helper,
+                    "inspect_result",
+                    return_value={"absent": False, "ready": True},
+                ),
+            ):
+                result = helper.ensure_instance(ensure_request(secret))
+            persisted_json = (instances / f"{INSTANCE_ID}.json").read_text(
+                encoding="utf-8"
+            )
+            persisted_state = json.loads(persisted_json)
+
+        self.assertEqual(result["effective_generation"], 1)
+        positional = engine.call_args.args
+        environment_index = positional.index("--env")
+        self.assertEqual(positional[environment_index + 1], "CTFZONE_FLAG")
+        self.assertFalse(any(secret in value for value in positional))
+        self.assertEqual(
+            engine.call_args.kwargs["environment_overrides"],
+            {"CTFZONE_FLAG": secret},
+        )
+        self.assertEqual(engine.call_args.kwargs["sensitive_values"], (secret,))
+        self.assertNotIn(secret, persisted_json)
+        self.assertNotIn("flag_value", persisted_json)
+        self.assertNotIn("flag_value", persisted_state["deployment"])
+        self.assertEqual(
+            persisted_state["flag_fingerprint"], helper.flag_fingerprint(secret)
+        )
+
+    def test_retry_reuses_matching_container_without_reinjecting_secret(self) -> None:
+        secret = "flag{stable-retry}"
+        previous_state = {
+            "instance_id": INSTANCE_ID,
+            "generation": 1,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "deployment": deployment(),
+            "flag_fingerprint": helper.flag_fingerprint(secret),
+        }
+        inspection = {
+            "Config": {
+                "Labels": {
+                    "ctfzone.instance_id": INSTANCE_ID,
+                    "ctfzone.generation": "1",
+                }
+            }
+        }
+        with (
+            mock.patch.object(helper, "read_tombstone", return_value=None),
+            mock.patch.object(helper, "inspect_raw", return_value=inspection),
+            mock.patch.object(helper, "read_state", return_value=previous_state),
+            mock.patch.object(helper, "engine") as engine,
+            mock.patch.object(helper, "schedule_timer"),
+            mock.patch.object(helper, "write_state") as write_state,
+            mock.patch.object(helper, "wait_for_startup"),
+            mock.patch.object(
+                helper,
+                "inspect_result",
+                return_value={"absent": False, "ready": True},
+            ),
+        ):
+            helper.ensure_instance(ensure_request(secret))
+
+        engine.assert_not_called()
+        persisted = write_state.call_args.args[1]
+        self.assertNotIn(secret, repr(persisted))
+        self.assertEqual(persisted["flag_fingerprint"], helper.flag_fingerprint(secret))
+
+    def test_retry_rejects_changed_flag_without_echoing_either_value(self) -> None:
+        original = "flag{original}"
+        replacement = "flag{replacement}"
+        previous_state = {
+            "instance_id": INSTANCE_ID,
+            "generation": 1,
+            "deployment": deployment(),
+            "flag_fingerprint": helper.flag_fingerprint(original),
+        }
+        inspection = {
+            "Config": {
+                "Labels": {
+                    "ctfzone.instance_id": INSTANCE_ID,
+                    "ctfzone.generation": "1",
+                }
+            }
+        }
+        with (
+            mock.patch.object(helper, "read_tombstone", return_value=None),
+            mock.patch.object(helper, "inspect_raw", return_value=inspection),
+            mock.patch.object(helper, "read_state", return_value=previous_state),
+            mock.patch.object(helper, "engine") as engine,
+        ):
+            with self.assertRaises(helper.HelperError) as raised:
+                helper.ensure_instance(ensure_request(replacement))
+
+        diagnostic = str(raised.exception)
+        self.assertNotIn(original, diagnostic)
+        self.assertNotIn(replacement, diagnostic)
+        engine.assert_not_called()
+
+    def test_existing_container_cannot_be_relabelled_as_a_new_generation(self) -> None:
+        secret = "flag{immutable-generation}"
+        previous_state = {
+            "instance_id": INSTANCE_ID,
+            "generation": 1,
+            "deployment": deployment(),
+            "flag_fingerprint": helper.flag_fingerprint(secret),
+        }
+        inspection = {
+            "Config": {
+                "Labels": {
+                    "ctfzone.instance_id": INSTANCE_ID,
+                    "ctfzone.generation": "1",
+                }
+            }
+        }
+        request = ensure_request(secret)
+        request["generation"] = 2
+        with (
+            mock.patch.object(helper, "read_tombstone", return_value=None),
+            mock.patch.object(helper, "inspect_raw", return_value=inspection),
+            mock.patch.object(helper, "read_state", return_value=previous_state),
+            mock.patch.object(helper, "engine") as engine,
+            mock.patch.object(helper, "write_state") as write_state,
+        ):
+            result = helper.ensure_instance(request)
+
+        self.assertEqual(result["stale_generation"], True)
+        self.assertEqual(result["effective_generation"], 1)
+        engine.assert_not_called()
+        write_state.assert_not_called()
+
+    def test_container_engine_diagnostics_redact_flag_value(self) -> None:
+        secret = "flag{must-not-reach-stderr}"
+        completed = subprocess.CompletedProcess(
+            ["podman"], 125, stdout=b"", stderr=f"failed for {secret}".encode()
+        )
+        with mock.patch.object(helper.subprocess, "run", return_value=completed):
+            with self.assertRaises(helper.HelperError) as raised:
+                helper.run(
+                    ["podman", "run"],
+                    environment_overrides={"CTFZONE_FLAG": secret},
+                    sensitive_values=(secret,),
+                )
+
+        diagnostic = str(raised.exception)
+        self.assertNotIn(secret, diagnostic)
+        self.assertIn("[redacted]", diagnostic)
 
 
 class LockingTests(unittest.TestCase):

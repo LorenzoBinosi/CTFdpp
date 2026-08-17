@@ -21,7 +21,6 @@ use uuid::Uuid;
 
 type HmacSha1 = Hmac<Sha1>;
 
-const CONFIGURATION_LOCK: i64 = 0x4354_465A;
 const TEAM_CAPACITY_LOCK: i64 = 0x4354_465B;
 const TEAM_MEMBERSHIP_LOCK: i64 = 0x4354_465C;
 const TEAM_INVITE_MAX_AGE_SECONDS: i64 = 86_400;
@@ -308,6 +307,12 @@ pub(super) async fn create(
     }
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &admin,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     require_team_mode_in_transaction(&mut transaction).await?;
     reject_duplicate(&mut transaction, None, &name, &email).await?;
     validate_bracket(&mut transaction, request.bracket_id).await?;
@@ -370,13 +375,19 @@ pub(super) async fn create_current(
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     lock_team_capacity(&mut transaction).await?;
     lock_team_membership(&mut transaction).await?;
     let current_team_id = lock_participant(&mut transaction, user.id).await?;
     if current_team_id.is_some() {
         return Err(ApiError::conflict("You have already joined a team"));
     }
-    require_team_mode_in_transaction(&mut transaction).await?;
     if !transaction_config_bool(&mut transaction, "team_creation", true).await? {
         return Err(ApiError::forbidden(
             "Participant team creation is currently disabled; join an existing team instead",
@@ -443,12 +454,18 @@ pub(super) async fn join_current(
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     lock_team_membership(&mut transaction).await?;
     let current_team_id = lock_participant(&mut transaction, user.id).await?;
     if current_team_id.is_some() {
         return Err(ApiError::conflict("You have already joined a team"));
     }
-    require_team_mode_in_transaction(&mut transaction).await?;
     let record = load_team_for_update(&mut transaction, invite.team_id)
         .await?
         .ok_or_else(invalid_team_invite)?;
@@ -566,7 +583,7 @@ pub(super) async fn delete_admin(
 ) -> Result<Response, ApiError> {
     require_team_mode(&state).await?;
     require_admin(&admin)?;
-    delete_team(&state, team_id, None).await
+    delete_team(&state, &admin, team_id, None).await
 }
 
 pub(super) async fn delete_current(
@@ -577,7 +594,7 @@ pub(super) async fn delete_current(
     let team_id = user
         .team_id
         .ok_or_else(|| ApiError::forbidden("You are not a member of a team"))?;
-    delete_team(&state, team_id, Some(user.id)).await
+    delete_team(&state, &user, team_id, Some(user.id)).await
 }
 
 pub(super) async fn list_members(
@@ -610,6 +627,14 @@ pub(super) async fn add_member(
         .map_err(|_| ApiError::bad_request("A valid user_id is required"))?;
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &admin,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     lock_team_membership(&mut transaction).await?;
     let participant = sqlx::query_as::<_, (Option<String>, Option<i32>)>(
         "SELECT type,team_id FROM ctfzone.users WHERE id=$1 FOR UPDATE",
@@ -650,6 +675,12 @@ pub(super) async fn current_invite(
         .ok_or_else(|| ApiError::forbidden("You are not a member of a team"))?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     lock_team_membership(&mut transaction).await?;
     if lock_participant(&mut transaction, user.id).await? != Some(team_id) {
         return Err(ApiError::forbidden("You are not a member of this team"));
@@ -680,6 +711,14 @@ pub(super) async fn remove_member(
     require_team_mode(&state).await?;
     require_admin(&admin)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &admin,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     lock_team_membership(&mut transaction).await?;
     let member_team_id = sqlx::query_scalar::<_, Option<i32>>(
         "SELECT team_id FROM ctfzone.users WHERE id=$1 FOR UPDATE",
@@ -730,8 +769,15 @@ async fn update(
     let email = request.email.as_deref().map(validate_email).transpose()?;
     let mut name_changes_enabled = true;
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        actor,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     if !admin {
-        lock_configuration_shared(&mut transaction).await?;
         lock_team_membership(&mut transaction).await?;
         if lock_participant(&mut transaction, actor.id).await? != Some(team_id) {
             return Err(ApiError::forbidden("You are not a member of this team"));
@@ -745,7 +791,6 @@ async fn update(
             ));
         }
         previous = locked_team;
-        require_team_mode_in_transaction(&mut transaction).await?;
         name_changes_enabled =
             transaction_config_bool(&mut transaction, "name_changes", true).await?;
     }
@@ -897,13 +942,19 @@ async fn update(
 
 async fn delete_team(
     state: &AppState,
+    actor: &CurrentUser,
     team_id: i32,
     participant_actor: Option<i32>,
 ) -> Result<Response, ApiError> {
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    if participant_actor.is_some() {
-        lock_configuration_shared(&mut transaction).await?;
-    }
+    lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        actor,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    require_team_mode_in_transaction(&mut transaction).await?;
     lock_team_capacity(&mut transaction).await?;
     lock_team_membership(&mut transaction).await?;
     if let Some(actor_id) = participant_actor {
@@ -1028,12 +1079,7 @@ async fn rate_limit_team_action(
 pub(super) async fn lock_configuration_shared(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), ApiError> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
-        .bind(CONFIGURATION_LOCK)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
-        .map_err(ApiError::database)
+    super::user_mode_transition::lock_configuration_shared(transaction).await
 }
 
 async fn lock_team_capacity(transaction: &mut Transaction<'_, Postgres>) -> Result<(), ApiError> {
@@ -1120,11 +1166,7 @@ async fn transaction_config_i64(
 async fn require_team_mode_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), ApiError> {
-    if transaction_config_string(transaction, "user_mode")
-        .await?
-        .as_deref()
-        == Some("teams")
-    {
+    if super::user_mode_transition::transaction_user_mode(transaction).await? == "teams" {
         Ok(())
     } else {
         Err(ApiError::not_found("Team mode is disabled"))

@@ -1,82 +1,216 @@
 {% extends "admin/base.html" %}
-{% block description %}<p>{{ 'Define a new challenge and its first static flag.' if form_mode == 'create' else 'Update the core fields exposed by the CTFZone API.' }}</p>{% endblock %}
+{% block description %}<p>{{ 'Build a Jeopardy challenge in five focused steps.' if form_mode == 'create' else 'Update the challenge details exposed to players.' }}</p>{% endblock %}
 {% block actions %}<a class="secondary-button button-small" href="{{ url_for('web.admin_challenges') }}">← Back to challenges</a>{% endblock %}
 {% block admin_content %}
   {% if module_error %}
     <section class="admin-panel admin-empty-card"><h2>Challenge unavailable</h2><p>The challenge could not be loaded. Return to the list and try again.</p></section>
-  {% else %}
-    <form class="admin-form" data-challenge-form data-mode="{{ form_mode }}"{% if challenge %} data-challenge-id="{{ challenge.id }}"{% endif %}>
-      <section class="admin-panel admin-form-section">
-        <header><span class="eyebrow">IDENTITY</span><h2>Core details</h2><p>The title, category and description presented to players.</p></header>
-        <div class="admin-field-grid two">
-          <label class="admin-field"><span>Name</span><input name="name" required maxlength="128" value="{{ challenge.name if challenge else '' }}" placeholder="Grandma's Cookies"></label>
-          <label class="admin-field"><span>Category</span><input name="category" required maxlength="80" value="{{ challenge.category if challenge else '' }}" placeholder="web"></label>
-        </div>
-        <label class="admin-field"><span>Description <small>Markdown</small></span><textarea name="description" rows="9" required placeholder="Explain the goal without giving away the solution…">{{ challenge.description if challenge else '' }}</textarea></label>
-        <label class="admin-field"><span>Connection information <small>Optional</small></span><input name="connection_info" value="{{ challenge.connection_info if challenge and challenge.connection_info else '' }}" placeholder="nc host.example 31337"></label>
+  {% elif form_mode == 'create' %}
+    <form class="admin-form admin-challenge-form admin-challenge-wizard" data-challenge-form data-challenge-wizard data-mode="create">
+      <nav class="challenge-wizard-progress admin-panel" aria-label="Challenge creation progress">
+        <ol>
+          <li class="active" data-wizard-progress-item><button type="button" data-wizard-step-trigger="1" aria-current="step" aria-controls="challenge-step-1"><span>1</span><strong>Challenge type</strong><small>Choose the format</small></button></li>
+          <li data-wizard-progress-item><button type="button" data-wizard-step-trigger="2" aria-controls="challenge-step-2" disabled><span>2</span><strong>Availability</strong><small>Public or private</small></button></li>
+          <li data-wizard-progress-item><button type="button" data-wizard-step-trigger="3" aria-controls="challenge-step-3" disabled><span>3</span><strong>Details</strong><small>Content and scoring</small></button></li>
+          <li data-wizard-progress-item><button type="button" data-wizard-step-trigger="4" aria-controls="challenge-step-4" disabled><span>4</span><strong>Flag</strong><small>Validation rules</small></button></li>
+          <li data-wizard-progress-item><button type="button" data-wizard-step-trigger="5" aria-controls="challenge-step-5" disabled><span>5</span><strong>Connection</strong><small>Player access</small></button></li>
+        </ol>
+      </nav>
+      <p class="sr-only" data-wizard-announcement aria-live="polite">Step 1 of 5: Challenge type</p>
+
+      <section class="admin-panel challenge-wizard-step" id="challenge-step-1" data-wizard-step="1" aria-labelledby="challenge-step-1-title">
+        <div class="challenge-step-heading"><span class="eyebrow">STEP 1 OF 5</span><h2 id="challenge-step-1-title" tabindex="-1">What kind of challenge is this?</h2><p>The format defines how participants compete and how CTFZone evaluates progress.</p></div>
+        <fieldset class="challenge-choice-grid challenge-type-grid">
+          <legend class="sr-only">Challenge type</legend>
+          <label class="challenge-choice-card"><input type="radio" name="challenge_type" value="jeopardy" required><span class="challenge-choice-mark" aria-hidden="true">J</span><span><strong>Jeopardy</strong><small>Find and submit a flag to solve an independent challenge.</small></span><em>Available</em></label>
+          <label class="challenge-choice-card future" aria-disabled="true"><input type="radio" name="challenge_type" value="attack_defense" disabled><span class="challenge-choice-mark" aria-hidden="true">A/D</span><span><strong>Attack / Defense</strong><small>Protect your service while exploiting opponents.</small></span><em>Future development</em></label>
+          <label class="challenge-choice-card future" aria-disabled="true"><input type="radio" name="challenge_type" value="speed_run" disabled><span class="challenge-choice-mark" aria-hidden="true">SR</span><span><strong>Speed run</strong><small>Race to complete a challenge in the shortest time.</small></span><em>Future development</em></label>
+          <label class="challenge-choice-card future" aria-disabled="true"><input type="radio" name="challenge_type" value="king_of_the_hill" disabled><span class="challenge-choice-mark" aria-hidden="true">K</span><span><strong>King of the hill</strong><small>Continuously control a target to accumulate points.</small></span><em>Future development</em></label>
+        </fieldset>
+        <footer class="challenge-step-actions"><span></span><button class="button" type="button" data-wizard-next>Continue to availability →</button></footer>
       </section>
 
+      <section class="admin-panel challenge-wizard-step" id="challenge-step-2" data-wizard-step="2" aria-labelledby="challenge-step-2-title" hidden>
+        <div class="challenge-step-heading"><span class="eyebrow">STEP 2 OF 5</span><h2 id="challenge-step-2-title" tabindex="-1">How is the challenge delivered?</h2><p>Public challenges share participant-facing content or services. Private challenges receive an isolated controller-managed instance.</p></div>
+        <fieldset class="challenge-choice-grid challenge-exposure-grid">
+          <legend class="sr-only">Challenge availability</legend>
+          <label class="challenge-choice-card"><input type="radio" name="exposure" value="public" required><span class="challenge-choice-mark" aria-hidden="true">↗</span><span><strong>Public challenge</strong><small>Every participant uses the same files, page, or externally hosted service.</small></span></label>
+          <label class="challenge-choice-card"><input type="radio" name="exposure" value="private" required><span class="challenge-choice-mark" aria-hidden="true">◇</span><span><strong>Private instance</strong><small>The controller starts a dedicated container when a participant activates it.</small></span></label>
+        </fieldset>
+        <div class="challenge-conditional-card" data-public-explanation hidden><strong>No controller lifecycle</strong><p>Add optional connection instructions in the final step, or place links and instructions directly in the description.</p></div>
+        <div class="challenge-conditional-card" data-private-explanation hidden><strong>Controller-managed lifecycle</strong><p>You will provide the immutable container image, exposed service port, lifetime, and optional resource limits in the final step.</p></div>
+        <footer class="challenge-step-actions"><button class="quiet-button" type="button" data-wizard-back>← Back</button><button class="button" type="button" data-wizard-next>Continue to details →</button></footer>
+      </section>
+
+      <section class="challenge-wizard-step" id="challenge-step-3" data-wizard-step="3" aria-labelledby="challenge-step-3-title" hidden>
+        <section class="admin-panel admin-form-section challenge-details-introduction">
+          <header><span class="eyebrow">STEP 3 OF 5</span><h2 id="challenge-step-3-title" tabindex="-1">Describe the challenge</h2><p>Add participant-facing content, select a pre-created category, and choose scoring and visibility.</p></header>
+          <div class="challenge-review-strip" aria-label="Selected challenge setup"><span><small>Format</small><strong data-review-type>Jeopardy</strong></span><span><small>Availability</small><strong data-review-exposure>—</strong></span><span><small>Flag</small><strong data-review-flag>Exact match</strong></span></div>
+        </section>
+        <section class="admin-panel admin-form-section">
+          <header><span class="eyebrow">IDENTITY</span><h2>Player-facing details</h2><p>The title, category, authors, and description shown on the challenge board.</p></header>
+          <div class="admin-field-grid two challenge-identity-grid">
+            <label class="admin-field"><span>Name</span><input name="name" required maxlength="80" placeholder="Grandma's Cookies"></label>
+            <div class="admin-field challenge-category-field">
+              <span><label for="challenge-category">Category</label> <small>Pre-created</small></span>
+              <div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div>
+              <small class="challenge-category-help" data-category-help>{% if category_error %}The category catalog could not be loaded. You can still create a category here.{% elif not categories %}No categories exist yet. Create one before saving this challenge.{% else %}Categories are reusable and managed separately from challenges.{% endif %}</small>
+            </div>
+          </div>
+          <label class="admin-field"><span>Author(s) / attribution <small>Optional · Markdown</small></span><textarea name="attribution" rows="2" maxlength="2048" placeholder="Jane Doe, [Team Example](https://example.org)"></textarea><small>List one or more authors, teams, or source links. This appears as the challenge byline.</small></label>
+          <label class="admin-field"><span>Description <small>Markdown + safe HTML</small></span><textarea name="description" rows="8" required placeholder="Explain the goal without giving away the solution…"></textarea><small>Use Markdown or permitted HTML for links, formatting, code blocks, and richer instructions.</small></label>
+        </section>
+        <section class="admin-panel admin-form-section">
+          <header><span class="eyebrow">SCORING &amp; VISIBILITY</span><h2>Competition behavior</h2></header>
+          <div class="admin-field-grid three">
+            <label class="admin-field"><span>Scoring</span><select name="type" data-challenge-type><option value="standard">Fixed value</option><option value="dynamic">Dynamic value</option></select></label>
+            <label class="admin-field" data-static-value><span>Value</span><input name="value" type="number" min="0" required value="500"></label>
+            <label class="admin-field"><span>State</span><select name="state"><option value="hidden" selected>Hidden draft</option><option value="visible">Visible</option><option value="locked">Locked</option></select></label>
+          </div>
+          <div class="admin-dynamic-fields" data-dynamic-fields><div class="admin-field-grid four">
+            <label class="admin-field"><span>Curve</span><select name="function"><option value="logarithmic">Logarithmic</option><option value="linear">Linear</option></select></label>
+            <label class="admin-field"><span>Initial</span><input name="initial" type="number" min="0" value="500"></label>
+            <label class="admin-field"><span>Minimum</span><input name="minimum" type="number" min="0" value="100"></label>
+            <label class="admin-field"><span>Decay</span><input name="decay" type="number" min="1" value="50"></label>
+          </div></div>
+          <div class="admin-field-grid two">
+            <label class="admin-field"><span>Maximum attempts <small>Blank = unlimited</small></span><input name="max_attempts" type="number" min="0"></label>
+            <label class="admin-field"><span>Board position</span><input name="position" type="number" min="0" max="32767" value="0"></label>
+          </div>
+        </section>
+        <section class="admin-panel admin-form-section">
+          <header><span class="eyebrow">RESOURCES</span><h2>Challenge files</h2><p>Files are authorized by CTFZone, uploaded directly from this browser to object storage, then attached after the challenge is saved.</p></header>
+          {% if storage_origin %}<label class="admin-field admin-file-picker"><span>Select files <small>Optional · 64 MiB maximum per file · uploads start after save</small></span><input name="challenge_files" type="file" multiple data-challenge-files></label><p class="admin-upload-status" data-upload-status aria-live="polite"></p>{% else %}<p class="admin-upload-note">Direct object storage is not configured, so resource uploads are unavailable.</p>{% endif %}
+        </section>
+        <footer class="challenge-step-actions"><button class="quiet-button" type="button" data-wizard-back>← Back</button><button class="button" type="button" data-wizard-next>Continue to flag →</button></footer>
+      </section>
+
+      <section class="admin-panel challenge-wizard-step" id="challenge-step-4" data-wizard-step="4" aria-labelledby="challenge-step-4-title" hidden>
+        <div class="challenge-step-heading"><span class="eyebrow">STEP 4 OF 5</span><h2 id="challenge-step-4-title" tabindex="-1">How is the flag validated?</h2><p>Choose an exact flag or a full regular expression. Private exact flags can be personalized per participant.</p></div>
+        <fieldset class="challenge-choice-grid challenge-flag-grid">
+          <legend class="sr-only">Flag validation type</legend>
+          <label class="challenge-choice-card compact"><input type="radio" name="flag_type" value="static" checked required><span><strong>Exact match</strong><small>Compare the submitted flag with a literal value or private template.</small></span></label>
+          <label class="challenge-choice-card compact"><input type="radio" name="flag_type" value="regex" required><span><strong>Regular expression</strong><small>Accept any submission matched by one anchored expression.</small></span></label>
+        </fieldset>
+        <div class="challenge-flag-editor" data-static-flag-fields>
+          <label class="admin-field"><span>Flag or flag template <small>512 UTF-8 bytes after token replacement</small></span><input name="flag_content" autocomplete="off" spellcheck="false" maxlength="512" placeholder="flag{this_is_a_flag}" required></label>
+          <label class="admin-check-row" data-case-sensitive-setting><input name="case_sensitive" type="checkbox" checked><span><strong>Case-sensitive match</strong><small><code>flag{example}</code> and <code>FLAG{EXAMPLE}</code> are treated as different flags.</small></span></label>
+          <div class="challenge-private-flag-options" data-private-flag-options hidden>
+            <div class="challenge-template-guide"><div><strong>Optional random token</strong><p>Place <code>&#123;&#123;RANDOM_TOKEN&#125;&#125;</code> anywhere in the flag. CTFZone detects it and substitutes a unique UUIDv4 for each participant.</p></div><span class="status-pill" data-random-token-status>No random token</span></div>
+            <label class="admin-check-row"><input name="leet_variation" type="checkbox"><span><strong>Create a unique leet variation</strong><small>On first activation, vary eligible letters inside the outer <code>{…}</code> payload and reserve a unique result. An unwrapped flag uses the whole literal.</small></span></label>
+            <label class="admin-check-row"><input name="accept_other_users" type="checkbox" disabled><span><strong>Accept another participant's generated flag</strong><small>Count it as valid while retaining the original flag owner for sharing and cheating review.</small></span></label>
+            <p class="challenge-flag-preview" data-flag-example>Generated assignments persist from first activation. Enable leet variation to see its capacity.</p>
+          </div>
+        </div>
+        <div class="challenge-flag-editor" data-regex-flag-fields hidden>
+          <label class="admin-field"><span>Regular expression <small>512 UTF-8 bytes maximum</small></span><input name="flag_regex_content" autocomplete="off" spellcheck="false" maxlength="512" placeholder="flag\{user_[0-9a-f]{8}\}" required disabled></label>
+          <p>CTFZone anchors the expression to the complete submission. Personalized tokens and leet variations do not apply to regex flags.</p>
+        </div>
+        <footer class="challenge-step-actions"><button class="quiet-button" type="button" data-wizard-back>← Back</button><button class="button" type="button" data-wizard-next>Continue to connection →</button></footer>
+      </section>
+
+      <section class="challenge-wizard-step" id="challenge-step-5" data-wizard-step="5" aria-labelledby="challenge-step-5-title" hidden>
+        <section class="admin-panel admin-form-section challenge-details-introduction">
+          <header><span class="eyebrow">STEP 5 OF 5</span><h2 id="challenge-step-5-title" tabindex="-1">Configure participant access</h2><p>Provide optional connection instructions and, for private challenges, the controller deployment.</p></header>
+          <div class="challenge-review-strip" aria-label="Selected challenge setup"><span><small>Format</small><strong>Jeopardy</strong></span><span><small>Availability</small><strong data-review-exposure>—</strong></span><span><small>Flag</small><strong data-review-flag>Exact match</strong></span></div>
+        </section>
+        <section class="admin-panel admin-form-section">
+          <header><span class="eyebrow">PLAYER ACCESS</span><h2>Connection information</h2><p>This is a free-form instruction shown separately from the description; it does not have to be a URL.</p></header>
+          <label class="admin-field"><span>Connection information <small>Optional</small></span><textarea name="connection_info" rows="3" maxlength="4096" placeholder="https://challenge.example.org, nc host.example 31337, or ssh user@host"></textarea><small>Use a link, hostname, command, or short instructions. Leave blank if the description already explains how to access the challenge.</small></label>
+          <div class="challenge-conditional-card" data-public-connection-note hidden><strong>Shared connection</strong><p>CTFZone displays these instructions to every participant and does not ask the controller to provision anything.</p></div>
+          <div class="challenge-conditional-card" data-private-connection-note hidden><strong>Generated endpoint</strong><p>The controller generates the instance endpoint when a participant activates the challenge. Use this field only for extra instructions shared by everyone.</p></div>
+        </section>
+        <section class="admin-panel admin-form-section" data-challenge-runtime-fields data-global-gate-enabled="{{ 'true' if private_challenge_gate_enabled else 'false' }}" hidden>
+          <header><span class="eyebrow">PRIVATE INSTANCE</span><h2>Controller deployment</h2><p>Use an immutable OCI digest so every participant receives the intended challenge build.</p></header>
+          {% if private_challenge_gate_enabled %}
+            <div class="challenge-global-gate good"><span class="status-dot"></span><div><strong>Private challenge launches are enabled globally</strong><p>This challenge can become available as soon as its own configuration is saved and visible.</p></div></div>
+          {% else %}
+            <div class="challenge-global-gate warning">
+              <span class="status-dot off"></span>
+              <div>
+                <strong>{{ 'Global launch state could not be verified' if private_challenge_gate_error else 'Private challenge launches are disabled globally' }}</strong>
+                <p>A hidden draft can be saved without changing the gate. To create this challenge as visible or locked, explicitly enable launches for every configured private challenge.</p>
+                <label class="admin-check-row"><input name="enable_global_gate" type="checkbox" disabled><span><strong>Enable private challenge launches globally</strong><small>This affects every enabled private challenge, not only this one.</small></span></label>
+              </div>
+            </div>
+          {% endif %}
+          <label class="admin-field"><span>Container image digest</span><input name="image_digest" autocomplete="off" spellcheck="false" placeholder="registry.example/ctf/web@sha256:0123…" required disabled data-image-digest></label>
+          <div class="admin-field-grid three">
+            <label class="admin-field"><span>Protocol</span><select name="runtime_protocol" required disabled><option value="tcp">TCP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+            <label class="admin-field"><span>Container port</span><input name="container_port" type="number" min="1" max="65535" required disabled placeholder="31337"></label>
+            <label class="admin-field"><span>Remote pool <small>Optional</small></span><input name="remote_pool" maxlength="128" disabled placeholder="default"></label>
+          </div>
+          <div class="admin-field-grid three">
+            <label class="admin-field"><span>Default lifetime <small>Minutes</small></span><input name="default_ttl_minutes" type="number" min="1" max="1440" value="30" required disabled></label>
+            <label class="admin-field"><span>Maximum lifetime <small>Minutes</small></span><input name="maximum_ttl_minutes" type="number" min="1" max="10080" value="60" required disabled></label>
+            <label class="admin-field"><span>Maximum extensions</span><input name="maximum_extensions" type="number" min="0" max="100" value="2" required disabled></label>
+          </div>
+          <label class="admin-check-row challenge-runtime-extension"><input name="allow_extension" type="checkbox" checked disabled><span><strong>Allow participants to extend an active instance</strong><small>Extensions can never exceed the maximum lifetime above.</small></span></label>
+          <details class="challenge-advanced-settings"><summary>Optional resource limits</summary><div class="admin-field-grid four">
+            <label class="admin-field"><span>CPU limit</span><input name="cpu_limit" type="number" min="0.01" max="256" step="0.01" disabled placeholder="1.5"></label>
+            <label class="admin-field"><span>Memory <small>MiB</small></span><input name="memory_limit_mib" type="number" min="1" disabled placeholder="512"></label>
+            <label class="admin-field"><span>PID limit</span><input name="pid_limit" type="number" min="1" disabled placeholder="256"></label>
+            <label class="admin-field"><span>Storage <small>MiB</small></span><input name="storage_limit_mib" type="number" min="1" disabled placeholder="1024"></label>
+          </div></details>
+        </section>
+        <footer class="challenge-final-actions"><button class="quiet-button" type="button" data-wizard-back>← Back</button><span data-submit-summary>Jeopardy challenge</span><a class="quiet-button" href="{{ url_for('web.admin_challenges') }}">Cancel</a><button class="button" type="submit">Create challenge</button></footer>
+      </section>
+    </form>
+  {% else %}
+    <form class="admin-form admin-challenge-form" data-challenge-form data-mode="edit" data-challenge-id="{{ challenge.id }}">
+      <section class="admin-panel admin-form-section">
+        <header><span class="eyebrow">IDENTITY</span><h2>Core details</h2><p>The title, category, authors, and description presented to players.</p></header>
+        <div class="admin-field-grid two">
+          <label class="admin-field"><span>Name</span><input name="name" required maxlength="80" value="{{ challenge.name }}" placeholder="Grandma's Cookies"></label>
+          <div class="admin-field challenge-category-field"><span><label for="challenge-category">Category</label> <small>Pre-created</small></span><div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}" {{ 'selected' if challenge.category_id|string == category.id|string }}>{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div><small class="challenge-category-help" data-category-help>{% if category_error %}The category catalog could not be loaded. Create or reload a category before saving.{% else %}Categories are reusable across challenges.{% endif %}</small></div>
+        </div>
+        <label class="admin-field"><span>Author(s) / attribution <small>Optional · Markdown</small></span><textarea name="attribution" rows="2" maxlength="2048" placeholder="Jane Doe, [Team Example](https://example.org)">{{ challenge.attribution or '' }}</textarea></label>
+        <label class="admin-field"><span>Description <small>Markdown + safe HTML</small></span><textarea name="description" rows="9" required placeholder="Explain the goal without giving away the solution…">{{ challenge.description or '' }}</textarea></label>
+      </section>
       <section class="admin-panel admin-form-section">
         <header><span class="eyebrow">SCORING &amp; VISIBILITY</span><h2>Competition behavior</h2></header>
         <div class="admin-field-grid three">
-          <label class="admin-field"><span>Type{% if challenge %} <small>Fixed after creation</small>{% endif %}</span><select name="type" data-challenge-type {{ 'disabled' if challenge }}><option value="standard" {{ 'selected' if not challenge or challenge.type != 'dynamic' }}>Standard</option><option value="dynamic" {{ 'selected' if challenge and challenge.type == 'dynamic' }}>Dynamic</option></select></label>
-          <label class="admin-field"><span>Value</span><input name="value" type="number" min="0" required value="{{ challenge.value if challenge and challenge.value is not none else 500 }}"></label>
-          <label class="admin-field"><span>State</span><select name="state"><option value="visible" {{ 'selected' if not challenge or challenge.state == 'visible' }}>Visible</option><option value="hidden" {{ 'selected' if challenge and challenge.state == 'hidden' }}>Hidden</option></select></label>
+          <label class="admin-field"><span>Scoring <small>Fixed after creation</small></span><select name="type" data-challenge-type disabled><option value="standard" {{ 'selected' if challenge.type != 'dynamic' }}>Fixed value</option><option value="dynamic" {{ 'selected' if challenge.type == 'dynamic' }}>Dynamic value</option></select></label>
+          <label class="admin-field" data-static-value><span>Value</span><input name="value" type="number" min="0" required value="{{ challenge.value if challenge.value is not none else 500 }}"></label>
+          <label class="admin-field"><span>State</span><select name="state"><option value="visible" {{ 'selected' if challenge.state == 'visible' }}>Visible</option><option value="hidden" {{ 'selected' if challenge.state == 'hidden' }}>Hidden draft</option><option value="locked" {{ 'selected' if challenge.state == 'locked' }}>Locked</option></select></label>
         </div>
-        <div class="admin-dynamic-fields" data-dynamic-fields>
-          <div class="admin-field-grid four">
-            <label class="admin-field"><span>Curve</span><select name="function"><option value="logarithmic" {{ 'selected' if not challenge or challenge.function != 'linear' }}>Logarithmic</option><option value="linear" {{ 'selected' if challenge and challenge.function == 'linear' }}>Linear</option></select></label>
-            <label class="admin-field"><span>Initial</span><input name="initial" type="number" min="0" value="{{ challenge.initial if challenge and challenge.initial is not none else 500 }}"></label>
-            <label class="admin-field"><span>Minimum</span><input name="minimum" type="number" min="0" value="{{ challenge.minimum if challenge and challenge.minimum is not none else 100 }}"></label>
-            <label class="admin-field"><span>Decay</span><input name="decay" type="number" min="1" value="{{ challenge.decay if challenge and challenge.decay is not none else 50 }}"></label>
-          </div>
-        </div>
-        <div class="admin-field-grid two">
-          <label class="admin-field"><span>Maximum attempts <small>Blank = unlimited</small></span><input name="max_attempts" type="number" min="0" value="{{ challenge.max_attempts if challenge and challenge.max_attempts is not none else '' }}"></label>
-          <label class="admin-field"><span>Position</span><input name="position" type="number" min="0" value="{{ challenge.position if challenge and challenge.position is not none else 0 }}"></label>
-        </div>
+        <div class="admin-dynamic-fields" data-dynamic-fields><div class="admin-field-grid four"><label class="admin-field"><span>Curve</span><select name="function"><option value="logarithmic" {{ 'selected' if challenge.function != 'linear' }}>Logarithmic</option><option value="linear" {{ 'selected' if challenge.function == 'linear' }}>Linear</option></select></label><label class="admin-field"><span>Initial</span><input name="initial" type="number" min="0" value="{{ challenge.initial if challenge.initial is not none else 500 }}"></label><label class="admin-field"><span>Minimum</span><input name="minimum" type="number" min="0" value="{{ challenge.minimum if challenge.minimum is not none else 100 }}"></label><label class="admin-field"><span>Decay</span><input name="decay" type="number" min="1" value="{{ challenge.decay if challenge.decay is not none else 50 }}"></label></div></div>
+        <div class="admin-field-grid two"><label class="admin-field"><span>Maximum attempts <small>Blank = unlimited</small></span><input name="max_attempts" type="number" min="0" value="{{ challenge.max_attempts if challenge.max_attempts is not none else '' }}"></label><label class="admin-field"><span>Position</span><input name="position" type="number" min="0" max="32767" value="{{ challenge.position if challenge.position is not none else 0 }}"></label></div>
       </section>
-
-      {% if form_mode == 'create' %}
-        <section class="admin-panel admin-form-section">
-          <header><span class="eyebrow">OPTIONAL</span><h2>Initial static flag</h2><p>You can add a flag now and change it through the API later.</p></header>
-          <label class="admin-field"><span>Flag</span><input name="flag" autocomplete="off" spellcheck="false" placeholder="FLAG{…}"></label>
+      {% if challenge.challenge_type == 'jeopardy' and challenge.exposure == 'private' %}
+        <section class="admin-panel admin-form-section" data-private-edit-gate data-global-gate-enabled="{{ 'true' if private_challenge_gate_enabled else 'false' }}">
+          <header><span class="eyebrow">PRIVATE INSTANCE</span><h2>Launch availability</h2><p>Publishing keeps this challenge's saved managed-runtime configuration unchanged.</p></header>
+          {% if private_challenge_gate_enabled %}
+            <div class="challenge-global-gate good"><span class="status-dot"></span><div><strong>Private challenge launches are enabled globally</strong><p>This challenge can be saved as visible or locked while its managed runtime remains enabled.</p></div></div>
+          {% else %}
+            <div class="challenge-global-gate warning">
+              <span class="status-dot off"></span>
+              <div>
+                <strong>{{ 'Global launch state could not be verified' if private_challenge_gate_error else 'Private challenge launches are disabled globally' }}</strong>
+                <p>Keep this challenge hidden, or explicitly enable launches for every configured private challenge when publishing it.</p>
+                <label class="admin-check-row"><input name="enable_global_gate" type="checkbox"><span><strong>Enable private challenge launches globally</strong><small>This affects every enabled private challenge, not only this one.</small></span></label>
+              </div>
+            </div>
+          {% endif %}
         </section>
       {% endif %}
-
       <section class="admin-panel admin-form-section">
-        <header>
-          <span class="eyebrow">RESOURCES</span>
-          <h2>Challenge files</h2>
-          <p>Files are authorized by CTFZone, uploaded directly from this browser to object storage, then attached to the saved challenge.</p>
-        </header>
-        {% if storage_origin %}
-          <label class="admin-field admin-file-picker">
-            <span>Select files <small>Optional · 64 MiB maximum per file · uploads start after save</small></span>
-            <input name="challenge_files" type="file" multiple data-challenge-files>
-          </label>
-          <p class="admin-upload-status" data-upload-status aria-live="polite"></p>
-        {% else %}
-          <p class="admin-upload-note">Direct object storage is not configured, so resource uploads are unavailable.</p>
-        {% endif %}
-        {% if challenge and challenge.files %}
-          <div class="admin-existing-files">
-            <strong>Attached files</strong>
-            <ul>
-              {% for file in challenge.files if file is mapping and file.object_id %}
-                <li><span>{{ file.name or file.filename or 'download' }}</span><code>{{ file.object_id }}</code></li>
-              {% endfor %}
-            </ul>
-          </div>
-        {% endif %}
+        <header><span class="eyebrow">CONNECTION</span><h2>Participant access</h2><p>Optional free-form connection information shown separately from the description.</p></header>
+        <label class="admin-field"><span>Connection information <small>Optional</small></span><textarea name="connection_info" rows="3" maxlength="4096" placeholder="https://challenge.example.org, nc host.example 31337, or ssh user@host">{{ challenge.connection_info or '' }}</textarea><small>Leave blank if the description already contains all access instructions.</small></label>
       </section>
-
-      <div class="admin-form-actions">
-        {% if form_mode == 'edit' %}<button class="danger-button" type="button" data-delete-challenge>Delete challenge</button>{% endif %}
-        <span></span>
-        <a class="quiet-button" href="{{ url_for('web.admin_challenges') }}">Cancel</a>
-        <button class="button" type="submit">{{ 'Create challenge' if form_mode == 'create' else 'Save changes' }}</button>
-      </div>
+      <section class="admin-panel admin-form-section">
+        <header><span class="eyebrow">RESOURCES</span><h2>Challenge files</h2><p>Files upload directly from this browser to object storage, then attach to the saved challenge.</p></header>
+        {% if storage_origin %}<label class="admin-field admin-file-picker"><span>Select files <small>Optional · 64 MiB maximum per file</small></span><input name="challenge_files" type="file" multiple data-challenge-files></label><p class="admin-upload-status" data-upload-status aria-live="polite"></p>{% else %}<p class="admin-upload-note">Direct object storage is not configured, so resource uploads are unavailable.</p>{% endif %}
+        {% if challenge.files %}<div class="admin-existing-files"><strong>Attached files</strong><ul>{% for file in challenge.files if file is mapping and file.object_id %}<li><span>{{ file.name or file.filename or 'download' }}</span><code>{{ file.object_id }}</code></li>{% endfor %}</ul></div>{% endif %}
+      </section>
+      <div class="admin-form-actions"><button class="danger-button" type="button" data-delete-challenge>Delete challenge</button><span></span><a class="quiet-button" href="{{ url_for('web.admin_challenges') }}">Cancel</a><button class="button" type="submit">Save changes</button></div>
     </form>
   {% endif %}
+
+  <dialog class="challenge-category-dialog" data-category-dialog aria-labelledby="category-dialog-title">
+    <form class="challenge-category-dialog-shell" data-category-dialog-form>
+      <header><div><span class="eyebrow">CATEGORY</span><h2 id="category-dialog-title">Create category</h2></div><button class="quiet-button button-small" type="button" data-close-category-dialog aria-label="Close category dialog">×</button></header>
+      <div><label class="admin-field"><span>Name</span><input name="category_name" required maxlength="80" autocomplete="off" placeholder="Web"></label><p>Categories organize the challenge board and can be reused by future challenges.</p><p class="challenge-category-dialog-error" data-category-dialog-error role="alert" aria-live="polite"></p></div>
+      <footer><button class="quiet-button" type="button" data-close-category-dialog>Cancel</button><button class="button" type="submit">Create category</button></footer>
+    </form>
+  </dialog>
 {% endblock %}

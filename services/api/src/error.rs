@@ -39,12 +39,20 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, message)
     }
 
+    pub(crate) fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, message)
+    }
+
     pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
 
     pub(crate) fn upstream(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, message)
+    }
+
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
     pub(crate) fn database(error: sqlx::Error) -> Self {

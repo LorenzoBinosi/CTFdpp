@@ -252,6 +252,14 @@ pub(super) async fn revoke_all(
     user: CurrentUser,
 ) -> Result<Json<Success<RevocationData>>, ApiError> {
     require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let result = sqlx::query(
         r#"
         UPDATE ctfzone.user_sessions
@@ -261,9 +269,10 @@ pub(super) async fn revoke_all(
         "#,
     )
     .bind(user.id)
-    .execute(&state.database)
+    .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
 
     let revoked = result.rows_affected();
     Ok(Json(Success::new(RevocationData {
@@ -278,10 +287,18 @@ pub(super) async fn revoke_user(
     Path(user_id): Path<i32>,
 ) -> Result<Json<Success<RevocationData>>, ApiError> {
     require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let exists =
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ctfzone.users WHERE id = $1)")
             .bind(user_id)
-            .fetch_one(&state.database)
+            .fetch_one(&mut *transaction)
             .await
             .map_err(ApiError::database)?;
     if !exists {
@@ -298,9 +315,10 @@ pub(super) async fn revoke_user(
     )
     .bind(user.id)
     .bind(user_id)
-    .execute(&state.database)
+    .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    transaction.commit().await.map_err(ApiError::database)?;
 
     let revoked = result.rows_affected();
     Ok(Json(Success::new(RevocationData {
@@ -315,6 +333,14 @@ pub(super) async fn revoke_one(
     Path(management_id): Path<uuid::Uuid>,
 ) -> Result<Json<Success<RevocationData>>, ApiError> {
     require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let session = sqlx::query_as::<_, (String, i32)>(
         r#"
         SELECT id, user_id
@@ -323,7 +349,7 @@ pub(super) async fn revoke_one(
         "#,
     )
     .bind(management_id)
-    .fetch_optional(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Session not found"))?;
@@ -338,10 +364,11 @@ pub(super) async fn revoke_one(
     )
     .bind(user.id)
     .bind(management_id)
-    .execute(&state.database)
+    .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
     let revoked = result.rows_affected();
+    transaction.commit().await.map_err(ApiError::database)?;
 
     Ok(Json(Success::new(RevocationData {
         revoked,

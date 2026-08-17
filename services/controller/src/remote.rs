@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::config::{Config, RemoteDriver};
 
+const GLOBAL_KNOWN_HOSTS_FILE_OPTION: &str = "GlobalKnownHostsFile=/dev/null";
+const MAX_FLAG_VALUE_BYTES: usize = 512;
+
 #[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub(crate) struct RemoteServer {
     pub(crate) id: Uuid,
@@ -87,6 +90,7 @@ impl RemoteExecutor {
         operation: RemoteOperation,
         payload: &Value,
     ) -> Result<RemoteResult> {
+        validate_flag_value(operation, payload)?;
         match self.driver {
             RemoteDriver::Mock => self.mock(operation, payload).await,
             RemoteDriver::Ssh => self.ssh(server, operation, payload).await,
@@ -164,6 +168,8 @@ impl RemoteExecutor {
             .arg("-o")
             .arg("StrictHostKeyChecking=yes")
             .arg("-o")
+            .arg(GLOBAL_KNOWN_HOSTS_FILE_OPTION)
+            .arg("-o")
             .arg(format!(
                 "UserKnownHostsFile={}",
                 self.known_hosts_file.display()
@@ -211,6 +217,22 @@ impl RemoteExecutor {
         }
         serde_json::from_slice::<RemoteResult>(&output.stdout)
             .context("remote helper returned invalid JSON")
+    }
+}
+
+fn validate_flag_value(operation: RemoteOperation, payload: &Value) -> Result<()> {
+    let flag_value = payload.pointer("/deployment/flag_value");
+    match (operation, flag_value) {
+        (RemoteOperation::EnsureInstance, None | Some(Value::Null)) | (_, None) => Ok(()),
+        (RemoteOperation::EnsureInstance, Some(Value::String(value)))
+            if !value.is_empty()
+                && value.len() <= MAX_FLAG_VALUE_BYTES
+                && !value.contains('\0') =>
+        {
+            Ok(())
+        }
+        (RemoteOperation::EnsureInstance, Some(_)) => bail!("deployment flag_value is invalid"),
+        (_, Some(_)) => bail!("deployment flag_value is allowed only during instance startup"),
     }
 }
 
@@ -288,6 +310,14 @@ mod tests {
     }
 
     #[test]
+    fn ignores_ambient_global_known_hosts_files() {
+        assert_eq!(
+            GLOBAL_KNOWN_HOSTS_FILE_OPTION,
+            "GlobalKnownHostsFile=/dev/null"
+        );
+    }
+
+    #[test]
     fn startup_wait_must_fit_inside_remote_operation_timeout() {
         let payload = serde_json::json!({
             "deployment": {"healthcheck": {"startup_timeout_seconds": 56}}
@@ -308,5 +338,52 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn generated_flag_handoff_is_bounded_without_echoing_the_value() {
+        let valid = serde_json::json!({"deployment": {"flag_value": "é".repeat(256)}});
+        assert!(validate_flag_value(RemoteOperation::EnsureInstance, &valid).is_ok());
+
+        for invalid in [
+            serde_json::json!({"deployment": {"flag_value": ""}}),
+            serde_json::json!({"deployment": {"flag_value": "bad\0flag"}}),
+            serde_json::json!({"deployment": {"flag_value": "é".repeat(257)}}),
+            serde_json::json!({"deployment": {"flag_value": {"unsafe": true}}}),
+        ] {
+            let error = validate_flag_value(RemoteOperation::EnsureInstance, &invalid)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "deployment flag_value is invalid");
+            assert!(!error.contains("bad\0flag"));
+        }
+        assert!(
+            validate_flag_value(
+                RemoteOperation::EnsureInstance,
+                &serde_json::json!({"deployment": {"flag_value": null}}),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn generated_flag_is_rejected_for_non_start_operations() {
+        let payload = serde_json::json!({
+            "deployment": {"flag_value": "flag{personalized-secret}"}
+        });
+        for operation in [
+            RemoteOperation::InspectInstance,
+            RemoteOperation::StopInstance,
+            RemoteOperation::UpdateDeadline,
+        ] {
+            let error = validate_flag_value(operation, &payload)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "deployment flag_value is allowed only during instance startup"
+            );
+            assert!(!error.contains("personalized-secret"));
+        }
     }
 }

@@ -18,7 +18,7 @@ open a private security advisory instead.
 - Deployment method (Compose or other):
 - Operating system and architecture:
 - Browser and version, if relevant:
-- Affected component (backend, API, controller, database, Caddy, remote helper):
+- Affected component (backend, API, controller, remote helper, SSH gateway, database, Caddy):
 
 ## What happened?
 

@@ -9,9 +9,9 @@ treated as committed release work.
 
 ## Deferred configuration capabilities
 
-The 1.0 administration catalog restores settings only when the Rust API
-implements and validates their behavior. Preserved legacy rows are not a promise
-that an older CTFd feature is active. The current semantics and complete
+The 1.0 administration catalog exposes settings only when the Rust API
+implements and validates their behavior. Unknown keys are rejected rather than
+kept as inert compatibility data. The current semantics and complete
 deferred list are documented in [`CONFIGURATION.md`](CONFIGURATION.md).
 
 Possible future modules include object-storage-backed event branding, locale
@@ -29,11 +29,11 @@ mandatory content sanitization are deliberate security boundaries.
 
 The current implementation should use normal page loads, explicit refreshes,
 and bounded status checks following a user action. It must not continuously
-poll instance or scoreboard endpoints once per second.
+poll status or scoreboard endpoints once per second.
 
 Server-Sent Events (SSE) may later provide live updates for:
 
-- an instance changing from `starting` to `ready`;
+- an asynchronous job changing from `queued` to `ready`;
 - King of the Hill ownership and score changes;
 - attack/defense rounds and service status;
 - speedrun finishes;
@@ -47,14 +47,13 @@ Python backend -- internal event stream ------> Rust API
 Rust API <---- PostgreSQL facts/projections and wake notifications
 ```
 
-The browser must not connect to the Rust API or controller. The controller
-continues to write observed state and history through PostgreSQL; it does not
-hold participant connections or publish browser events.
+The browser must not connect to the Rust API or controller. The controller does
+not hold participant connections or publish browser events.
 
 ### Why it is postponed
 
-- Classic challenges and private-instance actions work with bounded refreshes.
-- SSE is an optimization for live presentation, not part of scoring or runtime
+- Classic challenges and ordinary administration work with bounded refreshes.
+- SSE is an optimization for live presentation, not part of scoring
   correctness.
 - The current synchronous Flask/Gunicorn backend would reserve a worker thread
   for every open stream.
@@ -107,32 +106,3 @@ Separate least-privilege credentials for API grant/promotion operations and
 controller cleanup operations are also desirable. The 1.0 Compose topology
 shares one storage credential between those two trusted services to keep the
 first deployment understandable.
-
-## Remote tenant networking and diagnostics
-
-The 1.0 helper gives each instance its own bridge and random published host
-port. A hardened multi-tenant runtime pool should additionally provide an
-explicit per-challenge egress policy and an authenticated ingress/firewall
-layer, instead of relying on a broadly reachable host-published port. Some
-challenges legitimately require outbound access, so this needs a policy field
-and enforceable network profiles rather than one global switch.
-
-Controller SSH responses and database-outage journal recovery should eventually
-gain streaming byte caps, bounded batches, and prompt shutdown cancellation.
-The current helper emits small bounded JSON, but defense in depth should not
-assume that a faulty or compromised runtime host follows that contract.
-
-## Controller throughput and capacity reservations
-
-The 1.0 runtime worker executes remote lifecycle commands serially. This keeps
-placement, retries, per-instance ordering, and recovery easy to reason about,
-and it does not affect deadline safety because every workload also has its
-independent host-side timer. It can, however, create queueing latency during a
-large simultaneous challenge launch.
-
-Increase concurrency only after measuring that queue. A safe implementation
-must reserve server CPU, memory, and instance capacity atomically in PostgreSQL;
-serialize commands for the same instance; retain claim-token fencing; bound
-global and per-host parallelism; and release reservations on every terminal or
-recovery path. Simply spawning one task per command could overbook a host and
-reorder start, extend, and terminate operations.

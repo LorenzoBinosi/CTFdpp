@@ -10,22 +10,24 @@ native Rust API.
 |---|---|---|
 | `caddy` | Caddy 2 | Public site and storage origins, certificates, compression, and strict boundary routing |
 | `backend` | Python/Flask | Replaceable web/BFF adapter: HTML, CSS, JavaScript, browser sessions/CSRF, and trusted calls to the private API |
-| `api` | Rust/Axum | Authentication, users, teams, challenges, scoring, administration, object authorization, exports, sessions, and runtime intent |
-| `controller` | Rust/Axum + Tokio | Durable command processing, deadline scheduling, recovery, remote execution |
-| `db` | PostgreSQL 16 | One authoritative platform and runtime database |
+| `api` | Rust/Axum | Authentication, users, teams, challenges, scoring, administration, object authorization, exports, and sessions |
+| `controller` | Rust/Axum + Tokio | Durable private-instance orchestration plus object-storage cleanup and recovery |
+| `ssh-gateway` | Rust/Axum + OpenSSH | Isolated browser-terminal WebSocket bridge and SSH client-key custody |
+| `db` | PostgreSQL 16 | Authoritative platform and object-lifecycle database |
 | `storage` | S3-compatible object storage | Bulk challenge files and future artifacts; reached only through signed data-plane requests |
 
-The four core roles are backend, API, controller, and database. Caddy is edge
-infrastructure. Remote challenge containers are workloads, not platform
-services.
+The core platform roles are backend, API, controller, SSH gateway, and database.
+Caddy is edge infrastructure.
 
 Storage and Caddy are supporting infrastructure rather than additional owners of
 platform rules. The two public origins have deliberately different jobs:
 
 ```text
 CADDY_SITE_ADDRESS
-  Browser ---- all portal routes, including /bff/* ----> Python BFF
+  Browser ---- portal routes and /bff/api/* -----------> Python BFF
   Python BFF -- service token + opaque session header --> private Rust API
+  Rust API <---- durable state/commands ----> PostgreSQL <----> controller -- restricted SSH --> runtime host
+  Browser ---- /bff/ssh/terminal WebSocket ------------> SSH gateway -- SSH --> registered host
 
 CADDY_STORAGE_ADDRESS
   Browser ---- short-lived, signed S3 PUT/GET only -----> object storage
@@ -47,6 +49,13 @@ Downloads begin at a same-origin `/downloads/<object-id>` authorization route
 and use a short-lived
 redirect to the configured storage origin. The general BFF proxy remains capped
 so Python workers do not buffer large artifact bodies.
+
+Interactive SSH is deliberately outside Flask and the storage-maintenance
+controller. The browser renders a locally bundled terminal and exchanges PTY
+bytes with the isolated gateway over a same-origin WebSocket. The API issues a
+short-lived one-use ticket and stores host/audit metadata; only the gateway can
+read its dedicated SSH private-key volume. See
+[Browser SSH console](docs/SSH_CONSOLE.md).
 
 The web package also keeps the neutral administration frontend separate from
 player frontends. PostgreSQL stores the selected `player_frontend` identifier;
@@ -74,17 +83,12 @@ origin and are not subject to the small portal cap.
 
 ## Database model
 
-CTFZone starts with a fresh PostgreSQL volume. Versioned SQL in `db/init` creates
-the complete 1.0.0 portal and managed-runtime schema before the API starts. The
-Rust API and controller share that single authoritative database; the Python BFF
-never connects to it. Instance ownership can therefore be correlated with users,
-scores, and lifecycle history without a second source of truth.
-
-The runtime schema enforces one active instance per user with a partial unique
-index. `runtime_instances` stores the immutable owner/creator/challenge snapshot,
-desired and observed state, absolute deadlines, remote placement, container ID,
-IP, port, endpoint, and timestamps. `runtime_instance_events` is append-only
-history; `runtime_commands` is the durable API-to-controller queue.
+CTFZone starts with a fresh PostgreSQL volume. Ordered SQL in `db/init` creates
+the complete 1.0.0 schema before the API starts. The Rust API and controller
+share that single authoritative database; the Python BFF never connects to it.
+Private-instance intent, immutable deployment snapshots, commands,
+observations, and history are stored alongside portal and object-lifecycle
+state.
 
 PostgreSQL also stores object ownership, purpose, expected/actual metadata,
 status, retention, audit events, and durable maintenance operations. Object
@@ -118,18 +122,21 @@ only one side can leave missing bodies or unauthorized orphaned objects.
 
 ```console
 cp .env.example .env
-docker compose -f compose.yml -f compose.local.yml up --build
+./run-local.sh
 ```
 
 Replace every example secret in `.env`, then use the local override. It fixes the
 plain-HTTP portal at `http://localhost` and the signed storage data plane at
 `http://files.localhost`; keep host ports 80 and 443 free because Caddy owns the
 standard edge bindings and these exact origins are also embedded in signed URLs
-and CORS policy. Set `CONTROLLER_REMOTE_DRIVER=mock` in `.env` unless local SSH
-challenge hosts are intentionally configured.
-
-The mock driver exercises the complete API/database/controller state machine but
-does not start a real container.
+and CORS policy. Local containers use the isolated `ctfzone-local` Compose
+project. `run-local.sh` rebuilds without cache and deletes that project's named
+volumes before every start, so each run gets the current v1 schema and empty
+local data. Use `./stop-local.sh` to stop it without immediately deleting the
+volumes; the next local run will reset them. Local and production projects use
+the same host ports, so stop an existing `ctfzone` project once with `./stop.sh`
+before starting `ctfzone-local`; the script detects this conflict and refuses
+to stop the other project automatically.
 
 ## Production
 
@@ -147,23 +154,25 @@ does not start a real container.
    for example `openssl rand -hex 32`) because Compose places it in the internal
    PostgreSQL connection URI. Leave `POSTGRES_USER` and `POSTGRES_DB` at their
    defaults or keep custom values URL-safe for the same reason.
-4. Leave `CONTROLLER_REMOTE_DRIVER=ssh`.
-5. Put the dedicated private key and pinned host keys in `secrets/` as documented
-   in `secrets/README.md`.
-6. Install the fixed remote helper on every challenge host and register each host
-   through the admin runtime API.
-7. Validate the rendered configuration, then back up PostgreSQL and the object
-   bucket as one recovery set before upgrades or maintenance.
+4. Configure the browser SSH destination allowlists and gateway service secret.
+5. Validate the rendered configuration, then back up PostgreSQL, the object
+   bucket, `controller_journal`, the controller SSH identity/known-hosts
+   directory, and `ssh_gateway_identities` as one recovery set before
+   maintenance.
 
 Start CTFZone with:
 
 ```console
-docker compose -f compose.yml config --quiet
-docker compose -f compose.yml up --build -d
+./run.sh
 ```
 
-Only ports 80/443 are public. Ports 8000, 8080, 8090, and 5432 are internal and
-must not be published by an override or firewall rule.
+`run.sh` pulls and rebuilds images without cache and force-recreates every
+container, but deliberately preserves production PostgreSQL, object, journal,
+Caddy, and SSH-identity volumes. It is not an in-place schema migration tool.
+Use `./stop.sh` to stop the deployment while preserving those volumes.
+
+Only ports 80/443 are public. Ports 8000, 8080, 8090, 8091, 8333, and 5432 are
+internal and must not be published by an override or firewall rule.
 
 ### Secret roles
 
@@ -174,7 +183,7 @@ must not be published by an override or firewall rule.
   Rust application/auth endpoint. It is shared only by backend and API and must
   never reach browser JavaScript or logs.
 - `API_SIGNING_KEY` is Rust-only key material for API-generated signed values
-  such as share and team-invite verification data. Keep it independent from the
+  such as team invitations and destructive-transition previews. Keep it independent from the
   browser cookie key and service token.
 - `SETUP_TOKEN` authorizes creation of the first administrator through the
   Python `/setup` page. Do not put it in a URL or reuse it. Setup remains closed
@@ -186,35 +195,28 @@ must not be published by an override or firewall rule.
   short-lived S3 operations and let the controller perform maintenance. The
   browser receives only scoped presigned URLs, never these credentials.
 
-## Runtime behavior
+## Background maintenance
 
-The controller opens PostgreSQL `LISTEN` connections for command, setting, and
-challenge-profile notifications. A notification is only a wake-up hint; the
-command table is durable. Between notifications it sleeps until the nearest
-instance deadline, delayed retry, or five-minute reconciliation bound. It does
-not poll remote hosts once per second.
+The controller runs two independent durable workers. The private-instance
+worker claims PostgreSQL runtime commands and dispatches a fixed operation
+vocabulary over restricted SSH to the remote runtime helper. The object worker
+reconciles expired staging uploads and revision-fenced deletion work. Both use
+PostgreSQL state and bounded reconciliation so recovery is independent of one
+process lifetime. The controller is not involved in browser terminals.
 
-At startup or after reconnecting, the controller recovers stale claims, queues
-terminations for expired or disabled instances, processes all pending commands,
-and then reports ready. Disabling private challenges rejects new activation and
-places existing instances into draining cleanup. With no eligible managed
-challenge and no active instance, the process stays up but reports `dormant`.
-
-The SSH helper creates an independent host-side systemd expiry timer for every
-container. Therefore an already-running workload still expires if Caddy, the
-API, PostgreSQL, and the controller are all offline. When the control plane
-returns, startup reconciliation repairs the database history and retries cleanup.
-
-See [the complete controller architecture](docs/INSTANCE_CONTROLLER_ARCHITECTURE.md)
-for exchanges, state transitions, failure cases, and remote-host activities.
+The SSH gateway independently claims key-generation/deletion operations through
+the private Rust API and bridges authorized browser WebSockets to registered SSH
+hosts. It has no database credentials and does not manage challenge workloads.
 
 Additional project documentation:
 
 - [Configuration](docs/CONFIGURATION.md)
+- [Jeopardy challenge authoring](docs/JEOPARDY_AUTHORING.md)
+- [Private-instance controller](docs/INSTANCE_CONTROLLER_ARCHITECTURE.md)
+- [Remote runtime helper](remote-helper/README.md)
 - [Frontend architecture](docs/FRONTEND_ARCHITECTURE.md)
 - [Future competitive-mode implementation](docs/FUTURE_IMPLEMENTATION.md)
 - [Possible improvements](docs/POSSIBLE_IMPROVEMENTS.md)
-- [Controller alternatives](docs/CONTROLLER_ALTERNATIVES.md)
 - [Security policy](docs/SECURITY.md)
 - [Contributing](docs/CONTRIBUTING.md)
 - [Changelog](docs/CHANGELOG.md)
@@ -226,6 +228,7 @@ Internal endpoints:
 - Backend: `GET /healthz` on port 8000.
 - API: `GET /healthz` and `GET /readyz` on port 8080.
 - Controller: `GET /healthz`, `GET /readyz`, and `GET /status` on port 8090.
+- SSH gateway: `GET /healthz` and `GET /readyz` on port 8091.
 
 Product metadata is available internally at API `GET /api/v1/ctfzone` when the
 caller supplies the backend service credential; it is intentionally not a
@@ -242,13 +245,14 @@ For a running deployment:
 
 ```console
 docker compose -f compose.yml ps
-docker compose -f compose.yml logs backend api controller storage
+docker compose -f compose.yml logs backend api controller ssh-gateway storage
 curl --fail https://ctf.example.org/healthz
 docker compose -f compose.yml exec api curl --fail --silent http://127.0.0.1:8080/readyz
 ```
 
-The controller must reach `readyz` before managed challenge execution is treated
-as available. A dormant controller is healthy and ready; it simply has no
-currently eligible managed work. Readiness does not probe SSH while the
-controller is dormant, so validate the UID `10002` secret mounts and the
-restricted remote helper separately before enabling managed execution.
+The controller must reach `readyz` before private-instance orchestration and
+object-maintenance recovery are treated as available. SSH gateway health and
+readiness are independent from controller readiness. Caddy deliberately does
+not make the whole portal depend on SSH
+gateway startup; when the gateway is unavailable, the terminal route fails
+closed while ordinary portal pages remain available.

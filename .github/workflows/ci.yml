@@ -81,7 +81,7 @@ jobs:
         run: sh -n remote-helper/install.sh
 
   compose:
-    name: Compose configuration
+    name: Compose and fresh database
     runs-on: ubuntu-latest
     env:
       API_SIGNING_KEY: compose-check-api-signing-key
@@ -93,6 +93,8 @@ jobs:
       POSTGRES_PASSWORD: compose-check-only
       SECRET_KEY: compose-check-browser-key
       SETUP_TOKEN: compose-check-setup-token
+      SSH_ALLOWED_CIDRS: 203.0.113.0/24
+      SSH_GATEWAY_SERVICE_TOKEN: compose-check-ssh-gateway-token
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -102,3 +104,35 @@ jobs:
 
       - name: Validate local configuration
         run: docker compose -f compose.yml -f compose.local.yml config --quiet
+
+      - name: Initialize the fresh 1.0 database
+        run: docker compose -f compose.yml up -d --wait db
+
+      - name: Verify the final fresh schema
+        run: |
+          set -euo pipefail
+          docker compose -f compose.yml exec -T db sh -lc \
+            'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "
+              SELECT (
+                to_regclass('"'"'ctfzone.user_mode_transitions'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.ssh_hosts'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.ssh_host_identity_operations'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.runtime_settings'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.challenge_runtime_configs'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.runtime_instances'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.runtime_commands'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.runtime_instance_events'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.remote_servers'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.challenge_categories'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.flags'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.user_challenge_flags'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.flag_sharing_events'"'"') IS NOT NULL
+              )::int
+            "' | grep -qx 1
+
+      - name: Verify Jeopardy flag allocation constraints
+        run: docker compose -f compose.yml exec -T db sh -lc 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < db/tests/jeopardy-flag-contract.sql
+
+      - name: Remove the disposable database
+        if: always()
+        run: docker compose -f compose.yml down -v

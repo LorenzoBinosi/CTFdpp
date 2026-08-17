@@ -306,6 +306,12 @@ pub(super) async fn create(
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     super::team_accounts::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &admin,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     let password = hash_password(&mut transaction, &request.password)
         .await
         .map_err(ApiError::database)?;
@@ -437,6 +443,12 @@ pub(super) async fn delete(
 
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     super::team_accounts::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &admin,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     crate::browser_auth::lock_registration_capacity(&mut transaction).await?;
     super::team_accounts::lock_team_membership(&mut transaction).await?;
     crate::setup::guard_admin_delete(&mut transaction, user_id).await?;
@@ -448,6 +460,18 @@ pub(super) async fn delete(
     .await
     .map_err(ApiError::database)?
     .flatten();
+    let owns_personalized_flags = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM ctfzone.user_challenge_flags WHERE user_id=$1)",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if owns_personalized_flags {
+        return Err(ApiError::conflict(
+            "This user owns personalized challenge flags and cannot be deleted",
+        ));
+    }
     if let Some(email) = email {
         sqlx::query(
             "DELETE FROM ctfzone.registration_email_allowlist WHERE lower(email) = lower($1)",
@@ -512,9 +536,13 @@ async fn update(
         config_i64(state, "password_min_length", 0).await?
     };
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
-    if admin {
-        super::team_accounts::lock_configuration_shared(&mut transaction).await?;
-    }
+    super::team_accounts::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        actor,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
     if admin
         && (request.user_type.is_some() || request.hidden.is_some() || request.banned.is_some())
     {
@@ -551,6 +579,16 @@ async fn update(
         }
         if previous.team_id.is_some() {
             request.team_id = Some(None);
+        }
+    }
+    if admin {
+        let resulting_team_id = request.team_id.unwrap_or(previous.team_id);
+        let user_mode =
+            super::user_mode_transition::transaction_user_mode(&mut transaction).await?;
+        if !team_assignment_allowed(&user_mode, resulting_team_id) {
+            return Err(ApiError::bad_request(
+                "Users can only be assigned to teams while competition mode is teams",
+            ));
         }
     }
     if request.team_id.is_some() && request.team_id.flatten() != previous.team_id {
@@ -1294,6 +1332,10 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+fn team_assignment_allowed(user_mode: &str, team_id: Option<i32>) -> bool {
+    team_id.is_none() || user_mode == "teams"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,6 +1373,7 @@ mod tests {
             &[
                 "state.database.begin()",
                 "lock_configuration_shared",
+                "revalidate_current_credential",
                 "lock_registration_capacity",
                 "INSERT INTO ctfzone.users",
             ],
@@ -1342,10 +1385,13 @@ mod tests {
             &[
                 "state.database.begin()",
                 "lock_configuration_shared",
+                "revalidate_current_credential",
                 "lock_registration_capacity",
                 "lock_team_membership",
                 "guard_admin_delete",
                 "FOR UPDATE",
+                "user_challenge_flags",
+                "DELETE FROM ctfzone.users",
             ],
         );
 
@@ -1355,12 +1401,22 @@ mod tests {
             &[
                 "state.database.begin()",
                 "lock_configuration_shared",
+                "revalidate_current_credential",
                 "lock_registration_capacity",
                 "lock_team_membership",
                 "guard_admin_update",
                 "load_user_for_update",
+                "transaction_user_mode",
             ],
         );
+    }
+
+    #[test]
+    fn team_assignment_requires_team_competition_mode() {
+        assert!(team_assignment_allowed("teams", Some(7)));
+        assert!(team_assignment_allowed("teams", None));
+        assert!(team_assignment_allowed("users", None));
+        assert!(!team_assignment_allowed("users", Some(7)));
     }
 
     #[test]
