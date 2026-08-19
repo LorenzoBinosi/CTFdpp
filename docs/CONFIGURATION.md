@@ -23,7 +23,7 @@ The catalog defines six logical sections.
 | Section | Active settings |
 | --- | --- |
 | Site & interface | `ctf_name`, `ctf_description`, `player_frontend` |
-| Visibility & access | `challenge_visibility`, `score_visibility`, `account_visibility` |
+| Visibility & access | `account_visibility` |
 | Schedule | `start`, `end`, `freeze`, `paused`, `view_after_ctf` |
 | Accounts & registration | `num_users`, `password_min_length`, `name_changes`, `verify_emails`, `user_mode`, `team_creation`, `team_size`, `num_teams`, `team_disbanding`, `registration_visibility`, `registration_access_mode`, `registration_code`, `domain_whitelist`, `domain_blacklist` |
 | Challenges & scoring | `incorrect_submissions_per_min`, `max_attempts_behavior`, `max_attempts_timeout`, `challenge_ratings`, `hints_free_public_access`, `view_self_submissions` |
@@ -54,6 +54,13 @@ proposed configuration. Important cross-field checks include:
 The browser sends only fields changed in one section. Rust applies that patch in
 one database transaction, so either every field in the save succeeds or none of
 them do.
+
+Challenge and scoreboard visibility are intentionally not duplicated here.
+Administrators manage those protected system entries, the permanent home page,
+and ordered custom pages under **Competition → Pages**. Page visibility has
+three explicit states: public, signed-in-only private, and navigation-hidden
+administrator-only. The permanent home page is always public and remains at
+`/`; the top-left event logo always links to it.
 
 ## Competition mode transition
 
@@ -107,17 +114,12 @@ domain-rule, access-code, and email-allowlist admission affects future
 registrations only. It never deletes accounts, invitations, stored codes, or
 domain rules.
 
-Fresh databases create the transition audit and browser-SSH control-plane schema
-through the ordered files in `db/init`.
-PostgreSQL runs those files only when it creates an empty data directory;
-restarting or rebuilding containers does **not** rerun them for an existing
-volume.
-
-CTFZone 1.0.0 is a fresh-install contract. Pre-release prototype databases are
-not supported and there is no incremental migration directory. During
-development, recreate the PostgreSQL volume when the schema changes; never do
-that to a database whose contents must be retained. Production upgrade scripts
-will begin with the first post-1.0 schema change.
+The ordered files in `db/init` define the complete database from an empty data
+directory. Pre-release databases are disposable: both `run.sh` and
+`run-local.sh` remove their project volumes before startup so PostgreSQL always
+executes the current schema from zero. `stop.sh` and `stop-local.sh` only stop
+containers and preserve their current volumes for inspection until the next
+run.
 
 After the SSH gateway has generated console identities, include its
 `ssh_gateway_identities` volume with PostgreSQL and object storage in the same
@@ -287,7 +289,7 @@ intentionally not active configuration in 1.0.0:
 - database-selected themes, logo/favicon uploads, color controls, and raw
   header/footer/theme injection; CTFZone uses reviewed, manifest-backed player
   frontend packages instead;
-- locale selection, editable legal/terms/privacy pages, and `robots.txt`;
+- locale selection, predefined legal/terms/privacy fields, and `robots.txt`;
 - bracket administration and custom-field administration in this configuration
   page;
 - social share templates and solve-share pages;

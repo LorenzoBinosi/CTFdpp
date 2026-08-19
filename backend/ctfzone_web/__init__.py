@@ -132,6 +132,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             connect_sources.append(websocket_origin)
         if app.config["OBJECT_STORAGE_ORIGIN"]:
             connect_sources.append(app.config["OBJECT_STORAGE_ORIGIN"])
+        image_sources = ["'self'", "data:"]
+        if app.config["OBJECT_STORAGE_ORIGIN"]:
+            image_sources.append(app.config["OBJECT_STORAGE_ORIGIN"])
         style_sources = ["'self'"]
         # xterm creates runtime <style> elements for its viewport, cell
         # dimensions and theme, and also applies per-cell style attributes.
@@ -141,7 +144,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             style_sources.append("'unsafe-inline'")
         response.headers.setdefault(
             "Content-Security-Policy",
-            f"default-src 'self'; img-src 'self' data:; style-src {' '.join(style_sources)}; "
+            f"default-src 'self'; img-src {' '.join(image_sources)}; style-src {' '.join(style_sources)}; "
             f"script-src 'self'; connect-src {' '.join(connect_sources)}; frame-ancestors 'self'; "
             "form-action 'self'; base-uri 'self'",
         )

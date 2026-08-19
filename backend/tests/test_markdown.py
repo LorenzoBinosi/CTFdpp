@@ -1,6 +1,6 @@
 import unittest
 
-from ctfzone_web.markdown import render_markdown
+from ctfzone_web.markdown import render_html, render_markdown
 
 
 class MarkdownTests(unittest.TestCase):
@@ -37,6 +37,23 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn("<ul>", rendered)
         self.assertIn("<strong>flag</strong>", rendered)
         self.assertIn("<code>id</code>", rendered)
+
+    def test_page_html_preserves_only_the_safe_layout_vocabulary(self):
+        rendered = str(
+            render_html(
+                '<div class="row topbar unknown">'
+                '<div class="col-md-6 offset-md-3">'
+                '<h1 class="text-center" style="position:fixed">CTFZone</h1>'
+                "</div></div>"
+            )
+        )
+        self.assertEqual(
+            rendered,
+            '<div class="row"><div class="col-md-6 offset-md-3">'
+            '<h1 class="text-center">CTFZone</h1></div></div>',
+        )
+        self.assertNotIn("topbar", rendered)
+        self.assertNotIn("style=", rendered)
 
 
 if __name__ == "__main__":

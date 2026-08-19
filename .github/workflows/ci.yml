@@ -125,6 +125,11 @@ jobs:
                 AND to_regclass('"'"'ctfzone.remote_servers'"'"') IS NOT NULL
                 AND to_regclass('"'"'ctfzone.challenge_categories'"'"') IS NOT NULL
                 AND to_regclass('"'"'ctfzone.flags'"'"') IS NOT NULL
+                AND to_regclass('"'"'ctfzone.pages'"'"') IS NOT NULL
+                AND (
+                  SELECT count(*) = 3 FROM ctfzone.pages
+                  WHERE system_key IN ('"'"'home'"'"','"'"'challenges'"'"','"'"'scoreboard'"'"')
+                )
                 AND to_regclass('"'"'ctfzone.user_challenge_flags'"'"') IS NOT NULL
                 AND to_regclass('"'"'ctfzone.flag_sharing_events'"'"') IS NOT NULL
               )::int
@@ -132,6 +137,9 @@ jobs:
 
       - name: Verify Jeopardy flag allocation constraints
         run: docker compose -f compose.yml exec -T db sh -lc 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < db/tests/jeopardy-flag-contract.sql
+
+      - name: Verify page and navigation constraints
+        run: docker compose -f compose.yml exec -T db sh -lc 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < db/tests/page-contract.sql
 
       - name: Remove the disposable database
         if: always()

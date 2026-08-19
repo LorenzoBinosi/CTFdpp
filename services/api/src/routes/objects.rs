@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::Cursor};
 
 use axum::{
     Json,
@@ -9,9 +9,11 @@ use axum::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
+use xmlparser::{ElementEnd, Token, Tokenizer};
 
 use crate::{
     AppState,
@@ -21,6 +23,8 @@ use crate::{
 };
 
 pub(super) const MAX_UPLOAD_BODY_BYTES: usize = 64 * 1024;
+const CATEGORY_ICON_MAX_BYTES: usize = 256 * 1024;
+const CATEGORY_ICON_DIMENSION: u32 = 128;
 const STORAGE_QUOTA_LOCK_NAMESPACE: i32 = 0x4354_465a;
 
 #[derive(Clone, FromRow)]
@@ -33,6 +37,7 @@ struct StoredObject {
     authorization_scope: String,
     owner_user_id: Option<i32>,
     owner_team_id: Option<i32>,
+    category_id: Option<i32>,
     challenge_id: Option<i32>,
     page_id: Option<i32>,
     solution_id: Option<i32>,
@@ -46,6 +51,7 @@ struct StoredObject {
     created_at: DateTime<Utc>,
     ready_at: Option<DateTime<Utc>>,
     revision: i64,
+    metadata: Value,
 }
 
 #[derive(FromRow)]
@@ -66,6 +72,7 @@ struct ObjectView {
     expected_size: i64,
     actual_size: Option<i64>,
     sha256: Option<String>,
+    category_id: Option<i32>,
     challenge_id: Option<i32>,
     page_id: Option<i32>,
     solution_id: Option<i32>,
@@ -90,6 +97,7 @@ impl From<&StoredObject> for ObjectView {
                     .clone()
                     .unwrap_or_else(|| object.expected_checksum.clone()),
             ),
+            category_id: object.category_id,
             challenge_id: object.challenge_id,
             page_id: object.page_id,
             solution_id: object.solution_id,
@@ -109,6 +117,8 @@ pub(super) struct UploadRequest {
     content_type: String,
     size: i64,
     sha256: String,
+    #[serde(default)]
+    category_id: Option<i32>,
     #[serde(default)]
     challenge_id: Option<i32>,
     #[serde(default)]
@@ -135,6 +145,7 @@ struct UploadInstructions {
 
 #[derive(Clone, Copy)]
 enum Purpose {
+    CategoryIcon,
     ChallengeAsset,
     PageAsset,
     SolutionAsset,
@@ -146,6 +157,7 @@ enum Purpose {
 impl Purpose {
     fn parse(value: &str) -> Result<Self, ApiError> {
         match value {
+            "category_icon" => Ok(Self::CategoryIcon),
             "challenge_asset" => Ok(Self::ChallengeAsset),
             "page_asset" => Ok(Self::PageAsset),
             "solution_asset" => Ok(Self::SolutionAsset),
@@ -158,6 +170,7 @@ impl Purpose {
 
     const fn as_str(self) -> &'static str {
         match self {
+            Self::CategoryIcon => "category_icon",
             Self::ChallengeAsset => "challenge_asset",
             Self::PageAsset => "page_asset",
             Self::SolutionAsset => "solution_asset",
@@ -170,7 +183,7 @@ impl Purpose {
     const fn is_asset(self) -> bool {
         matches!(
             self,
-            Self::ChallengeAsset | Self::PageAsset | Self::SolutionAsset
+            Self::CategoryIcon | Self::ChallengeAsset | Self::PageAsset | Self::SolutionAsset
         )
     }
 }
@@ -183,6 +196,7 @@ fn is_competition_purpose(value: &str) -> bool {
 }
 
 struct ValidatedTarget {
+    category_id: Option<i32>,
     challenge_id: Option<i32>,
     page_id: Option<i32>,
     solution_id: Option<i32>,
@@ -230,11 +244,12 @@ pub(super) async fn initiate_upload(
     }
     let filename = safe_filename(&request.filename)?;
     let content_type = safe_content_type(&request.content_type)?;
-    if request.size < 0 || request.size > state.object_storage.max_upload_bytes() {
-        return Err(ApiError::bad_request(
-            "Object size is outside the upload limit",
-        ));
-    }
+    validate_upload_policy(
+        purpose,
+        &content_type,
+        request.size,
+        state.object_storage.max_upload_bytes(),
+    )?;
     let expected_checksum = validate_sha256(&request.sha256)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let target = validate_target(&state, &user, purpose, &request).await?;
@@ -269,6 +284,20 @@ pub(super) async fn initiate_upload(
     if !lock_validated_target(&mut transaction, purpose, &target).await? {
         return Err(ApiError::not_found("Object target not found"));
     }
+    let object_metadata = if matches!(purpose, Purpose::CategoryIcon) {
+        let category_id = target.category_id.expect("validated category icon target");
+        let expected_icon_object_id = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT icon_object_id FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
+        )
+        .bind(category_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("Object target not found"))?;
+        json!({"expected_icon_object_id": expected_icon_object_id})
+    } else {
+        json!({})
+    };
     if let Some(challenge_id) = target.challenge_id {
         super::challenges::require_full_challenge_access_in_transaction(
             &mut transaction,
@@ -319,17 +348,17 @@ pub(super) async fn initiate_upload(
         r#"
         INSERT INTO ctfzone.stored_objects
             (id,bucket,object_key,upload_key,purpose,status,authorization_scope,
-             owner_user_id,owner_team_id,idempotency_key,challenge_id,page_id,
-             solution_id,original_filename,content_type,
+             owner_user_id,owner_team_id,idempotency_key,category_id,challenge_id,page_id,
+             solution_id,original_filename,content_type,metadata,
              expected_size,checksum_algorithm,expected_checksum,retention_class,
              upload_expires_at)
-        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                'sha256',$16,'standard',$17)
+        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                $17,'sha256',$18,'standard',$19)
         RETURNING id,object_key,upload_key,purpose,status,authorization_scope,
                   owner_user_id,owner_team_id,
-                  challenge_id,page_id,solution_id,original_filename,content_type,
+                  category_id,challenge_id,page_id,solution_id,original_filename,content_type,
                   expected_size,actual_size,expected_checksum,actual_checksum,
-                  upload_expires_at,created_at,ready_at,revision
+                  upload_expires_at,created_at,ready_at,revision,metadata
         "#,
     )
     .bind(object_id)
@@ -341,11 +370,13 @@ pub(super) async fn initiate_upload(
     .bind(user.id)
     .bind(owner_team_id)
     .bind(&idempotency_key)
+    .bind(target.category_id)
     .bind(target.challenge_id)
     .bind(target.page_id)
     .bind(target.solution_id)
     .bind(&filename)
     .bind(&content_type)
+    .bind(object_metadata)
     .bind(request.size)
     .bind(&expected_checksum)
     .bind(upload_expires_at)
@@ -386,7 +417,15 @@ pub(super) async fn complete_upload(
 ) -> Result<Response, ApiError> {
     let object = load_object(&state, object_id).await?;
     authorize_change(&state, user.id, &object).await?;
+    let purpose = Purpose::parse(&object.purpose)?;
     if object.status == "ready" {
+        if matches!(purpose, Purpose::CategoryIcon)
+            && !category_icon_is_current(&state, &object).await?
+        {
+            return Err(ApiError::conflict(
+                "This category icon upload is no longer current",
+            ));
+        }
         return Ok(Json(Success::new(ObjectView::from(&object))).into_response());
     }
     if object.status != "pending" {
@@ -412,7 +451,25 @@ pub(super) async fn complete_upload(
         ));
     }
 
-    let purpose = Purpose::parse(&object.purpose)?;
+    let staged_icon_metadata = if matches!(purpose, Purpose::CategoryIcon) {
+        match load_and_validate_category_icon(
+            &state,
+            &object.upload_key,
+            &object.content_type,
+            &object.expected_checksum,
+        )
+        .await
+        {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                fail_upload(&state, &object, &user, "category_icon_invalid").await?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
     crate::auth::revalidate_current_credential(
@@ -437,6 +494,13 @@ pub(super) async fn complete_upload(
             .await?;
     require_current_upload_principal(&current, principal, user.id)?;
     if current.status == "ready" {
+        if matches!(purpose, Purpose::CategoryIcon)
+            && !category_icon_is_current_in_transaction(&mut transaction, &current).await?
+        {
+            return Err(ApiError::conflict(
+                "This category icon upload is no longer current",
+            ));
+        }
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok(Json(Success::new(ObjectView::from(&current))).into_response());
     }
@@ -448,22 +512,73 @@ pub(super) async fn complete_upload(
         fail_upload(&state, &current, &user, "upload_expired").await?;
         return Err(ApiError::conflict("Object upload has expired"));
     }
+    let previous_category_icon = if matches!(purpose, Purpose::CategoryIcon) {
+        let category_id = current
+            .category_id
+            .ok_or_else(|| ApiError::conflict("Category icon target is invalid"))?;
+        let attached = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT icon_object_id FROM ctfzone.challenge_categories WHERE id=$1",
+        )
+        .bind(category_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        let expected = expected_category_icon_object_id(&current)?;
+        if attached != expected {
+            transaction.rollback().await.map_err(ApiError::database)?;
+            fail_upload(&state, &current, &user, "category_icon_superseded").await?;
+            return Err(ApiError::conflict(
+                "A newer category icon choice superseded this upload",
+            ));
+        }
+        attached
+    } else {
+        None
+    };
     copy_to_final_key(&state, &current).await?;
     let final_metadata = head_object(&state, &current.object_key).await?;
     if final_metadata.length != current.expected_size
         || final_metadata.content_type.as_deref() != Some(current.content_type.as_str())
     {
+        transaction.rollback().await.map_err(ApiError::database)?;
+        fail_upload(&state, &current, &user, "promotion_metadata_mismatch").await?;
         return Err(ApiError::upstream(
             "Object storage did not preserve the promoted object metadata",
         ));
+    }
+    let ready_metadata = if matches!(purpose, Purpose::CategoryIcon) {
+        match load_and_validate_category_icon(
+            &state,
+            &current.object_key,
+            &current.content_type,
+            &current.expected_checksum,
+        )
+        .await
+        {
+            Ok(validation) => merge_object_metadata(&current.metadata, &validation),
+            Err(error) => {
+                transaction.rollback().await.map_err(ApiError::database)?;
+                fail_upload(&state, &current, &user, "promoted_category_icon_invalid").await?;
+                return Err(error);
+            }
+        }
+    } else {
+        current.metadata.clone()
+    };
+    if let Some(staged) = staged_icon_metadata.as_ref() {
+        debug_assert_eq!(
+            staged.get("width"),
+            ready_metadata.get("width"),
+            "staged and promoted category icon validation disagree"
+        );
     }
 
     let revision = sqlx::query_scalar::<_, i64>(
         r#"
         UPDATE ctfzone.stored_objects
         SET status='ready',actual_size=$2,actual_checksum=$3,etag=$4,
-            ready_at=now(),revision=revision+1
-        WHERE id=$1 AND status='pending' AND revision=$5
+            ready_at=now(),revision=revision+1,metadata=$5
+        WHERE id=$1 AND status='pending' AND revision=$6
         RETURNING revision
         "#,
     )
@@ -471,10 +586,73 @@ pub(super) async fn complete_upload(
     .bind(final_metadata.length)
     .bind(&current.expected_checksum)
     .bind(&final_metadata.etag)
+    .bind(ready_metadata)
     .bind(current.revision)
     .fetch_one(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
+    if matches!(purpose, Purpose::CategoryIcon) {
+        let category_id = current.category_id.expect("validated category target");
+        let changed = sqlx::query(
+            r#"
+            UPDATE ctfzone.challenge_categories
+            SET icon_object_id=$2
+            WHERE id=$1 AND icon_object_id IS NOT DISTINCT FROM $3
+            "#,
+        )
+        .bind(category_id)
+        .bind(current.id)
+        .bind(previous_category_icon)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if changed.rows_affected() != 1 {
+            return Err(ApiError::conflict(
+                "A newer category icon choice superseded this upload",
+            ));
+        }
+        if let Some(previous_id) = previous_category_icon {
+            let previous = load_object_for_update(&mut transaction, previous_id).await?;
+            mark_object_deleting_in_transaction(
+                &mut transaction,
+                &previous,
+                Some(user.id),
+                "category_icon_replaced",
+            )
+            .await?;
+        }
+        // A pointer-only CAS is vulnerable to NULL -> A -> NULL ABA: an older
+        // upload that also snapshotted NULL could otherwise attach afterward.
+        // The category lock makes this winner safe to retire every older draft.
+        let superseded_uploads = sqlx::query_as::<_, StoredObject>(
+            r#"
+            SELECT id,object_key,upload_key,purpose,status,authorization_scope,
+                   owner_user_id,owner_team_id,category_id,challenge_id,page_id,solution_id,
+                   original_filename,content_type,expected_size,actual_size,
+                   expected_checksum,actual_checksum,upload_expires_at,created_at,
+                   ready_at,revision,metadata
+            FROM ctfzone.stored_objects
+            WHERE category_id=$1 AND purpose='category_icon'
+              AND status='pending' AND id<>$2
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(category_id)
+        .bind(current.id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        for superseded in superseded_uploads {
+            mark_object_deleting_in_transaction(
+                &mut transaction,
+                &superseded,
+                Some(user.id),
+                "category_icon_upload_superseded",
+            )
+            .await?;
+        }
+    }
     sqlx::query(
         "UPDATE ctfzone.object_operations SET status='cancelled',completed_at=now() WHERE object_id=$1 AND operation='reconcile' AND status IN ('pending','claimed')",
     )
@@ -608,6 +786,138 @@ pub(super) async fn download_grant(
     .into_response())
 }
 
+pub(super) async fn category_icon_grant(
+    State(state): State<AppState>,
+    Path((category_id, object_id)): Path<(i32, Uuid)>,
+) -> Result<Response, ApiError> {
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let object = sqlx::query_as::<_, StoredObject>(
+        r#"
+        SELECT stored.id,stored.object_key,stored.upload_key,stored.purpose,stored.status,
+               stored.authorization_scope,stored.owner_user_id,stored.owner_team_id,
+               stored.category_id,stored.challenge_id,stored.page_id,stored.solution_id,
+               stored.original_filename,stored.content_type,stored.expected_size,
+               stored.actual_size,stored.expected_checksum,stored.actual_checksum,
+               stored.upload_expires_at,stored.created_at,stored.ready_at,stored.revision,
+               stored.metadata
+        FROM ctfzone.challenge_categories category
+        JOIN ctfzone.stored_objects stored
+          ON stored.id=category.icon_object_id
+         AND stored.category_id=category.id
+         AND stored.purpose='category_icon'
+         AND stored.status='ready'
+         AND stored.content_type IN ('image/png','image/svg+xml')
+         AND ((stored.content_type='image/png' AND stored.metadata->'format'='"png"'::jsonb)
+           OR (stored.content_type='image/svg+xml' AND stored.metadata->'format'='"svg"'::jsonb
+               AND stored.metadata->'sanitized'='true'::jsonb))
+         AND stored.metadata->'width'='128'::jsonb
+         AND stored.metadata->'height'='128'::jsonb
+         AND stored.metadata->'animated'='false'::jsonb
+        WHERE category.id=$1
+          AND stored.id=$2
+        FOR KEY SHARE OF category,stored
+        "#,
+    )
+    .bind(category_id)
+    .bind(object_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Category icon not found"))?;
+    let url = state
+        .object_storage
+        .inline_image_url(&object.object_key, &object.content_type);
+    let expires_at = Utc::now()
+        + ChronoDuration::from_std(state.object_storage.presign_ttl())
+            .map_err(|_| ApiError::upstream("Download expiry is invalid"))?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(Json(Success::new(json!({
+        "method": "GET",
+        "url": url,
+        "expires_at": expires_at,
+    })))
+    .into_response())
+}
+
+pub(super) async fn delete_category_icon(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((category_id, object_id)): Path<(i32, Uuid)>,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    super::user_mode_transition::lock_configuration_shared(&mut transaction).await?;
+    crate::auth::revalidate_current_credential(
+        &mut transaction,
+        &user,
+        state.auth.session_lifetime_seconds,
+    )
+    .await?;
+    let attached = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT icon_object_id FROM ctfzone.challenge_categories WHERE id=$1 FOR UPDATE",
+    )
+    .bind(category_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge category not found"))?;
+    if attached != Some(object_id) {
+        return Err(ApiError::conflict(
+            "The challenge category icon has changed",
+        ));
+    }
+    let detached = sqlx::query(
+        r#"
+        UPDATE ctfzone.challenge_categories
+        SET icon_object_id=NULL
+        WHERE id=$1 AND icon_object_id=$2
+        "#,
+    )
+    .bind(category_id)
+    .bind(object_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if detached.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "The challenge category icon has changed",
+        ));
+    }
+
+    // Once the exact expected pointer wins the lock, every prior pending draft
+    // is stale (including uploads whose snapshot was NULL before an ABA cycle).
+    let objects = sqlx::query_as::<_, StoredObject>(
+        r#"
+        SELECT id,object_key,upload_key,purpose,status,authorization_scope,
+               owner_user_id,owner_team_id,category_id,challenge_id,page_id,solution_id,
+               original_filename,content_type,expected_size,actual_size,
+               expected_checksum,actual_checksum,upload_expires_at,created_at,
+               ready_at,revision,metadata
+        FROM ctfzone.stored_objects
+        WHERE category_id=$1 AND purpose='category_icon'
+          AND (id=$2 OR status='pending')
+        ORDER BY id
+        FOR UPDATE
+        "#,
+    )
+    .bind(category_id)
+    .bind(object_id)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    for object in objects {
+        mark_object_deleting_in_transaction(
+            &mut transaction,
+            &object,
+            Some(user.id),
+            "category_icon_removed",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 pub(super) async fn delete_object(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -625,16 +935,33 @@ async fn validate_target(
     purpose: Purpose,
     request: &UploadRequest,
 ) -> Result<ValidatedTarget, ApiError> {
-    let supplied = [request.challenge_id, request.page_id, request.solution_id]
-        .into_iter()
-        .flatten()
-        .count();
+    let supplied = [
+        request.category_id,
+        request.challenge_id,
+        request.page_id,
+        request.solution_id,
+    ]
+    .into_iter()
+    .flatten()
+    .count();
     if supplied != 1 {
         return Err(ApiError::bad_request(
-            "Exactly one challenge, page, or solution target is required",
+            "Exactly one category, challenge, page, or solution target is required",
         ));
     }
     match purpose {
+        Purpose::CategoryIcon => {
+            let category_id = request
+                .category_id
+                .ok_or_else(|| ApiError::bad_request("category_icon requires category_id"))?;
+            require_row(state, "challenge_categories", category_id).await?;
+            Ok(ValidatedTarget {
+                category_id: Some(category_id),
+                challenge_id: None,
+                page_id: None,
+                solution_id: None,
+            })
+        }
         Purpose::ChallengeAsset => {
             let challenge_id = request
                 .challenge_id
@@ -642,6 +969,7 @@ async fn validate_target(
             super::challenges::require_full_challenge_access(state, Some(user), challenge_id)
                 .await?;
             Ok(ValidatedTarget {
+                category_id: None,
                 challenge_id: Some(challenge_id),
                 page_id: None,
                 solution_id: None,
@@ -653,6 +981,7 @@ async fn validate_target(
                 .ok_or_else(|| ApiError::bad_request("page_asset requires page_id"))?;
             require_row(state, "pages", page_id).await?;
             Ok(ValidatedTarget {
+                category_id: None,
                 challenge_id: None,
                 page_id: Some(page_id),
                 solution_id: None,
@@ -673,6 +1002,7 @@ async fn validate_target(
             super::challenges::require_full_challenge_access(state, Some(user), challenge_id)
                 .await?;
             Ok(ValidatedTarget {
+                category_id: None,
                 challenge_id: Some(challenge_id),
                 page_id: None,
                 solution_id: Some(solution_id),
@@ -685,12 +1015,36 @@ async fn validate_target(
             super::challenges::require_full_challenge_access(state, Some(user), challenge_id)
                 .await?;
             Ok(ValidatedTarget {
+                category_id: None,
                 challenge_id: Some(challenge_id),
                 page_id: None,
                 solution_id: None,
             })
         }
     }
+}
+
+fn validate_upload_policy(
+    purpose: Purpose,
+    content_type: &str,
+    size: i64,
+    max_upload_bytes: i64,
+) -> Result<(), ApiError> {
+    if matches!(purpose, Purpose::CategoryIcon)
+        && (!matches!(content_type, "image/png" | "image/svg+xml")
+            || size <= 0
+            || size as usize > CATEGORY_ICON_MAX_BYTES)
+    {
+        return Err(ApiError::bad_request(
+            "Category icons must be PNG or SVG files between 1 byte and 256 KiB",
+        ));
+    }
+    if size < 0 || size > max_upload_bytes {
+        return Err(ApiError::bad_request(
+            "Object size is outside the upload limit",
+        ));
+    }
+    Ok(())
 }
 
 async fn require_row(state: &AppState, table: &str, id: i32) -> Result<(), ApiError> {
@@ -769,6 +1123,20 @@ async fn lock_validated_target(
     target: &ValidatedTarget,
 ) -> Result<bool, ApiError> {
     match purpose {
+        Purpose::CategoryIcon => {
+            let Some(category_id) = target.category_id else {
+                return Ok(false);
+            };
+            let exists = sqlx::query_scalar::<_, i32>(
+                "SELECT id FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
+            )
+            .bind(category_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(ApiError::database)?
+            .is_some();
+            Ok(exists)
+        }
         Purpose::ChallengeAsset | Purpose::Submission | Purpose::Patch | Purpose::Program => {
             let Some(challenge_id) = target.challenge_id else {
                 return Ok(false);
@@ -848,10 +1216,10 @@ async fn load_idempotent_object(
     sqlx::query_as::<_, StoredObject>(
         r#"
         SELECT id,object_key,upload_key,purpose,status,authorization_scope,
-               owner_user_id,owner_team_id,challenge_id,page_id,solution_id,
+               owner_user_id,owner_team_id,category_id,challenge_id,page_id,solution_id,
                original_filename,content_type,expected_size,actual_size,
                expected_checksum,actual_checksum,upload_expires_at,created_at,
-               ready_at,revision
+               ready_at,revision,metadata
         FROM ctfzone.stored_objects
         WHERE owner_user_id=$1 AND idempotency_key=$2
         FOR UPDATE
@@ -884,6 +1252,7 @@ fn require_same_upload(
     if object.purpose != purpose.as_str()
         || object.authorization_scope != principal.scope()
         || !owner_matches
+        || object.category_id != target.category_id
         || object.challenge_id != target.challenge_id
         || object.page_id != target.page_id
         || object.solution_id != target.solution_id
@@ -997,6 +1366,18 @@ async fn lock_target(
     object: &StoredObject,
 ) -> Result<bool, ApiError> {
     let exists = match object.purpose.as_str() {
+        "category_icon" => {
+            let Some(id) = object.category_id else {
+                return Ok(false);
+            };
+            sqlx::query_scalar::<_, i32>(
+                "SELECT id FROM ctfzone.challenge_categories WHERE id=$1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map(|row| row.is_some())
+        }
         "challenge_asset" | "submission" | "patch" | "program" => {
             let Some(id) = object.challenge_id else {
                 return Ok(false);
@@ -1072,6 +1453,433 @@ async fn head_object(state: &AppState, object_key: &str) -> Result<HeadMetadata,
         etag: string_header(headers, ETAG).map(|value| value.trim_matches('"').to_owned()),
         length,
     })
+}
+
+async fn get_object_body_limited(
+    state: &AppState,
+    object_key: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ApiError> {
+    let mut response = state
+        .http
+        .get(state.object_storage.internal_get_url(object_key))
+        .send()
+        .await
+        .map_err(|_| ApiError::upstream("Object storage is unavailable"))?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(ApiError::conflict("The uploaded object is not present"));
+    }
+    if !response.status().is_success() {
+        return Err(ApiError::upstream(
+            "Object storage rejected content verification",
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(ApiError::conflict(
+            "Uploaded category icon exceeds the size limit",
+        ));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(max_bytes as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ApiError::upstream("Object storage content could not be read"))?
+    {
+        append_bounded(&mut body, &chunk, max_bytes)?;
+    }
+    Ok(body)
+}
+
+async fn load_and_validate_category_icon(
+    state: &AppState,
+    object_key: &str,
+    content_type: &str,
+    expected_checksum: &str,
+) -> Result<Value, ApiError> {
+    let body = get_object_body_limited(state, object_key, CATEGORY_ICON_MAX_BYTES).await?;
+    validated_category_icon_metadata(&body, content_type, expected_checksum).map_err(|_| {
+        ApiError::conflict(
+            "Category icon must be a valid 128 by 128 PNG or a strictly sanitized square SVG",
+        )
+    })
+}
+
+fn append_bounded(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<(), ApiError> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(ApiError::conflict(
+            "Uploaded category icon exceeds the size limit",
+        ));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn validated_category_icon_metadata(
+    bytes: &[u8],
+    content_type: &str,
+    expected_checksum: &str,
+) -> Result<Value, &'static str> {
+    if bytes.is_empty() || bytes.len() > CATEGORY_ICON_MAX_BYTES {
+        return Err("body_size_invalid");
+    }
+    if hex::encode(Sha256::digest(bytes)) != expected_checksum {
+        return Err("checksum_mismatch");
+    }
+    if content_type == "image/svg+xml" {
+        return validated_category_svg_metadata(bytes);
+    }
+    if content_type != "image/png" {
+        return Err("content_type_invalid");
+    }
+    validate_static_png_chunks(bytes)?;
+    // The encoded upload is small, but compressed ancillary chunks can otherwise
+    // consume far more memory while decoding. We do not use textual or ICC
+    // metadata for category icons, so skip it and keep the decoder bounded.
+    let mut decoder = png::Decoder::new_with_limits(
+        Cursor::new(bytes),
+        png::Limits {
+            bytes: CATEGORY_ICON_MAX_BYTES * 4,
+        },
+    );
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(|_| "png_decode_failed")?;
+    if reader.info().width != CATEGORY_ICON_DIMENSION
+        || reader.info().height != CATEGORY_ICON_DIMENSION
+    {
+        return Err("png_dimensions_invalid");
+    }
+    let mut decoded = vec![0; reader.output_buffer_size()];
+    reader
+        .next_frame(&mut decoded)
+        .map_err(|_| "png_decode_failed")?;
+    reader.finish().map_err(|_| "png_decode_failed")?;
+    Ok(json!({
+        "format": "png",
+        "width": CATEGORY_ICON_DIMENSION,
+        "height": CATEGORY_ICON_DIMENSION,
+        "animated": false,
+    }))
+}
+
+fn validate_static_png_chunks(bytes: &[u8]) -> Result<(), &'static str> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(SIGNATURE) {
+        return Err("png_decode_failed");
+    }
+    let mut offset = SIGNATURE.len();
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8).ok_or("png_decode_failed")?;
+        if header_end > bytes.len() {
+            return Err("png_decode_failed");
+        }
+        let length = u32::from_be_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .map_err(|_| "png_decode_failed")?,
+        ) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        let chunk_end = header_end
+            .checked_add(length)
+            .and_then(|end| end.checked_add(4))
+            .ok_or("png_decode_failed")?;
+        if chunk_end > bytes.len() {
+            return Err("png_decode_failed");
+        }
+        let data_end = header_end + length;
+        let stored_crc = u32::from_be_bytes(
+            bytes[data_end..chunk_end]
+                .try_into()
+                .map_err(|_| "png_decode_failed")?,
+        );
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(&bytes[header_end..data_end]);
+        if crc.finalize() != stored_crc {
+            return Err("png_crc_invalid");
+        }
+        if matches!(kind, b"acTL" | b"fcTL" | b"fdAT") {
+            return Err("animated_png_not_supported");
+        }
+        offset = chunk_end;
+        if kind == b"IEND" {
+            return if length == 0 && offset == bytes.len() {
+                Ok(())
+            } else {
+                Err("png_decode_failed")
+            };
+        }
+    }
+    Err("png_decode_failed")
+}
+
+fn validated_category_svg_metadata(bytes: &[u8]) -> Result<Value, &'static str> {
+    let source = std::str::from_utf8(bytes).map_err(|_| "svg_utf8_invalid")?;
+    let mut elements = Vec::<&str>::new();
+    let mut current_element = None;
+    let mut current_attributes = Vec::<&str>::new();
+    let mut root_seen = false;
+    let mut namespace_seen = false;
+    let mut square_view_box_seen = false;
+    let mut element_count = 0usize;
+    let mut attribute_count = 0usize;
+
+    for token in Tokenizer::from(source) {
+        match token.map_err(|_| "svg_xml_invalid")? {
+            Token::Declaration {
+                version, encoding, ..
+            } => {
+                if version.as_str() != "1.0"
+                    || encoding.is_some_and(|value| !value.as_str().eq_ignore_ascii_case("utf-8"))
+                {
+                    return Err("svg_declaration_invalid");
+                }
+            }
+            Token::ElementStart { prefix, local, .. } => {
+                if !prefix.as_str().is_empty() {
+                    return Err("svg_namespace_prefix_forbidden");
+                }
+                let name = local.as_str();
+                if !matches!(
+                    name,
+                    "svg"
+                        | "g"
+                        | "path"
+                        | "circle"
+                        | "ellipse"
+                        | "line"
+                        | "polyline"
+                        | "polygon"
+                        | "rect"
+                ) {
+                    return Err("svg_element_forbidden");
+                }
+                if elements.is_empty() {
+                    if root_seen || name != "svg" {
+                        return Err("svg_root_invalid");
+                    }
+                    root_seen = true;
+                } else if name == "svg" {
+                    return Err("svg_nested_root_forbidden");
+                }
+                element_count += 1;
+                if element_count > 256 || elements.len() >= 32 {
+                    return Err("svg_complexity_exceeded");
+                }
+                elements.push(name);
+                current_element = Some(name);
+                current_attributes.clear();
+            }
+            Token::Attribute {
+                prefix,
+                local,
+                value,
+                ..
+            } => {
+                if !prefix.as_str().is_empty() {
+                    return Err("svg_attribute_prefix_forbidden");
+                }
+                let element = current_element.ok_or("svg_attribute_position_invalid")?;
+                let name = local.as_str();
+                if current_attributes.contains(&name) {
+                    return Err("svg_duplicate_attribute");
+                }
+                current_attributes.push(name);
+                attribute_count += 1;
+                if attribute_count > 2048 {
+                    return Err("svg_complexity_exceeded");
+                }
+                validate_svg_attribute(element, name, value.as_str())?;
+                if element == "svg" && name == "xmlns" {
+                    namespace_seen = true;
+                }
+                if element == "svg" && name == "viewBox" {
+                    square_view_box_seen = true;
+                }
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open => current_element = None,
+                ElementEnd::Empty => {
+                    elements.pop().ok_or("svg_structure_invalid")?;
+                    current_element = None;
+                }
+                ElementEnd::Close(prefix, local) => {
+                    if !prefix.as_str().is_empty() || elements.pop() != Some(local.as_str()) {
+                        return Err("svg_structure_invalid");
+                    }
+                    current_element = None;
+                }
+            },
+            Token::Text { text } if text.as_str().trim().is_empty() => {}
+            // No scripts, CSS, links, text, metadata, DTD/entities, CDATA,
+            // processing instructions, comments, animation, or external refs.
+            _ => return Err("svg_content_forbidden"),
+        }
+    }
+    if !root_seen || !namespace_seen || !square_view_box_seen || !elements.is_empty() {
+        return Err("svg_document_incomplete");
+    }
+    Ok(json!({
+        "format": "svg",
+        "width": CATEGORY_ICON_DIMENSION,
+        "height": CATEGORY_ICON_DIMENSION,
+        "animated": false,
+        "sanitized": true,
+    }))
+}
+
+fn validate_svg_attribute(element: &str, name: &str, value: &str) -> Result<(), &'static str> {
+    if value.len() > 8192 || value.chars().any(char::is_control) {
+        return Err("svg_attribute_invalid");
+    }
+    match name {
+        "xmlns" if element == "svg" && value == "http://www.w3.org/2000/svg" => Ok(()),
+        "viewBox" if element == "svg" => {
+            let values = parse_svg_numbers(value)?;
+            if values.len() == 4
+                && values
+                    .iter()
+                    .all(|number| number.is_finite() && number.abs() <= 1_000_000.0)
+                && values[2] > 0.0
+                && values[2] == values[3]
+            {
+                Ok(())
+            } else {
+                Err("svg_viewbox_invalid")
+            }
+        }
+        "width" | "height" if element == "svg" => validate_svg_dimension(value),
+        "d" if element == "path" => {
+            if !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_digit()
+                        || character.is_ascii_whitespace()
+                        || ".,+-MmZzLlHhVvCcSsQqTtAaEe".contains(character)
+                })
+            {
+                Ok(())
+            } else {
+                Err("svg_path_invalid")
+            }
+        }
+        "points" if matches!(element, "polyline" | "polygon") => {
+            parse_svg_numbers(value).and_then(|numbers| {
+                if numbers.len() >= 4 && numbers.len() % 2 == 0 {
+                    Ok(())
+                } else {
+                    Err("svg_points_invalid")
+                }
+            })
+        }
+        "x" | "y" | "x1" | "y1" | "x2" | "y2" | "cx" | "cy" | "r" | "rx" | "ry"
+        | "stroke-width" | "stroke-dashoffset" => validate_svg_number(value),
+        "fill" | "stroke" => validate_svg_paint(value),
+        "opacity" | "fill-opacity" | "stroke-opacity" => validate_svg_opacity(value),
+        "stroke-linecap" if matches!(value, "butt" | "round" | "square") => Ok(()),
+        "stroke-linejoin" if matches!(value, "miter" | "round" | "bevel") => Ok(()),
+        "fill-rule" | "clip-rule" if matches!(value, "nonzero" | "evenodd") => Ok(()),
+        "stroke-dasharray" if value == "none" => Ok(()),
+        "stroke-dasharray" => parse_svg_numbers(value).map(|_| ()),
+        "vector-effect" if value == "non-scaling-stroke" => Ok(()),
+        "transform" => validate_svg_transform(value),
+        _ => Err("svg_attribute_forbidden"),
+    }
+}
+
+fn parse_svg_numbers(value: &str) -> Result<Vec<f64>, &'static str> {
+    if value.is_empty()
+        || !value.chars().all(|character| {
+            character.is_ascii_digit()
+                || character.is_ascii_whitespace()
+                || matches!(character, '.' | ',' | '+' | '-' | 'e' | 'E')
+        })
+    {
+        return Err("svg_number_invalid");
+    }
+    let normalized = value.replace(',', " ");
+    let values = normalized
+        .split_whitespace()
+        .map(|part| part.parse::<f64>().map_err(|_| "svg_number_invalid"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty()
+        || values.len() > 1024
+        || values
+            .iter()
+            .any(|number| !number.is_finite() || number.abs() > 1_000_000.0)
+    {
+        return Err("svg_number_invalid");
+    }
+    Ok(values)
+}
+
+fn validate_svg_number(value: &str) -> Result<(), &'static str> {
+    let values = parse_svg_numbers(value)?;
+    if values.len() == 1 {
+        Ok(())
+    } else {
+        Err("svg_number_invalid")
+    }
+}
+
+fn validate_svg_dimension(value: &str) -> Result<(), &'static str> {
+    let value = value.strip_suffix("px").unwrap_or(value);
+    let number = value.parse::<f64>().map_err(|_| "svg_dimension_invalid")?;
+    if number.is_finite() && number > 0.0 && number <= 4096.0 {
+        Ok(())
+    } else {
+        Err("svg_dimension_invalid")
+    }
+}
+
+fn validate_svg_paint(value: &str) -> Result<(), &'static str> {
+    let valid_hex = matches!(value.len(), 4 | 5 | 7 | 9)
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if matches!(value, "none" | "currentColor") || valid_hex {
+        Ok(())
+    } else {
+        Err("svg_paint_invalid")
+    }
+}
+
+fn validate_svg_opacity(value: &str) -> Result<(), &'static str> {
+    let number = value.parse::<f64>().map_err(|_| "svg_opacity_invalid")?;
+    if number.is_finite() && (0.0..=1.0).contains(&number) {
+        Ok(())
+    } else {
+        Err("svg_opacity_invalid")
+    }
+}
+
+fn validate_svg_transform(value: &str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character.is_ascii_whitespace()
+                || matches!(character, '.' | ',' | '+' | '-' | '(' | ')')
+        })
+    {
+        return Err("svg_transform_invalid");
+    }
+    for word in value.split(|character: char| !character.is_ascii_alphabetic()) {
+        if !word.is_empty()
+            && !matches!(
+                word,
+                "matrix" | "translate" | "scale" | "rotate" | "skewX" | "skewY"
+            )
+        {
+            return Err("svg_transform_invalid");
+        }
+    }
+    Ok(())
 }
 
 async fn copy_to_final_key(state: &AppState, object: &StoredObject) -> Result<(), ApiError> {
@@ -1175,10 +1983,45 @@ async fn schedule_delete(
     if is_competition_purpose(&object.purpose) {
         super::team_accounts::lock_team_membership(&mut transaction).await?;
     }
+    let attached_category_icon = if object.purpose == "category_icon" {
+        let category_id = object
+            .category_id
+            .ok_or_else(|| ApiError::not_found("Object not found"))?;
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT icon_object_id FROM ctfzone.challenge_categories WHERE id=$1 FOR UPDATE",
+        )
+        .bind(category_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .flatten()
+    } else {
+        None
+    };
     let current = load_object_for_update(&mut transaction, object.id).await?;
     authorize_change_in_transaction(&mut transaction, user.id, &current).await?;
-    if current.status == "deleted" || current.status == "deleting" {
-        transaction.commit().await.map_err(ApiError::database)?;
+    if attached_category_icon == Some(current.id) {
+        return Err(ApiError::conflict(
+            "Remove the current icon through its challenge category",
+        ));
+    }
+    mark_object_deleting_in_transaction(
+        &mut transaction,
+        &current,
+        Some(user.id),
+        "object_delete_requested",
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::database)
+}
+
+async fn mark_object_deleting_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current: &StoredObject,
+    actor_user_id: Option<i32>,
+    reason: &str,
+) -> Result<(), ApiError> {
+    if matches!(current.status.as_str(), "deleted" | "deleting") {
         return Ok(());
     }
     let revision = sqlx::query_scalar::<_, i64>(
@@ -1191,35 +2034,35 @@ async fn schedule_delete(
     )
     .bind(current.id)
     .bind(current.revision)
-    .fetch_one(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await
     .map_err(ApiError::database)?;
     sqlx::query(
         "UPDATE ctfzone.object_operations SET status='cancelled',completed_at=now() WHERE object_id=$1 AND status IN ('pending','claimed')",
     )
     .bind(current.id)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await
     .map_err(ApiError::database)?;
     enqueue_operation(
-        &mut transaction,
+        transaction,
         current.id,
         "delete_upload",
         revision,
         staging_cleanup_at(current.upload_expires_at),
     )
     .await?;
-    enqueue_operation(&mut transaction, current.id, "delete", revision, Utc::now()).await?;
+    enqueue_operation(transaction, current.id, "delete", revision, Utc::now()).await?;
     insert_event(
-        &mut transaction,
+        transaction,
         current.id,
         "delete_requested",
         "api",
-        Some(user.id),
-        json!({}),
+        actor_user_id,
+        json!({"reason": reason}),
     )
     .await?;
-    transaction.commit().await.map_err(ApiError::database)
+    Ok(())
 }
 
 async fn enqueue_operation(
@@ -1285,9 +2128,9 @@ async fn load_object(state: &AppState, object_id: Uuid) -> Result<StoredObject, 
         r#"
         SELECT id,object_key,upload_key,purpose,status,authorization_scope,
                owner_user_id,owner_team_id,
-               challenge_id,page_id,solution_id,original_filename,content_type,
+               category_id,challenge_id,page_id,solution_id,original_filename,content_type,
                expected_size,actual_size,expected_checksum,actual_checksum,
-               upload_expires_at,created_at,ready_at,revision
+               upload_expires_at,created_at,ready_at,revision,metadata
         FROM ctfzone.stored_objects WHERE id=$1
         "#,
     )
@@ -1306,9 +2149,9 @@ async fn load_object_for_update(
         r#"
         SELECT id,object_key,upload_key,purpose,status,authorization_scope,
                owner_user_id,owner_team_id,
-               challenge_id,page_id,solution_id,original_filename,content_type,
+               category_id,challenge_id,page_id,solution_id,original_filename,content_type,
                expected_size,actual_size,expected_checksum,actual_checksum,
-               upload_expires_at,created_at,ready_at,revision
+               upload_expires_at,created_at,ready_at,revision,metadata
         FROM ctfzone.stored_objects WHERE id=$1 FOR UPDATE
         "#,
     )
@@ -1327,9 +2170,9 @@ async fn load_object_in_transaction(
         r#"
         SELECT id,object_key,upload_key,purpose,status,authorization_scope,
                owner_user_id,owner_team_id,
-               challenge_id,page_id,solution_id,original_filename,content_type,
+               category_id,challenge_id,page_id,solution_id,original_filename,content_type,
                expected_size,actual_size,expected_checksum,actual_checksum,
-               upload_expires_at,created_at,ready_at,revision
+               upload_expires_at,created_at,ready_at,revision,metadata
         FROM ctfzone.stored_objects WHERE id=$1
         "#,
     )
@@ -1363,8 +2206,8 @@ async fn authorize_download_in_transaction(
             let page_id = object
                 .page_id
                 .ok_or_else(|| ApiError::not_found("Object not found"))?;
-            let (draft, hidden, auth_required) = sqlx::query_as::<_, (bool, bool, bool)>(
-                "SELECT COALESCE(draft,false),COALESCE(hidden,false),COALESCE(auth_required,false) FROM ctfzone.pages WHERE id=$1 FOR KEY SHARE",
+            let visibility = sqlx::query_scalar::<_, String>(
+                "SELECT visibility FROM ctfzone.pages WHERE id=$1 FOR KEY SHARE",
             )
             .bind(page_id)
             .fetch_optional(&mut **transaction)
@@ -1374,10 +2217,10 @@ async fn authorize_download_in_transaction(
             if user.is_some_and(CurrentUser::is_admin) {
                 return Ok(());
             }
-            if draft || hidden || (auth_required && user.is_none()) {
-                Err(ApiError::not_found("Object not found"))
-            } else {
-                Ok(())
+            match visibility.as_str() {
+                "public" => Ok(()),
+                "private" if user.is_some() => Ok(()),
+                _ => Err(ApiError::not_found("Object not found")),
             }
         }
         "solution_asset" => {
@@ -1487,11 +2330,76 @@ fn same_download_identity(left: &StoredObject, right: &StoredObject) -> bool {
         && left.authorization_scope == right.authorization_scope
         && left.owner_user_id == right.owner_user_id
         && left.owner_team_id == right.owner_team_id
+        && left.category_id == right.category_id
         && left.challenge_id == right.challenge_id
         && left.page_id == right.page_id
         && left.solution_id == right.solution_id
         && left.original_filename == right.original_filename
         && left.content_type == right.content_type
+}
+
+fn expected_category_icon_object_id(object: &StoredObject) -> Result<Option<Uuid>, ApiError> {
+    match object.metadata.get("expected_icon_object_id") {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|_| ApiError::conflict("Category icon upload snapshot is invalid")),
+        _ => Err(ApiError::conflict(
+            "Category icon upload snapshot is missing",
+        )),
+    }
+}
+
+fn merge_object_metadata(current: &Value, validation: &Value) -> Value {
+    let mut merged = current.as_object().cloned().unwrap_or_default();
+    if let Some(fields) = validation.as_object() {
+        merged.extend(fields.clone());
+    }
+    Value::Object(merged)
+}
+
+async fn category_icon_is_current(
+    state: &AppState,
+    object: &StoredObject,
+) -> Result<bool, ApiError> {
+    let Some(category_id) = object.category_id else {
+        return Ok(false);
+    };
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ctfzone.challenge_categories
+            WHERE id=$1 AND icon_object_id=$2
+        )
+        "#,
+    )
+    .bind(category_id)
+    .bind(object.id)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::database)
+}
+
+async fn category_icon_is_current_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    object: &StoredObject,
+) -> Result<bool, ApiError> {
+    let Some(category_id) = object.category_id else {
+        return Ok(false);
+    };
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ctfzone.challenge_categories
+            WHERE id=$1 AND icon_object_id=$2
+        )
+        "#,
+    )
+    .bind(category_id)
+    .bind(object.id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(ApiError::database)
 }
 
 async fn authorize_change(
@@ -1655,6 +2563,134 @@ mod tests {
     }
 
     #[test]
+    fn category_icon_upload_policy_accepts_only_png_or_svg_and_is_strictly_bounded() {
+        assert!(
+            validate_upload_policy(
+                Purpose::CategoryIcon,
+                "image/png",
+                1,
+                CATEGORY_ICON_MAX_BYTES as i64
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_upload_policy(
+                Purpose::CategoryIcon,
+                "image/svg+xml",
+                1,
+                CATEGORY_ICON_MAX_BYTES as i64
+            )
+            .is_ok()
+        );
+        for (content_type, size) in [
+            ("image/jpeg", 1),
+            ("image/png", 0),
+            ("image/png", CATEGORY_ICON_MAX_BYTES as i64 + 1),
+        ] {
+            assert!(
+                validate_upload_policy(
+                    Purpose::CategoryIcon,
+                    content_type,
+                    size,
+                    CATEGORY_ICON_MAX_BYTES as i64 + 1,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn category_icon_decoder_accepts_valid_transparency_and_rejects_bad_images() {
+        let valid = test_png(CATEGORY_ICON_DIMENSION, CATEGORY_ICON_DIMENSION);
+        let checksum = hex::encode(Sha256::digest(&valid));
+        let metadata = validated_category_icon_metadata(&valid, "image/png", &checksum).unwrap();
+        assert_eq!(metadata["format"], "png");
+        assert_eq!(metadata["width"], CATEGORY_ICON_DIMENSION);
+        assert_eq!(metadata["height"], CATEGORY_ICON_DIMENSION);
+        assert_eq!(metadata["animated"], false);
+        assert!(validated_category_icon_metadata(&valid, "image/png", &"0".repeat(64)).is_err());
+
+        let wrong_dimensions = test_png(64, CATEGORY_ICON_DIMENSION);
+        let wrong_checksum = hex::encode(Sha256::digest(&wrong_dimensions));
+        assert!(
+            validated_category_icon_metadata(&wrong_dimensions, "image/png", &wrong_checksum)
+                .is_err()
+        );
+
+        let truncated = &valid[..valid.len() - 4];
+        let truncated_checksum = hex::encode(Sha256::digest(truncated));
+        assert!(
+            validated_category_icon_metadata(truncated, "image/png", &truncated_checksum).is_err()
+        );
+
+        let mut animated = valid.clone();
+        let animation_chunk = test_png_chunk(b"acTL", &[0, 0, 0, 1, 0, 0, 0, 1]);
+        animated.splice(33..33, animation_chunk);
+        let animated_checksum = hex::encode(Sha256::digest(&animated));
+        assert_eq!(
+            validated_category_icon_metadata(&animated, "image/png", &animated_checksum),
+            Err("animated_png_not_supported")
+        );
+
+        let mut duplicate_header = valid.clone();
+        let ihdr = duplicate_header[8..33].to_vec();
+        let iend_offset = duplicate_header.len() - 12;
+        duplicate_header.splice(iend_offset..iend_offset, ihdr);
+        let duplicate_header_checksum = hex::encode(Sha256::digest(&duplicate_header));
+        assert!(
+            validated_category_icon_metadata(
+                &duplicate_header,
+                "image/png",
+                &duplicate_header_checksum
+            )
+            .is_err()
+        );
+
+        let mut invalid_iend_crc = valid.clone();
+        let last = invalid_iend_crc.len() - 1;
+        invalid_iend_crc[last] ^= 1;
+        let invalid_iend_checksum = hex::encode(Sha256::digest(&invalid_iend_crc));
+        assert_eq!(
+            validated_category_icon_metadata(
+                &invalid_iend_crc,
+                "image/png",
+                &invalid_iend_checksum
+            ),
+            Err("png_crc_invalid")
+        );
+    }
+
+    #[test]
+    fn category_svg_accepts_a_small_square_icon_and_rejects_active_content() {
+        let valid = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#34689c" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg>"##;
+        let checksum = hex::encode(Sha256::digest(valid));
+        let metadata = validated_category_icon_metadata(valid, "image/svg+xml", &checksum).unwrap();
+        assert_eq!(metadata["format"], "svg");
+        assert_eq!(metadata["sanitized"], true);
+
+        for invalid in [
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><script>alert(1)</script></svg>"#.as_slice(),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><image href="https://example.test/x"/></svg>"#.as_slice(),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 12"><path d="M0 0"/></svg>"#.as_slice(),
+            br#"<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"/>"#.as_slice(),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" onload="alert(1)"/>"#.as_slice(),
+        ] {
+            let checksum = hex::encode(Sha256::digest(invalid));
+            assert!(
+                validated_category_icon_metadata(invalid, "image/svg+xml", &checksum).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_body_accumulation_rejects_a_lying_content_length() {
+        let mut body = vec![0; 3];
+        assert!(append_bounded(&mut body, &[1, 2], 5).is_ok());
+        assert!(append_bounded(&mut body, &[3], 5).is_err());
+        assert_eq!(body.len(), 5);
+    }
+
+    #[test]
     fn upload_idempotency_key_is_required_and_bounded() {
         let mut headers = HeaderMap::new();
         assert!(required_idempotency_key(&headers).is_err());
@@ -1754,5 +2790,31 @@ mod tests {
             banned: false,
             team_banned: false,
         }
+    }
+
+    fn test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![0; width as usize * height as usize * 4])
+                .unwrap();
+        }
+        bytes
+    }
+
+    fn test_png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(data.len() + 12);
+        chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(data);
+        chunk.extend_from_slice(&crc.finalize().to_be_bytes());
+        chunk
     }
 }

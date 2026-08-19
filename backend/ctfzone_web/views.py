@@ -9,7 +9,6 @@ import hmac
 import json
 import secrets
 import unicodedata
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -30,7 +29,7 @@ from flask import (
 
 from .api import ApiClient, ApiUnavailable
 from .frontends import FrontendRegistry
-from .markdown import render_markdown
+from .markdown import render_html, render_markdown
 
 web = Blueprint("web", __name__)
 
@@ -73,7 +72,6 @@ _AUTH_ERRORS = {
 }
 
 _MISSING = object()
-
 
 def _api() -> ApiClient:
     return current_app.extensions["ctfzone_api"]
@@ -171,6 +169,110 @@ def _read_data(path: str, default: Any = None) -> tuple[int, Any]:
     return status, ApiClient.unwrap(payload, default)
 
 
+def _safe_page_endpoint(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 128:
+        return None
+    if value != value.casefold() or value.startswith("/") or value.endswith("/"):
+        return None
+    segments = value.split("/")
+    if any(
+        not segment
+        or not segment[0].isascii()
+        or not segment[0].isalnum()
+        or any(not (character.isascii() and (character.isalnum() or character in "_-")) for character in segment)
+        for segment in segments
+    ):
+        return None
+    return value
+
+
+def _normalize_navigation(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    navigation: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        endpoint = _safe_page_endpoint(raw.get("endpoint"))
+        label = raw.get("label")
+        page_id = raw.get("id")
+        if (
+            endpoint is None
+            or endpoint in seen
+            or not isinstance(label, str)
+            or not label.strip()
+            or len(label.encode("utf-8")) > 80
+            or any(unicodedata.category(character).startswith("C") for character in label)
+            or not isinstance(page_id, int)
+            or isinstance(page_id, bool)
+            or page_id < 1
+        ):
+            continue
+        system_key = raw.get("system_key")
+        if system_key not in {None, "challenges", "scoreboard"}:
+            continue
+        seen.add(endpoint)
+        navigation.append(
+            {
+                "id": page_id,
+                "label": label.strip(),
+                "endpoint": endpoint,
+                "href": f"/{endpoint}",
+                "system_key": system_key,
+            }
+        )
+    return navigation
+
+
+def _normalize_admin_page(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    page_id = value.get("id")
+    label = value.get("label")
+    endpoint = value.get("endpoint")
+    content = value.get("content")
+    page_type = value.get("page_type")
+    system_key = value.get("system_key")
+    visibility = value.get("visibility")
+    navigation_order = value.get("navigation_order")
+    revision = value.get("revision")
+    endpoint_valid = endpoint == "" if page_type == "home" else _safe_page_endpoint(endpoint) == endpoint
+    if (
+        not isinstance(page_id, int)
+        or isinstance(page_id, bool)
+        or page_id < 1
+        or not isinstance(label, str)
+        or not label.strip()
+        or len(label.encode("utf-8")) > 80
+        or not endpoint_valid
+        or not isinstance(content, str)
+        or len(content.encode("utf-8")) > 262_144
+        or page_type not in {"home", "system", "custom"}
+        or system_key not in {None, "home", "challenges", "scoreboard"}
+        or visibility not in {"public", "private", "invisible"}
+        or not isinstance(navigation_order, int)
+        or isinstance(navigation_order, bool)
+        or not 0 <= navigation_order <= 10_000
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        return None
+    return {
+        "id": page_id,
+        "label": label.strip(),
+        "endpoint": endpoint,
+        "href": "/" if endpoint == "" else f"/{endpoint}",
+        "content": content,
+        "page_type": page_type,
+        "system_key": system_key,
+        "visibility": visibility,
+        "navigation_order": navigation_order,
+        "revision": revision,
+    }
+
+
 def _normalize_bootstrap(data: Any, status: int = 200) -> dict[str, Any]:
     if status >= 500 or not isinstance(data, dict):
         data = {}
@@ -220,6 +322,7 @@ def _normalize_bootstrap(data: Any, status: int = 200) -> dict[str, Any]:
         session[_PLAYER_FRONTEND_SESSION_KEY] = player_frontend.identifier
     user = data.get("user") if isinstance(data.get("user"), dict) else None
     authenticated = bool(data.get("authenticated") and user and _session_id())
+    navigation = _normalize_navigation(data.get("navigation"))
 
     return {
         "available": status < 500,
@@ -228,6 +331,7 @@ def _normalize_bootstrap(data: Any, status: int = 200) -> dict[str, Any]:
         "csrf_token": _csrf_token(),
         "user": user,
         "site": site,
+        "navigation": navigation,
     }
 
 
@@ -241,9 +345,11 @@ def _context_from_bootstrap(
 ) -> dict[str, Any]:
     return {
         "page": page,
+        "page_endpoint": page,
         "bootstrap": bootstrap,
         "site": bootstrap["site"],
         "user": bootstrap["user"],
+        "navigation": bootstrap["navigation"],
         "csrf_token": bootstrap["csrf_token"],
         "storage_origin": current_app.config["OBJECT_STORAGE_ORIGIN"],
         **extra,
@@ -398,7 +504,7 @@ def _safe_destination(value: Any, fallback: str) -> str:
 def _auth_post(
     path: str,
     failure_endpoint: str,
-    fallback: str = "/challenges",
+    fallback: str = "/",
     *,
     destination_override: str | None = None,
 ) -> Response:
@@ -457,11 +563,71 @@ def healthz() -> Response:
 
 
 @web.get("/")
-def index() -> Response:
+def index() -> Response | tuple[str, int] | str:
     bootstrap = _bootstrap()
     if bootstrap["setup_required"]:
         return redirect(url_for("web.setup"), code=302)
-    return redirect(url_for("web.challenges"), code=302)
+    return _content_page("/api/v1/pages/root", "", bootstrap=bootstrap)
+
+
+def _normalize_content_page(value: Any, expected_endpoint: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    page_id = value.get("id")
+    label = value.get("label")
+    endpoint = value.get("endpoint")
+    content = value.get("content")
+    page_type = value.get("page_type")
+    system_key = value.get("system_key")
+    if (
+        not isinstance(page_id, int)
+        or isinstance(page_id, bool)
+        or page_id < 1
+        or not isinstance(label, str)
+        or not label.strip()
+        or len(label.encode("utf-8")) > 80
+        or any(unicodedata.category(character).startswith("C") for character in label)
+        or endpoint != expected_endpoint
+        or not isinstance(content, str)
+        or len(content.encode("utf-8")) > 262_144
+        or "\0" in content
+        or page_type not in {"home", "custom"}
+        or system_key not in {None, "home"}
+    ):
+        return None
+    return {
+        "id": page_id,
+        "label": label.strip(),
+        "endpoint": endpoint,
+        "content_html": render_html(content),
+        "page_type": page_type,
+    }
+
+
+def _content_page(
+    api_path: str,
+    endpoint: str,
+    *,
+    bootstrap: dict[str, Any] | None = None,
+) -> Response | tuple[str, int] | str:
+    bootstrap = bootstrap or _bootstrap()
+    status, value = _read_data(api_path, None)
+    if status == 403 and not bootstrap["authenticated"]:
+        return redirect(url_for("web.login", next=request.path), code=302)
+    if status in {400, 403, 404}:
+        abort(404)
+    page_data = _normalize_content_page(value, endpoint) if status < 400 else None
+    context = _context_from_bootstrap(endpoint, bootstrap)
+    context.update(
+        content_page=page_data,
+        page_error=(
+            "This page is temporarily unavailable."
+            if status >= 500 or page_data is None
+            else None
+        ),
+    )
+    rendered = _render_player("page.html", **context)
+    return (rendered, 503) if context["page_error"] else rendered
 
 
 @web.route("/login", methods=["GET", "POST"])
@@ -569,7 +735,7 @@ def logout() -> Response:
         except ApiUnavailable:
             pass
     _clear_session()
-    return redirect(url_for("web.challenges"), code=303)
+    return redirect(url_for("web.index"), code=303)
 
 
 def _tag_values(challenge: dict[str, Any]) -> list[str]:
@@ -581,19 +747,80 @@ def _tag_values(challenge: dict[str, Any]) -> list[str]:
     return values
 
 
-def _category_icon(category: str) -> str:
-    lowered = category.lower()
-    if any(value in lowered for value in ("web", "http")):
-        return "globe"
-    if any(value in lowered for value in ("pwn", "binary", "exploit")):
-        return "skull"
-    if "crypto" in lowered:
-        return "lock"
-    if any(value in lowered for value in ("rev", "reverse")):
-        return "bug"
-    if any(value in lowered for value in ("forensic", "network")):
-        return "search"
-    return "puzzle"
+def _uuid_string(value: Any) -> str | None:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+_CATEGORY_LOGO_KEYS = frozenset(
+    {"web", "pwn", "crypto", "rev", "misc", "coding", "forensics"}
+)
+
+
+def _category_logo_key(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in _CATEGORY_LOGO_KEYS else None
+
+
+def _category_logo_color(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) != 7 or not value.startswith("#"):
+        return None
+    try:
+        int(value[1:], 16)
+    except ValueError:
+        return None
+    return value.lower()
+
+
+def _category_icon_url(category_id: Any, object_id: Any) -> str | None:
+    normalized_object_id = _uuid_string(object_id)
+    if (
+        not isinstance(category_id, int)
+        or isinstance(category_id, bool)
+        or category_id < 1
+        or normalized_object_id is None
+    ):
+        return None
+    return url_for(
+        "web.category_icon",
+        category_id=category_id,
+        object_id=normalized_object_id,
+    )
+
+
+def _normalize_categories(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    categories: list[dict[str, Any]] = []
+    for raw in value:
+        if (
+            not isinstance(raw, dict)
+            or not isinstance(raw.get("id"), int)
+            or isinstance(raw.get("id"), bool)
+            or not isinstance(raw.get("name"), str)
+        ):
+            continue
+        name = raw["name"]
+        challenge_count = raw.get("challenge_count")
+        icon_object_id = _uuid_string(raw.get("icon_object_id"))
+        category = dict(raw)
+        category.update(
+            name=name,
+            logo_key=_category_logo_key(raw.get("logo_key")),
+            logo_color=_category_logo_color(raw.get("logo_color")),
+            icon_object_id=icon_object_id,
+            icon_url=_category_icon_url(raw["id"], icon_object_id),
+            challenge_count=(
+                challenge_count
+                if isinstance(challenge_count, int)
+                and not isinstance(challenge_count, bool)
+                and challenge_count >= 0
+                else 0
+            ),
+        )
+        categories.append(category)
+    return categories
 
 
 def _decorate_challenges(value: Any) -> list[dict[str, Any]]:
@@ -607,18 +834,37 @@ def _decorate_challenges(value: Any) -> list[dict[str, Any]]:
         tags = _tag_values(challenge)
         tag_keys = {tag.casefold() for tag in tags}
         category = str(challenge.get("category") or "misc")
+        category_id = challenge.get("category_id")
+        category_key = (
+            f"id:{category_id}"
+            if isinstance(category_id, int)
+            and not isinstance(category_id, bool)
+            and category_id > 0
+            else f"name:{category.casefold()}"
+        )
         difficulty = next(
             (tag for tag in tags if tag.casefold() in {"easy", "medium", "hard", "insane"}),
             None,
         )
         challenge.update(
             category=category,
-            category_key=category.casefold(),
-            category_icon=_category_icon(category),
+            category_key=category_key,
+            category_logo_key=_category_logo_key(
+                challenge.get("category_logo_key")
+            ),
+            category_logo_color=_category_logo_color(
+                challenge.get("category_logo_color")
+            ),
+            category_icon_object_id=_uuid_string(
+                challenge.get("category_icon_object_id")
+            ),
             tags=tags,
             tag_keys=" ".join(sorted(tag_keys)),
             difficulty=difficulty,
             runtime_available=bool(challenge.get("runtime_available") or "instance" in tag_keys),
+        )
+        challenge["category_icon_url"] = _category_icon_url(
+            category_id, challenge["category_icon_object_id"]
         )
         challenges.append(challenge)
     return challenges
@@ -628,7 +874,18 @@ def _decorate_detail(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     challenge = dict(value)
-    challenge["category_icon"] = _category_icon(str(challenge.get("category") or "misc"))
+    challenge["category_logo_key"] = _category_logo_key(
+        challenge.get("category_logo_key")
+    )
+    challenge["category_logo_color"] = _category_logo_color(
+        challenge.get("category_logo_color")
+    )
+    challenge["category_icon_object_id"] = _uuid_string(
+        challenge.get("category_icon_object_id")
+    )
+    challenge["category_icon_url"] = _category_icon_url(
+        challenge.get("category_id"), challenge["category_icon_object_id"]
+    )
     tags = _tag_values(challenge)
     challenge["tags"] = tags
     challenge["difficulty"] = next(
@@ -685,6 +942,11 @@ def challenges() -> str:
         aggregate = {}
     else:
         bootstrap = _normalize_bootstrap(aggregate.get("bootstrap"), status)
+    if status in {401, 403} and not bootstrap.get("setup_required"):
+        visibility = bootstrap.get("site", {}).get("challenge_visibility")
+        if visibility == "private" and not bootstrap.get("authenticated"):
+            return redirect(url_for("web.login", next=request.full_path.rstrip("?")))
+        abort(404)
     context = _context_from_bootstrap("challenges", bootstrap)
     challenge_list = _decorate_challenges(aggregate.get("challenges", []))
     selected = _decorate_detail(aggregate.get("selected"))
@@ -696,11 +958,25 @@ def challenges() -> str:
         else None
     )
 
-    counts = Counter(challenge["category"] for challenge in challenge_list)
-    categories = [
-        {"name": name, "count": count, "icon": _category_icon(name)}
-        for name, count in sorted(counts.items(), key=lambda item: item[0].casefold())
-    ]
+    category_index: dict[str, dict[str, Any]] = {}
+    for challenge in challenge_list:
+        key = challenge["category_key"]
+        category = category_index.setdefault(
+            key,
+            {
+                "key": key,
+                "name": challenge["category"],
+                "count": 0,
+                "logo_key": challenge["category_logo_key"],
+                "logo_color": challenge["category_logo_color"],
+                "icon_object_id": challenge["category_icon_object_id"],
+                "icon_url": challenge["category_icon_url"],
+            },
+        )
+        category["count"] += 1
+    categories = sorted(
+        category_index.values(), key=lambda category: category["name"].casefold()
+    )
     context.update(
         challenges=challenge_list,
         categories=categories,
@@ -748,6 +1024,12 @@ def _response_message(payload: Any, status: int) -> str:
 def scoreboard() -> str:
     context = _page_context("scoreboard")
     status, standings = _read_data("/api/v1/scoreboard", [])
+    if status in {401, 403} and not context["bootstrap"].get("setup_required"):
+        bootstrap = context["bootstrap"]
+        visibility = bootstrap.get("site", {}).get("score_visibility")
+        if visibility == "private" and not bootstrap.get("authenticated"):
+            return redirect(url_for("web.login", next=request.path))
+        abort(404)
     context.update(standings=standings if isinstance(standings, list) else [], api_error=status >= 500)
     return _render_player("scoreboard.html", **context)
 
@@ -866,23 +1148,15 @@ def team_profile(team_id: int) -> Response | tuple[str, int] | str:
     return _profile_page("team", team_id)
 
 
-@web.get("/rules")
-def rules() -> str:
-    context = _page_context("rules")
-    status, value = _read_data("/api/v1/pages/by-route/rules", None)
-    page_data = value if status < 400 and isinstance(value, dict) else None
-    raw = page_data.get("content") if page_data else None
-    if not raw:
-        raw = (
-            "# Rules\n\n"
-            "- Only attack systems explicitly listed as challenge targets.\n"
-            "- Do not disrupt the platform, other participants, or shared infrastructure.\n"
-            "- Do not share flags or solutions while the event is running.\n"
-            "- Report platform issues privately to the organizers.\n\n"
-            "Good luck, have fun, and leave the infrastructure better than you found it."
-        )
-    context.update(rules_title=(page_data or {}).get("title") or "Rules", rules_html=render_markdown(raw))
-    return _render_player("rules.html", **context)
+@web.get("/<path:endpoint>")
+def custom_page(endpoint: str) -> Response | tuple[str, int] | str:
+    endpoint = _safe_page_endpoint(endpoint)
+    if endpoint is None:
+        abort(404)
+    return _content_page(
+        f"/api/v1/pages/by-route/{endpoint}",
+        endpoint,
+    )
 
 
 def _admin_context(module: str, title: str) -> tuple[dict[str, Any] | None, Response | tuple[str, int] | None]:
@@ -1239,6 +1513,32 @@ def admin_challenges() -> Response | tuple[str, int] | str:
     return render_template("admin/challenges.html", **context)
 
 
+@web.get("/admin/categories")
+def admin_categories() -> Response | tuple[str, int] | str:
+    context, gate = _admin_context("categories", "Categories")
+    if gate:
+        return gate
+    data, error = _admin_read("/api/v1/admin/challenge-categories", [])
+    context.update(
+        categories=_normalize_categories(data),
+        module_error=error,
+    )
+    return render_template("admin/categories.html", **context)
+
+
+@web.get("/admin/pages")
+def admin_pages() -> Response | tuple[str, int] | str:
+    context, gate = _admin_context("pages", "Pages")
+    if gate:
+        return gate
+    data, error = _admin_read("/api/v1/pages", [])
+    pages = []
+    if isinstance(data, list):
+        pages = [page for value in data if (page := _normalize_admin_page(value))]
+    context.update(pages=pages, module_error=error)
+    return render_template("admin/pages.html", **context)
+
+
 @web.get("/admin/challenges/new")
 def admin_challenge_new() -> Response | tuple[str, int] | str:
     context, gate = _admin_context("challenges", "New challenge")
@@ -1250,17 +1550,10 @@ def admin_challenge_new() -> Response | tuple[str, int] | str:
     runtime_gate_data, runtime_gate_error = _admin_read(
         "/api/v1/admin/runtime/settings/private-challenges", {}
     )
-    categories = category_data if isinstance(category_data, list) else []
     context.update(
         challenge=None,
         form_mode="create",
-        categories=[
-            category
-            for category in categories
-            if isinstance(category, dict)
-            and isinstance(category.get("id"), int)
-            and isinstance(category.get("name"), str)
-        ],
+        categories=_normalize_categories(category_data),
         category_error=category_error,
         private_challenge_gate_enabled=bool(
             isinstance(runtime_gate_data, dict)
@@ -1294,17 +1587,10 @@ def admin_challenge_edit(challenge_id: int) -> Response | tuple[str, int] | str:
         runtime_gate_data, runtime_gate_error = _admin_read(
             "/api/v1/admin/runtime/settings/private-challenges", {}
         )
-    categories = category_data if isinstance(category_data, list) else []
     context.update(
         challenge=challenge,
         form_mode="edit",
-        categories=[
-            category
-            for category in categories
-            if isinstance(category, dict)
-            and isinstance(category.get("id"), int)
-            and isinstance(category.get("name"), str)
-        ],
+        categories=_normalize_categories(category_data),
         category_error=category_error,
         private_challenge_gate_enabled=bool(
             isinstance(runtime_gate_data, dict)
@@ -1771,6 +2057,28 @@ def _validated_storage_url(value: Any) -> str | None:
     ):
         return None
     return value
+
+
+@web.get("/category-icons/<int:category_id>/<uuid:object_id>")
+def category_icon(category_id: int, object_id: UUID) -> Response:
+    if category_id < 1:
+        abort(404)
+    status, grant = _read_data(
+        f"/api/v1/challenge-categories/{category_id}/icon/{object_id}", {}
+    )
+    if status in {401, 403, 404}:
+        abort(404)
+    if status >= 400:
+        return Response("Category icon is temporarily unavailable", status=502)
+    if not isinstance(grant, dict) or grant.get("method") != "GET":
+        return Response("Category icon authorization is invalid", status=502)
+    destination = _validated_storage_url(grant.get("url"))
+    if destination is None:
+        return Response("Category icon authorization is invalid", status=502)
+    outgoing = redirect(destination, code=303)
+    outgoing.headers["Cache-Control"] = "private, no-store"
+    outgoing.headers["Referrer-Policy"] = "no-referrer"
+    return outgoing
 
 
 @web.get("/downloads/<uuid:object_id>")

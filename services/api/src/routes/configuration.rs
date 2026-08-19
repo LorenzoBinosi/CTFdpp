@@ -201,24 +201,6 @@ const VISIBILITY: &[OptionDefinition] = &[
         label: "Administrators",
     },
 ];
-const SCORE_VISIBILITY: &[OptionDefinition] = &[
-    OptionDefinition {
-        value: "public",
-        label: "Public",
-    },
-    OptionDefinition {
-        value: "private",
-        label: "Authenticated users",
-    },
-    OptionDefinition {
-        value: "admins",
-        label: "Administrators",
-    },
-    OptionDefinition {
-        value: "hidden",
-        label: "Hidden",
-    },
-];
 const REGISTRATION_VISIBILITY: &[OptionDefinition] = &[
     OptionDefinition {
         value: "public",
@@ -503,19 +485,6 @@ const SETTINGS: &[SettingDefinition] = &[
     },
     SettingDefinition {
         section: "visibility",
-        key: "score_visibility",
-        label: "Score visibility",
-        help: "Who may view scores and the scoreboard.",
-        kind: SettingKind::Select(SCORE_VISIBILITY),
-        default: "public",
-        required: true,
-        read_only: false,
-        warning: None,
-        danger: None,
-        depends_on: None,
-    },
-    SettingDefinition {
-        section: "visibility",
         key: "account_visibility",
         label: "Account visibility",
         help: "Who may view participant profiles and account data.",
@@ -704,19 +673,6 @@ const SETTINGS: &[SettingDefinition] = &[
         warning: Some(
             "When enabled, unverified participants cannot access challenges. Each user requests and completes verification from their own profile.",
         ),
-        danger: None,
-        depends_on: None,
-    },
-    SettingDefinition {
-        section: "visibility",
-        key: "challenge_visibility",
-        label: "Challenge visibility",
-        help: "Who may view challenges.",
-        kind: SettingKind::Select(VISIBILITY),
-        default: "private",
-        required: true,
-        read_only: false,
-        warning: None,
         danger: None,
         depends_on: None,
     },
@@ -1540,7 +1496,6 @@ mod tests {
             "freeze",
             "paused",
             "view_after_ctf",
-            "score_visibility",
             "account_visibility",
             "registration_visibility",
             "registration_access_mode",
@@ -1555,7 +1510,6 @@ mod tests {
             "num_teams",
             "team_disbanding",
             "verify_emails",
-            "challenge_visibility",
             "incorrect_submissions_per_min",
             "max_attempts_behavior",
             "max_attempts_timeout",

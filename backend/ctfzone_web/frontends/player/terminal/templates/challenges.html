@@ -1,4 +1,5 @@
 {% extends player_template('base.html') %}
+{% import player_template('partials/category_logo.html') as category_logos %}
 {% block title %}Challenges · {{ site.name }}{% endblock %}
 {% block content %}
   <div class="challenge-mobile-toolbar">
@@ -22,8 +23,11 @@
           <span>All</span><strong>{{ challenges | length }}</strong>
         </button>
         {% for category in categories %}
-          <button class="category-link" type="button" data-category="{{ category.name | lower }}">
-            <svg><use href="#icon-{{ category.icon }}"></use></svg>
+          <button class="category-link{% if not category.logo_key and not category.icon_url %} no-category-logo{% endif %}" type="button" data-category="{{ category.key }}">
+            {% if category.logo_key or category.icon_url %}<span class="category-filter-icon category-image-marker" aria-hidden="true">
+              <span data-category-icon-fallback>{% if category.logo_key %}{{ category_logos.render(category.logo_key, category.logo_color or '#34689c') }}{% endif %}</span>
+              {% if category.icon_url %}<img src="{{ category.icon_url }}" width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-icon-image>{% endif %}
+            </span>{% endif %}
             <span>{{ category.name }}</span><strong>{{ category.count }}</strong>
           </button>
         {% endfor %}
@@ -47,7 +51,6 @@
     <section class="challenge-list-pane" aria-label="Challenges">
       <div class="list-heading">
         <span>CHALLENGE</span>
-        <span>CAT</span>
       </div>
       {% if api_error %}
         <div class="empty-state compact">
@@ -70,19 +73,17 @@
               data-challenge-id="{{ challenge.id }}"
               data-name="{{ challenge.name | lower }}"
               data-category="{{ challenge.category_key }}"
+              data-category-name="{{ challenge.category | lower }}"
               data-tags="{{ challenge.tag_keys }}"
               data-solved="{{ 'true' if challenge.solved_by_me else 'false' }}"
               data-instance="{{ 'true' if challenge.runtime_available else 'false' }}"
             >
-              <span class="challenge-icon {{ challenge.category_icon }}">
-                <svg><use href="#icon-{{ challenge.category_icon }}"></use></svg>
-              </span>
               <span class="challenge-row-main">
                 <strong>{{ challenge.name }}</strong>
                 <small>{{ challenge.value }} pts · {{ challenge.solves if challenge.solves is not none else '—' }} solves</small>
               </span>
               {% if challenge.difficulty %}<span class="difficulty difficulty-{{ challenge.difficulty | lower }}">{{ challenge.difficulty }}</span>{% endif %}
-              <span class="challenge-category">{{ challenge.category }}</span>
+              <span class="challenge-category category-image-marker" role="img" aria-label="Category: {{ challenge.category }}" title="{{ challenge.category }}"><span data-category-icon-fallback>{% if challenge.category_logo_key %}{{ category_logos.render(challenge.category_logo_key, challenge.category_logo_color or '#34689c') }}{% else %}{{ challenge.category }}{% endif %}</span>{% if challenge.category_icon_url %}<img src="{{ challenge.category_icon_url }}" width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-icon-image>{% endif %}</span>
               <svg class="row-chevron"><use href="#icon-chevron"></use></svg>
             </a>
           {% endfor %}

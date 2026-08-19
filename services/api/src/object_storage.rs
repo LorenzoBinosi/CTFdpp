@@ -129,9 +129,34 @@ impl ObjectStorage {
         action.sign(self.presign_ttl).into()
     }
 
+    pub(crate) fn inline_image_url(&self, object_key: &str, content_type: &str) -> String {
+        debug_assert!(matches!(content_type, "image/png" | "image/svg+xml"));
+        let mut action = self
+            .public_bucket
+            .get_object(Some(&self.credentials), object_key);
+        action
+            .query_mut()
+            .insert("response-content-disposition", "inline".to_owned());
+        action
+            .query_mut()
+            .insert("response-content-type", content_type.to_owned());
+        action.query_mut().insert(
+            "response-cache-control",
+            "public, max-age=31536000, immutable".to_owned(),
+        );
+        action.sign(self.presign_ttl).into()
+    }
+
     pub(crate) fn internal_head_url(&self, object_key: &str) -> String {
         self.internal_bucket
             .head_object(Some(&self.credentials), object_key)
+            .sign(INTERNAL_REQUEST_TTL)
+            .into()
+    }
+
+    pub(crate) fn internal_get_url(&self, object_key: &str) -> String {
+        self.internal_bucket
+            .get_object(Some(&self.credentials), object_key)
             .sign(INTERNAL_REQUEST_TTL)
             .into()
     }
@@ -234,5 +259,14 @@ mod tests {
         let url = storage().get_url("result/abc", "x\"; inline\r\nX-Evil: 1", "text/plain");
         assert!(!url.contains("X-Evil"));
         assert!(url.contains("response-content-disposition="));
+    }
+
+    #[test]
+    fn category_icon_grant_is_inline_and_immutable() {
+        let url = storage().inline_image_url("objects/category_icon/icon.svg", "image/svg+xml");
+        assert!(url.contains("response-content-disposition=inline"));
+        assert!(url.contains("response-content-type=image%2Fsvg%2Bxml"));
+        assert!(url.contains("immutable"));
+        assert!(!url.contains("attachment"));
     }
 }

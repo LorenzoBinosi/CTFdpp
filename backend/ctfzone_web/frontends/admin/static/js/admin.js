@@ -194,6 +194,68 @@ function asNumber(form, name, fallback = 0) {
   return value === "" || value === undefined ? fallback : Number(value);
 }
 
+const categoryLogoKeys = new Set([
+  "web", "pwn", "crypto", "rev", "misc", "coding", "forensics",
+]);
+
+function normalizeCategoryLogoKey(value) {
+  const key = typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+  return categoryLogoKeys.has(key) ? key : "";
+}
+
+function normalizeCategoryLogoColor(value) {
+  const color = typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+  return /^#[0-9a-f]{6}$/.test(color) ? color : "#34689c";
+}
+
+function syncCategoryFallback(container, logoKey, name, logoColor = "#34689c") {
+  const fallback = container?.querySelector("[data-category-icon-fallback]");
+  if (!fallback) return null;
+  const key = normalizeCategoryLogoKey(logoKey);
+  const nameNode = fallback.querySelector("[data-category-preview-name]");
+  if (nameNode) {
+    nameNode.textContent = name;
+    nameNode.hidden = Boolean(key);
+  }
+  for (const logo of fallback.querySelectorAll("[data-category-builtin-logo]")) {
+    logo.hidden = logo.dataset.categoryBuiltinLogo !== key;
+    logo.querySelector("svg")?.setAttribute("stroke", normalizeCategoryLogoColor(logoColor));
+  }
+  return fallback;
+}
+
+function prepareCategoryImage(image, fallback, source = image?.getAttribute("src") || "") {
+  const marker = image?.closest(".category-image-marker");
+  if (!image) return;
+  image.hidden = true;
+  if (fallback) fallback.hidden = false;
+  marker?.classList.remove("icon-loaded");
+  image.onload = () => {
+    if (image.naturalWidth < 1 || image.naturalHeight < 1) return;
+    image.hidden = false;
+    if (fallback) fallback.hidden = true;
+    marker?.classList.add("icon-loaded");
+  };
+  image.onerror = () => {
+    image.hidden = true;
+    if (fallback) fallback.hidden = false;
+    marker?.classList.remove("icon-loaded");
+  };
+  if (!source) {
+    image.removeAttribute("src");
+    return;
+  }
+  if (image.getAttribute("src") !== source) image.src = source;
+  else if (image.complete && image.naturalWidth) image.onload();
+}
+
+for (const image of document.querySelectorAll("[data-category-icon-image]")) {
+  prepareCategoryImage(
+    image,
+    image.closest(".category-image-marker")?.querySelector("[data-category-icon-fallback]"),
+  );
+}
+
 async function uploadChallengeFiles(input, status, challengeId) {
   const files = Array.from(input?.files || []);
   if (!files.length) return 0;
@@ -231,8 +293,35 @@ if (challengeForm) {
   const categorySelect = challengeForm.querySelector("[data-category-select]");
   const categoryHelp = challengeForm.querySelector("[data-category-help]");
   const categoryError = categoryDialog?.querySelector("[data-category-dialog-error]");
+  const categorySelectionPreview = challengeForm.querySelector("[data-category-selection-preview]");
+  const categorySelectionImage = challengeForm.querySelector("[data-category-selection-image]");
+  const categorySelectionFallback = challengeForm.querySelector("[data-category-selection-preview] [data-category-icon-fallback]");
   const categoryCreateHeaders = new Map();
   let categoryReturnFocus = null;
+
+  const syncCategorySelectionPreview = () => {
+    const option = categorySelect?.selectedOptions?.[0];
+    const hasCategory = Boolean(option?.value);
+    if (categorySelectionPreview) categorySelectionPreview.hidden = !hasCategory;
+    if (!hasCategory) return;
+    categorySelectionPreview?.setAttribute(
+      "aria-label",
+      `Player marker for ${option.textContent.trim()}`,
+    );
+    syncCategoryFallback(
+      categorySelectionPreview,
+      option.dataset.categoryLogoKey,
+      option.textContent.trim(),
+      option.dataset.categoryLogoColor,
+    );
+    prepareCategoryImage(
+      categorySelectionImage,
+      categorySelectionFallback,
+      option.dataset.categoryIconUrl || "",
+    );
+  };
+  categorySelect?.addEventListener("change", syncCategorySelectionPreview);
+  syncCategorySelectionPreview();
 
   const closeCategoryDialog = () => {
     if (!categoryDialog) return;
@@ -290,6 +379,9 @@ if (challengeForm) {
       }
       if (option && categorySelect) {
         option.textContent = category.name;
+        option.dataset.categoryIconUrl = "";
+        option.dataset.categoryLogoKey = normalizeCategoryLogoKey(category.logo_key);
+        option.dataset.categoryLogoColor = normalizeCategoryLogoColor(category.logo_color);
         categorySelect.value = String(category.id);
         categorySelect.dispatchEvent(new Event("change", { bubbles: true }));
       }
@@ -842,6 +934,403 @@ if (challengeForm) {
       setBusy(event.currentTarget, false);
     }
   });
+}
+
+const categoryCatalog = document.querySelector("[data-category-catalog]");
+if (categoryCatalog) {
+  const createRequestHeaders = new WeakMap();
+  const validatedIconFiles = new WeakMap();
+  const categoryObjectIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  async function validateCategoryIcon(input) {
+    const file = input?.files?.[0];
+    input?.setCustomValidity("");
+    if (!file) {
+      if (input) validatedIconFiles.delete(input);
+      return null;
+    }
+    if (validatedIconFiles.get(input) === file) return file;
+    if (file.type !== "image/png" && file.type !== "image/svg+xml") {
+      input.setCustomValidity("Choose a PNG or SVG image.");
+      throw new Error("Custom category logos must be PNG or SVG images.");
+    }
+    if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > 256 * 1024) {
+      input.setCustomValidity("Choose an image no larger than 256 KiB.");
+      throw new Error("Custom category logos must be no larger than 256 KiB.");
+    }
+    if (file.type === "image/svg+xml") {
+      let documentRoot;
+      try {
+        documentRoot = new DOMParser().parseFromString(await file.text(), "image/svg+xml");
+      } catch (_error) {
+        documentRoot = null;
+      }
+      const svg = documentRoot?.documentElement;
+      const viewBox = svg?.getAttribute("viewBox")?.trim().split(/[\s,]+/).map(Number) || [];
+      const safeElements = new Set([
+        "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect",
+      ]);
+      const unsafeNode = svg && [svg, ...svg.querySelectorAll("*")].some(node =>
+        node.namespaceURI !== "http://www.w3.org/2000/svg"
+        || !safeElements.has(node.localName)
+        || Array.from(node.attributes).some(attribute =>
+          attribute.name.toLocaleLowerCase().startsWith("on")
+          || ["href", "style", "src"].includes(attribute.localName.toLocaleLowerCase())
+          || /(?:url\s*\(|javascript:|data:)/i.test(attribute.value)
+        ));
+      if (!svg || svg.localName !== "svg" || documentRoot.querySelector("parsererror")
+          || viewBox.length !== 4 || !viewBox.every(Number.isFinite)
+          || viewBox[2] <= 0 || viewBox[2] !== viewBox[3] || unsafeNode) {
+        input.setCustomValidity("Choose a valid SVG with a square viewBox.");
+        throw new Error("Custom SVG logos must have a square viewBox; unsafe SVG content is rejected by the server.");
+      }
+      validatedIconFiles.set(input, file);
+      return file;
+    }
+    if (typeof globalThis.createImageBitmap !== "function") {
+      input.setCustomValidity("This browser cannot verify image dimensions.");
+      throw new Error("This browser cannot verify custom PNG dimensions.");
+    }
+    let bitmap;
+    try {
+      bitmap = await globalThis.createImageBitmap(file);
+      if (bitmap.width !== 128 || bitmap.height !== 128) {
+        input.setCustomValidity("Choose a PNG that is exactly 128 × 128 pixels.");
+        throw new Error("Custom PNG logos must be exactly 128 × 128 pixels.");
+      }
+    } catch (error) {
+      if (!input.validationMessage) input.setCustomValidity("Choose a valid PNG image.");
+      throw error instanceof Error ? error : new Error("The custom category logo could not be read.");
+    } finally {
+      bitmap?.close();
+    }
+    validatedIconFiles.set(input, file);
+    return file;
+  }
+
+  function categoryIconDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => {
+        if (typeof reader.result === "string"
+            && (reader.result.startsWith("data:image/png;")
+              || reader.result.startsWith("data:image/svg+xml;"))) {
+          resolve(reader.result);
+        } else {
+          reject(new Error("The custom logo preview could not be prepared."));
+        }
+      }, { once: true });
+      reader.addEventListener("error", () => {
+        reject(new Error("The custom logo preview could not be read."));
+      }, { once: true });
+      reader.readAsDataURL(file);
+    });
+  }
+
+  const syncCategoryEditorPreview = form => {
+    const name = form.elements.name.value.trim() || "Category name";
+    const preview = form.querySelector("[data-category-preview]");
+    const markerMode = form.querySelector('input[name="marker_mode"]:checked')?.value || "name";
+    const logoKey = normalizeCategoryLogoKey(markerMode);
+    const logoColor = normalizeCategoryLogoColor(form.elements.logo_color?.value);
+    const custom = markerMode === "custom";
+    const colorFields = form.querySelector("[data-category-logo-color-fields]");
+    const customFields = form.querySelector("[data-category-custom-logo-fields]");
+    const iconInput = form.querySelector("[data-category-icon-file]");
+    const uploadPreview = form.querySelector("[data-category-upload-preview]");
+    const existingIcons = Array.from(preview?.querySelectorAll("[data-category-icon-image]") || []);
+    if (colorFields) colorFields.hidden = !logoKey;
+    if (form.elements.logo_color) form.elements.logo_color.disabled = !logoKey;
+    if (customFields) customFields.hidden = !custom;
+    if (iconInput) iconInput.disabled = !custom || iconInput.dataset.storageEnabled !== "true";
+    preview?.setAttribute("aria-label", `Category marker preview for ${name}`);
+    const fallback = syncCategoryFallback(preview, logoKey, name, logoColor);
+    for (const svg of form.querySelectorAll("[data-category-logo-picker] svg")) {
+      svg.setAttribute("stroke", logoColor);
+    }
+    if (!custom) {
+      if (uploadPreview) uploadPreview.hidden = true;
+      for (const existing of existingIcons) {
+        existing.onload = null;
+        existing.hidden = true;
+      }
+      if (fallback) fallback.hidden = false;
+    } else if (iconInput?.files?.length && uploadPreview?.getAttribute("src")) {
+      uploadPreview.hidden = false;
+      for (const existing of existingIcons) existing.hidden = true;
+      if (fallback) fallback.hidden = true;
+    } else if (!iconInput?.files?.length && uploadPreview) {
+      uploadPreview.hidden = true;
+      for (const existing of existingIcons) prepareCategoryImage(existing, fallback);
+    }
+  };
+
+  for (const form of document.querySelectorAll("[data-category-form]")) {
+    const iconInput = form.querySelector("[data-category-icon-file]");
+    const uploadPreview = form.querySelector("[data-category-upload-preview]");
+    const preview = form.querySelector("[data-category-preview]");
+    const previewFallback = form.querySelector("[data-category-icon-fallback]");
+    let previewGeneration = 0;
+    form.querySelector("[data-category-name]")?.addEventListener("input", () => syncCategoryEditorPreview(form));
+    for (const choice of form.querySelectorAll('input[name="marker_mode"]')) {
+      choice.addEventListener("change", () => syncCategoryEditorPreview(form));
+    }
+    form.elements.logo_color?.addEventListener("input", () => syncCategoryEditorPreview(form));
+    iconInput?.addEventListener("change", async () => {
+      const generation = ++previewGeneration;
+      if (uploadPreview) uploadPreview.hidden = true;
+      const errorRegion = form.querySelector("[data-category-form-error]");
+      if (errorRegion) errorRegion.textContent = "";
+      try {
+        const file = await validateCategoryIcon(iconInput);
+        if (generation !== previewGeneration) return;
+        if (!file) {
+          for (const existing of preview?.querySelectorAll("[data-category-icon-image]") || []) {
+            prepareCategoryImage(existing, previewFallback);
+          }
+          if (!preview?.querySelector("[data-category-icon-image]") && previewFallback) {
+            previewFallback.hidden = false;
+          }
+          return;
+        }
+        if (!uploadPreview) return;
+        const previewDataUrl = await categoryIconDataUrl(file);
+        if (generation !== previewGeneration) return;
+        uploadPreview.src = previewDataUrl;
+        uploadPreview.hidden = false;
+        if (previewFallback) previewFallback.hidden = true;
+        for (const existing of preview?.querySelectorAll("[data-category-icon-image]") || []) {
+          existing.hidden = true;
+        }
+      } catch (error) {
+        if (generation !== previewGeneration) return;
+        const existingIcons = Array.from(preview?.querySelectorAll("[data-category-icon-image]") || []);
+        if (existingIcons.length) {
+          for (const existing of existingIcons) prepareCategoryImage(existing, previewFallback);
+        } else if (previewFallback) {
+          previewFallback.hidden = false;
+        }
+        if (errorRegion) errorRegion.textContent = error.message || "The custom category logo is invalid.";
+      }
+    });
+    syncCategoryEditorPreview(form);
+
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const markerMode = form.querySelector('input[name="marker_mode"]:checked')?.value || "name";
+      const logoKey = normalizeCategoryLogoKey(markerMode);
+      const custom = markerMode === "custom";
+      let iconFile;
+      if (custom) {
+        try {
+          iconFile = await validateCategoryIcon(iconInput);
+        } catch (error) {
+          form.querySelector("[data-category-form-error]").textContent = error.message;
+          iconInput?.reportValidity();
+          return;
+        }
+        if (!iconFile && !categoryObjectIdPattern.test(form.dataset.categoryIconObjectId || "")) {
+          form.querySelector("[data-category-form-error]").textContent = "Choose a PNG or SVG file for the custom marker.";
+          iconInput?.setCustomValidity("Choose a PNG or SVG file.");
+          iconInput?.reportValidity();
+          return;
+        }
+      }
+      if (!form.reportValidity()) return;
+      const errorRegion = form.querySelector("[data-category-form-error]");
+      const submit = form.querySelector('button[type="submit"]');
+      const mode = form.dataset.categoryMode;
+      const categoryId = form.dataset.categoryId;
+      if (errorRegion) errorRegion.textContent = "";
+      if (mode === "create" && !createRequestHeaders.has(form)) {
+        createRequestHeaders.set(form, idempotencyHeaders());
+      }
+      setBusy(submit, true, mode === "create" ? "Creating…" : "Saving…");
+      try {
+        const result = await apiRequest(
+          mode === "create"
+            ? "/api/v1/admin/challenge-categories"
+            : `/api/v1/admin/challenge-categories/${categoryId}`,
+          {
+            method: mode === "create" ? "POST" : "PATCH",
+            headers: mode === "create" ? createRequestHeaders.get(form) : undefined,
+            body: {
+              name: form.elements.name.value.trim(),
+              logo_key: logoKey || null,
+              logo_color: logoKey
+                ? normalizeCategoryLogoColor(form.elements.logo_color?.value)
+                : null,
+            },
+          },
+        );
+        const category = result.data;
+        const savedCategoryId = Number(category?.id || categoryId);
+        if (!Number.isSafeInteger(savedCategoryId) || savedCategoryId < 1) {
+          throw new Error("The category service returned an invalid identifier.");
+        }
+        const label = category?.name || form.elements.name.value.trim();
+        const currentIconObjectId = form.dataset.categoryIconObjectId;
+        if (mode === "edit" && !custom && categoryObjectIdPattern.test(currentIconObjectId || "")) {
+          try {
+            await apiRequest(`/api/v1/admin/challenge-categories/${savedCategoryId}/icon/${currentIconObjectId}`, { method: "DELETE" });
+          } catch (error) {
+            showToast(`Category “${label}” was saved, but its previous custom logo could not be removed: ${error.message}`, "warning", 7000);
+            window.setTimeout(() => window.location.reload(), 1400);
+            return;
+          }
+        }
+        if (iconFile) {
+          try {
+            await uploadObject(iconFile, {
+              purpose: "category_icon",
+              category_id: savedCategoryId,
+            });
+          } catch (error) {
+            showToast(`Category “${label}” was saved, but its icon was not attached: ${error.message}`, "warning", 7000);
+            window.setTimeout(() => window.location.reload(), 1400);
+            return;
+          }
+        }
+        showToast(`Category “${label}” ${mode === "create" ? "created" : "updated"}.`);
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        if (errorRegion) errorRegion.textContent = error.message || "The category could not be saved.";
+        setBusy(submit, false);
+      }
+    });
+
+    form.querySelector("[data-remove-category-icon]")?.addEventListener("click", async event => {
+      const categoryId = form.dataset.categoryId;
+      const iconObjectId = event.currentTarget.dataset.categoryIconObjectId;
+      const categoryName = form.elements.name.value.trim();
+      const errorRegion = form.querySelector("[data-category-form-error]");
+      if (!categoryId || !categoryObjectIdPattern.test(iconObjectId || "")) {
+        if (errorRegion) errorRegion.textContent = "The current icon identifier is invalid. Refresh this page before trying again.";
+        return;
+      }
+      if (!window.confirm(`Remove the custom logo from “${categoryName}”? Players will see its built-in logo or name instead.`)) return;
+      if (errorRegion) errorRegion.textContent = "";
+      setBusy(event.currentTarget, true, "Removing…");
+      try {
+        await apiRequest(`/api/v1/admin/challenge-categories/${categoryId}/icon/${iconObjectId}`, { method: "DELETE" });
+        showToast(`Custom logo removed from “${categoryName}”.`);
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        if (errorRegion) {
+          errorRegion.textContent = error.status === 409
+            ? "This custom category logo changed since the page loaded. Refresh the page before trying again."
+            : error.message || "The custom category logo could not be removed.";
+        }
+        setBusy(event.currentTarget, false);
+      }
+    });
+
+    form.querySelector("[data-delete-category]")?.addEventListener("click", async event => {
+      const categoryId = form.dataset.categoryId;
+      const categoryName = form.elements.name.value.trim();
+      if (!categoryId || !window.confirm(`Delete category “${categoryName}”? This cannot be undone.`)) return;
+      const errorRegion = form.querySelector("[data-category-form-error]");
+      if (errorRegion) errorRegion.textContent = "";
+      setBusy(event.currentTarget, true, "Deleting…");
+      try {
+        await apiRequest(`/api/v1/admin/challenge-categories/${categoryId}`, { method: "DELETE" });
+        showToast(`Category “${categoryName}” deleted.`);
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        if (errorRegion) errorRegion.textContent = error.message || "The category could not be deleted.";
+        setBusy(event.currentTarget, false);
+      }
+    });
+  }
+}
+
+const pageCatalog = document.querySelector("[data-page-catalog]");
+if (pageCatalog) {
+  const createRequestHeaders = new WeakMap();
+
+  function pageHtml(form) {
+    const value = form.elements.content?.value || "";
+    if (value.includes("\0")) throw new Error("Page HTML cannot contain NUL characters.");
+    if (new TextEncoder().encode(value).byteLength > 256 * 1024) {
+      throw new Error("Page HTML must be no larger than 256 KiB.");
+    }
+    return value;
+  }
+
+  function pageEndpoint(form) {
+    return (form.elements.endpoint?.value || "")
+      .trim()
+      .replace(/^\/+|\/+$/g, "")
+      .toLocaleLowerCase();
+  }
+
+  for (const form of document.querySelectorAll("[data-page-form]")) {
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!form.reportValidity()) return;
+      const mode = form.dataset.pageMode;
+      const pageType = form.dataset.pageType;
+      const pageId = Number(form.dataset.pageId || 0);
+      const errorRegion = form.querySelector("[data-page-form-error]");
+      const submit = form.querySelector('button[type="submit"]');
+      if (errorRegion) errorRegion.textContent = "";
+      try {
+        const body = {};
+        if (mode === "create" || pageType !== "system") {
+          body.label = form.elements.label.value.trim();
+        }
+        if (mode === "create" || pageType === "custom") body.endpoint = pageEndpoint(form);
+        if (pageType !== "home") {
+          body.visibility = form.elements.visibility.value;
+          body.navigation_order = Number(form.elements.navigation_order.value);
+        }
+        if (mode === "create" || pageType !== "system") body.content = pageHtml(form);
+        if (mode === "edit") {
+          const revision = Number(form.dataset.pageRevision);
+          if (!Number.isSafeInteger(pageId) || pageId < 1
+              || !Number.isSafeInteger(revision) || revision < 1) {
+            throw new Error("This page record is invalid. Refresh before saving.");
+          }
+          body.revision = revision;
+        } else if (!createRequestHeaders.has(form)) {
+          createRequestHeaders.set(form, idempotencyHeaders());
+        }
+        setBusy(submit, true);
+        const result = await apiRequest(
+          mode === "create" ? "/api/v1/pages" : `/api/v1/pages/${pageId}`,
+          {
+            method: mode === "create" ? "POST" : "PATCH",
+            headers: mode === "create" ? createRequestHeaders.get(form) : undefined,
+            body,
+          },
+        );
+        const label = result.data?.label || body.label || "Page";
+        showToast(`${label} ${mode === "create" ? "created" : "updated"}.`);
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        if (errorRegion) errorRegion.textContent = error.message || "The page could not be saved.";
+        setBusy(submit, false);
+      }
+    });
+
+    form.querySelector("[data-delete-page]")?.addEventListener("click", async event => {
+      const pageId = Number(form.dataset.pageId || 0);
+      const label = form.elements.label.value.trim();
+      const errorRegion = form.querySelector("[data-page-form-error]");
+      if (!Number.isSafeInteger(pageId) || pageId < 1) return;
+      if (!window.confirm(`Delete page “${label}”? This cannot be undone.`)) return;
+      if (errorRegion) errorRegion.textContent = "";
+      setBusy(event.currentTarget, true, "Deleting…");
+      try {
+        await apiRequest(`/api/v1/pages/${pageId}`, { method: "DELETE" });
+        showToast(`${label} deleted.`);
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        if (errorRegion) errorRegion.textContent = error.message || "The page could not be deleted.";
+        setBusy(event.currentTarget, false);
+      }
+    });
+  }
 }
 
 function configInputValue(input) {

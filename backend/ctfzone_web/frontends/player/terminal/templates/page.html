@@ -1,0 +1,15 @@
+{% extends player_template('base.html') %}
+{% block title %}{{ (content_page or {}).get('label', 'Page') }} · {{ site.name }}{% endblock %}
+{% block content %}
+  <section class="page-content-shell">
+    {% if page_error %}
+      <div class="empty-state compact">
+        <span class="empty-glyph">!</span>
+        <h1>Page unavailable</h1>
+        <p>{{ page_error }}</p>
+      </div>
+    {% else %}
+      <article class="page-content-canvas markdown">{{ content_page.content_html }}</article>
+    {% endif %}
+  </section>
+{% endblock %}

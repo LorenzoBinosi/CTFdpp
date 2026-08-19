@@ -119,6 +119,7 @@ CREATE TABLE ctfzone.stored_objects (
     owner_user_id integer REFERENCES ctfzone.users(id) ON DELETE SET NULL,
     owner_team_id integer REFERENCES ctfzone.teams(id) ON DELETE SET NULL,
     idempotency_key text,
+    category_id integer REFERENCES ctfzone.challenge_categories(id) ON DELETE SET NULL,
     challenge_id integer REFERENCES ctfzone.challenges(id) ON DELETE SET NULL,
     page_id integer REFERENCES ctfzone.pages(id) ON DELETE SET NULL,
     solution_id integer REFERENCES ctfzone.solutions(id) ON DELETE SET NULL,
@@ -140,8 +141,9 @@ CREATE TABLE ctfzone.stored_objects (
     revision bigint NOT NULL DEFAULT 1,
     CONSTRAINT stored_objects_bucket_key_key UNIQUE (bucket, object_key),
     CONSTRAINT stored_objects_bucket_upload_key_key UNIQUE (bucket, upload_key),
+    CONSTRAINT stored_objects_id_category_key UNIQUE (id, category_id),
     CONSTRAINT stored_objects_purpose_check CHECK (
-        purpose IN ('challenge_asset', 'page_asset', 'solution_asset',
+        purpose IN ('category_icon', 'challenge_asset', 'page_asset', 'solution_asset',
                     'submission', 'patch', 'program', 'pcap', 'result', 'export')
     ),
     CONSTRAINT stored_objects_status_check CHECK (
@@ -152,22 +154,54 @@ CREATE TABLE ctfzone.stored_objects (
     ),
     CONSTRAINT stored_objects_target_check CHECK (
         status IN ('deleting', 'deleted')
+        OR (purpose = 'category_icon' AND category_id IS NOT NULL
+            AND challenge_id IS NULL AND page_id IS NULL AND solution_id IS NULL)
         OR (purpose = 'challenge_asset' AND challenge_id IS NOT NULL
-            AND page_id IS NULL AND solution_id IS NULL)
+            AND category_id IS NULL AND page_id IS NULL AND solution_id IS NULL)
         OR (purpose = 'page_asset' AND page_id IS NOT NULL
-            AND challenge_id IS NULL AND solution_id IS NULL)
+            AND category_id IS NULL AND challenge_id IS NULL AND solution_id IS NULL)
         OR (purpose = 'solution_asset' AND challenge_id IS NOT NULL
-            AND solution_id IS NOT NULL AND page_id IS NULL)
+            AND solution_id IS NOT NULL AND category_id IS NULL AND page_id IS NULL)
         OR (purpose IN ('submission', 'patch', 'program') AND challenge_id IS NOT NULL
-            AND page_id IS NULL AND solution_id IS NULL)
+            AND category_id IS NULL AND page_id IS NULL AND solution_id IS NULL)
         OR (purpose IN ('pcap', 'result', 'export')
+            AND category_id IS NULL AND challenge_id IS NULL
             AND page_id IS NULL AND solution_id IS NULL)
     ),
     CONSTRAINT stored_objects_scope_purpose_check CHECK (
-        (purpose IN ('challenge_asset', 'page_asset', 'solution_asset')
+        (purpose IN ('category_icon', 'challenge_asset', 'page_asset', 'solution_asset')
             AND authorization_scope = 'target')
-        OR (purpose NOT IN ('challenge_asset', 'page_asset', 'solution_asset')
+        OR (purpose NOT IN ('category_icon', 'challenge_asset', 'page_asset', 'solution_asset')
             AND authorization_scope IN ('user', 'team'))
+    ),
+    CONSTRAINT stored_objects_category_icon_check CHECK (
+        purpose <> 'category_icon'
+        OR (
+            content_type IN ('image/png', 'image/svg+xml')
+            AND expected_size BETWEEN 1 AND 262144
+            AND (actual_size IS NULL OR actual_size BETWEEN 1 AND 262144)
+        )
+    ),
+    CONSTRAINT stored_objects_category_icon_ready_check CHECK (
+        purpose <> 'category_icon'
+        OR status <> 'ready'
+        OR ((
+            jsonb_typeof(metadata->'format') = 'string'
+            AND (
+                (content_type = 'image/png' AND metadata->'format' = '"png"'::jsonb)
+                OR (
+                    content_type = 'image/svg+xml'
+                    AND metadata->'format' = '"svg"'::jsonb
+                    AND metadata->'sanitized' = 'true'::jsonb
+                )
+            )
+            AND jsonb_typeof(metadata->'width') = 'number'
+            AND metadata->'width' = '128'::jsonb
+            AND jsonb_typeof(metadata->'height') = 'number'
+            AND metadata->'height' = '128'::jsonb
+            AND jsonb_typeof(metadata->'animated') = 'boolean'
+            AND metadata->'animated' = 'false'::jsonb
+        ) IS TRUE)
     ),
     CONSTRAINT stored_objects_size_check CHECK (
         expected_size >= 0 AND (actual_size IS NULL OR actual_size >= 0)
@@ -203,6 +237,9 @@ CREATE INDEX idx_stored_objects_owner_user
 CREATE INDEX idx_stored_objects_owner_team
     ON ctfzone.stored_objects (owner_team_id, created_at DESC)
     WHERE owner_team_id IS NOT NULL;
+CREATE INDEX idx_stored_objects_category
+    ON ctfzone.stored_objects (category_id, created_at DESC)
+    WHERE category_id IS NOT NULL;
 CREATE INDEX idx_stored_objects_challenge
     ON ctfzone.stored_objects (challenge_id, created_at DESC)
     WHERE challenge_id IS NOT NULL;
@@ -223,6 +260,114 @@ CREATE UNIQUE INDEX uq_stored_objects_user_idempotency
 CREATE INDEX idx_stored_objects_principal_quota
     ON ctfzone.stored_objects
        (authorization_scope, owner_user_id, owner_team_id, status, created_at);
+
+ALTER TABLE ctfzone.challenge_categories
+    ADD CONSTRAINT challenge_categories_icon_object_id_fkey
+    FOREIGN KEY (icon_object_id, id)
+    REFERENCES ctfzone.stored_objects(id, category_id) ON DELETE RESTRICT;
+
+CREATE UNIQUE INDEX uq_challenge_categories_icon_object
+    ON ctfzone.challenge_categories (icon_object_id)
+    WHERE icon_object_id IS NOT NULL;
+
+CREATE FUNCTION ctfzone.validate_challenge_category_icon()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.icon_object_id IS NOT NULL THEN
+        -- SHARE conflicts with every status/metadata/target UPDATE mode. Holding
+        -- it through the category-pointer transaction closes the attach-vs-drift
+        -- race that a plain MVCC read (or KEY SHARE) would leave open.
+        PERFORM 1
+        FROM ctfzone.stored_objects object
+        WHERE object.id = NEW.icon_object_id
+          AND object.category_id = NEW.id
+          AND object.purpose = 'category_icon'
+          AND object.status = 'ready'
+          AND object.content_type IN ('image/png', 'image/svg+xml')
+          AND (
+              (object.content_type = 'image/png' AND object.metadata->'format' = '"png"'::jsonb)
+              OR (
+                  object.content_type = 'image/svg+xml'
+                  AND object.metadata->'format' = '"svg"'::jsonb
+                  AND object.metadata->'sanitized' = 'true'::jsonb
+              )
+          )
+          AND object.metadata->'width' = '128'::jsonb
+          AND object.metadata->'height' = '128'::jsonb
+          AND object.metadata->'animated' = 'false'::jsonb
+        FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'category icon must reference its validated ready PNG or SVG object'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER challenge_categories_validate_icon
+BEFORE INSERT OR UPDATE OF icon_object_id ON ctfzone.challenge_categories
+FOR EACH ROW EXECUTE FUNCTION ctfzone.validate_challenge_category_icon();
+
+-- Attachment validation must remain true after the pointer is installed too.
+-- Deferring this check permits the API and parent-delete trigger to detach the
+-- category and retire the old object in one transaction, while making direct
+-- status/target drift fail closed at commit.
+CREATE FUNCTION ctfzone.validate_attached_challenge_category_icon()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    checked_object_id uuid;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        checked_object_id := OLD.id;
+    ELSE
+        checked_object_id := NEW.id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM ctfzone.challenge_categories category
+        LEFT JOIN ctfzone.stored_objects object
+          ON object.id = category.icon_object_id
+         AND object.category_id = category.id
+        WHERE category.icon_object_id = checked_object_id
+          AND (
+              object.id IS NULL
+              OR object.purpose IS DISTINCT FROM 'category_icon'
+              OR object.status IS DISTINCT FROM 'ready'
+              OR object.content_type NOT IN ('image/png', 'image/svg+xml')
+              OR (
+                  (object.content_type = 'image/png' AND object.metadata->'format' = '"png"'::jsonb)
+                  OR (
+                      object.content_type = 'image/svg+xml'
+                      AND object.metadata->'format' = '"svg"'::jsonb
+                      AND object.metadata->'sanitized' = 'true'::jsonb
+                  )
+              ) IS NOT TRUE
+              OR object.metadata->'width' IS DISTINCT FROM '128'::jsonb
+              OR object.metadata->'height' IS DISTINCT FROM '128'::jsonb
+              OR object.metadata->'animated' IS DISTINCT FROM 'false'::jsonb
+          )
+    ) THEN
+        RAISE EXCEPTION 'attached category icon must remain a validated ready PNG or SVG object'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER stored_objects_validate_attached_category_icon
+AFTER INSERT OR UPDATE OR DELETE ON ctfzone.stored_objects
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION ctfzone.validate_attached_challenge_category_icon();
 
 CREATE TABLE ctfzone.stored_object_events (
     id bigserial PRIMARY KEY,
@@ -295,6 +440,8 @@ DECLARE
 BEGIN
     IF NOT (
         (association_column = 'challenge_id' AND parent_kind = 'challenge'
+            AND required_scope IS NULL)
+        OR (association_column = 'category_id' AND parent_kind = 'category'
             AND required_scope IS NULL)
         OR (association_column = 'page_id' AND parent_kind = 'page'
             AND required_scope IS NULL)
@@ -402,6 +549,11 @@ BEFORE DELETE ON ctfzone.challenges
 FOR EACH ROW
 EXECUTE FUNCTION ctfzone.schedule_linked_object_deletion('challenge_id', 'challenge', '');
 
+CREATE TRIGGER challenge_categories_schedule_stored_object_deletion
+BEFORE DELETE ON ctfzone.challenge_categories
+FOR EACH ROW
+EXECUTE FUNCTION ctfzone.schedule_linked_object_deletion('category_id', 'category', '');
+
 CREATE TRIGGER pages_schedule_stored_object_deletion
 BEFORE DELETE ON ctfzone.pages
 FOR EACH ROW
@@ -422,12 +574,63 @@ BEFORE DELETE ON ctfzone.teams
 FOR EACH ROW
 EXECUTE FUNCTION ctfzone.schedule_linked_object_deletion('owner_team_id', 'team', 'team');
 
+-- The player navigation is data-driven from its first boot. Home is the
+-- permanent root document; the two system pages retain fixed endpoints and
+-- implementation while administrators control only their visibility/order.
+INSERT INTO ctfzone.pages
+    (label, endpoint, content, page_type, system_key, visibility, navigation_order)
+VALUES
+    ('Home', '', '<div class="row page-section align-items-center"><div class="col-md-8 offset-md-1"><h1 class="display-1">Built for curious minds.</h1><p class="lead">Practice real security skills, solve challenges at your own pace, and compete for a place on the scoreboard.</p><p class="page-actions"><a href="/challenges">Browse challenges</a><a href="/scoreboard">View scoreboard</a></p></div></div>',
+     'home', 'home', 'public', 0),
+    ('Challenges', 'challenges', '', 'system', 'challenges', 'private', 10),
+    ('Scoreboard', 'scoreboard', '', 'system', 'scoreboard', 'public', 20)
+ON CONFLICT (endpoint) DO NOTHING;
+
 DO $$
 BEGIN
     IF to_regclass('ctfzone.users') IS NULL
         OR to_regclass('ctfzone.challenges') IS NULL
         OR to_regclass('ctfzone.flags') IS NULL
+        OR to_regclass('ctfzone.pages') IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'pages_system_identity_check'
+              AND conrelid = 'ctfzone.pages'::regclass
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'pages_visibility_check'
+              AND conrelid = 'ctfzone.pages'::regclass
+        )
+        OR (SELECT count(*) FROM ctfzone.pages WHERE system_key IN ('home', 'challenges', 'scoreboard')) <> 3
         OR to_regclass('ctfzone.challenge_categories') IS NULL
+        OR (
+            SELECT count(*) <> 3
+            FROM information_schema.columns
+            WHERE table_schema = 'ctfzone'
+              AND table_name = 'challenge_categories'
+              AND column_name IN ('logo_key', 'logo_color', 'icon_object_id')
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'challenge_categories_logo_key_check'
+              AND conrelid = 'ctfzone.challenge_categories'::regclass
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'challenge_categories_logo_color_check'
+              AND conrelid = 'ctfzone.challenge_categories'::regclass
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'challenge_categories_icon_object_id_fkey'
+              AND conrelid = 'ctfzone.challenge_categories'::regclass
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'stored_objects_category_icon_ready_check'
+              AND conrelid = 'ctfzone.stored_objects'::regclass
+        )
         OR to_regclass('ctfzone.admin_create_idempotency') IS NULL
         OR to_regclass('ctfzone.user_challenge_flags') IS NULL
         OR to_regclass('ctfzone.flag_sharing_events') IS NULL
@@ -440,6 +643,31 @@ BEGIN
         OR to_regclass('ctfzone.runtime_instance_events') IS NULL
         OR to_regclass('ctfzone.email_verification_tokens') IS NULL
         OR to_regclass('ctfzone.stored_objects') IS NULL
+        OR (
+            SELECT count(*) <> 2
+            FROM information_schema.columns
+            WHERE table_schema = 'ctfzone'
+              AND table_name = 'stored_objects'
+              AND column_name IN ('category_id', 'metadata')
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'challenge_categories_schedule_stored_object_deletion'
+              AND tgrelid = 'ctfzone.challenge_categories'::regclass
+              AND NOT tgisinternal
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'challenge_categories_validate_icon'
+              AND tgrelid = 'ctfzone.challenge_categories'::regclass
+              AND NOT tgisinternal
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'stored_objects_validate_attached_category_icon'
+              AND tgrelid = 'ctfzone.stored_objects'::regclass
+              AND NOT tgisinternal
+        )
         OR to_regclass('ctfzone.stored_object_events') IS NULL
         OR to_regclass('ctfzone.object_operations') IS NULL
     THEN

@@ -1,3 +1,4 @@
+{% import player_template('partials/category_logo.html') as category_logos %}
 {% if challenge %}
   {% set runtime = challenge.runtime if challenge.runtime is mapping else {} %}
   {% set instance = runtime.instance if runtime.instance is mapping else none %}
@@ -6,7 +7,7 @@
     <header class="detail-header">
       <div>
         <div class="detail-title-line">
-          <svg class="detail-category-icon"><use href="#icon-{{ challenge.category_icon | default('globe') }}"></use></svg>
+          <span class="detail-category-marker detail-category-name category-image-marker" role="img" aria-label="Category: {{ challenge.category }}" title="{{ challenge.category }}"><span data-category-icon-fallback>{% if challenge.category_logo_key %}{{ category_logos.render(challenge.category_logo_key, challenge.category_logo_color or '#34689c') }}{% else %}{{ challenge.category }}{% endif %}</span>{% if challenge.category_icon_url %}<img src="{{ challenge.category_icon_url }}" width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-icon-image>{% endif %}</span>
           <h1>{{ challenge.name }}</h1>
         </div>
         <div class="detail-meta">

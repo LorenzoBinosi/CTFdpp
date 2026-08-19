@@ -1,4 +1,5 @@
 {% extends "admin/base.html" %}
+{% import "admin/partials/category_logo.html" as category_logos %}
 {% block description %}<p>{{ 'Build a Jeopardy challenge in five focused steps.' if form_mode == 'create' else 'Update the challenge details exposed to players.' }}</p>{% endblock %}
 {% block actions %}<a class="secondary-button button-small" href="{{ url_for('web.admin_challenges') }}">← Back to challenges</a>{% endblock %}
 {% block admin_content %}
@@ -52,8 +53,9 @@
             <label class="admin-field"><span>Name</span><input name="name" required maxlength="80" placeholder="Grandma's Cookies"></label>
             <div class="admin-field challenge-category-field">
               <span><label for="challenge-category">Category</label> <small>Pre-created</small></span>
-              <div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div>
+              <div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}" data-category-icon-url="{{ category.icon_url or '' }}" data-category-logo-key="{{ category.logo_key or '' }}" data-category-logo-color="{{ category.logo_color or '' }}">{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div>
               <small class="challenge-category-help" data-category-help>{% if category_error %}The category catalog could not be loaded. You can still create a category here.{% elif not categories %}No categories exist yet. Create one before saving this challenge.{% else %}Categories are reusable and managed separately from challenges.{% endif %}</small>
+              <span class="challenge-category-preview category-image-marker" data-category-selection-preview role="img" hidden><span>Player marker</span>{{ category_logos.fallback('', none) }}<img width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-selection-image></span>
             </div>
           </div>
           <label class="admin-field"><span>Author(s) / attribution <small>Optional · Markdown</small></span><textarea name="attribution" rows="2" maxlength="2048" placeholder="Jane Doe, [Team Example](https://example.org)"></textarea><small>List one or more authors, teams, or source links. This appears as the challenge byline.</small></label>
@@ -161,7 +163,7 @@
         <header><span class="eyebrow">IDENTITY</span><h2>Core details</h2><p>The title, category, authors, and description presented to players.</p></header>
         <div class="admin-field-grid two">
           <label class="admin-field"><span>Name</span><input name="name" required maxlength="80" value="{{ challenge.name }}" placeholder="Grandma's Cookies"></label>
-          <div class="admin-field challenge-category-field"><span><label for="challenge-category">Category</label> <small>Pre-created</small></span><div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}" {{ 'selected' if challenge.category_id|string == category.id|string }}>{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div><small class="challenge-category-help" data-category-help>{% if category_error %}The category catalog could not be loaded. Create or reload a category before saving.{% else %}Categories are reusable across challenges.{% endif %}</small></div>
+          <div class="admin-field challenge-category-field"><span><label for="challenge-category">Category</label> <small>Pre-created</small></span><div class="challenge-category-control"><select id="challenge-category" name="category_id" required data-category-select><option value="">Choose a category…</option>{% for category in categories %}<option value="{{ category.id }}" data-category-icon-url="{{ category.icon_url or '' }}" data-category-logo-key="{{ category.logo_key or '' }}" data-category-logo-color="{{ category.logo_color or '' }}" {{ 'selected' if challenge.category_id|string == category.id|string }}>{{ category.name }}</option>{% endfor %}</select><button class="secondary-button" type="button" data-open-category-dialog>+ Create category</button></div><small class="challenge-category-help" data-category-help>{% if category_error %}The category catalog could not be loaded. Create or reload a category before saving.{% else %}Categories are reusable across challenges.{% endif %}</small><span class="challenge-category-preview category-image-marker" data-category-selection-preview role="img" hidden><span>Player marker</span>{{ category_logos.fallback('', none) }}<img width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-selection-image></span></div>
         </div>
         <label class="admin-field"><span>Author(s) / attribution <small>Optional · Markdown</small></span><textarea name="attribution" rows="2" maxlength="2048" placeholder="Jane Doe, [Team Example](https://example.org)">{{ challenge.attribution or '' }}</textarea></label>
         <label class="admin-field"><span>Description <small>Markdown + safe HTML</small></span><textarea name="description" rows="9" required placeholder="Explain the goal without giving away the solution…">{{ challenge.description or '' }}</textarea></label>
@@ -209,7 +211,10 @@
   <dialog class="challenge-category-dialog" data-category-dialog aria-labelledby="category-dialog-title">
     <form class="challenge-category-dialog-shell" data-category-dialog-form>
       <header><div><span class="eyebrow">CATEGORY</span><h2 id="category-dialog-title">Create category</h2></div><button class="quiet-button button-small" type="button" data-close-category-dialog aria-label="Close category dialog">×</button></header>
-      <div><label class="admin-field"><span>Name</span><input name="category_name" required maxlength="80" autocomplete="off" placeholder="Web"></label><p>Categories organize the challenge board and can be reused by future challenges.</p><p class="challenge-category-dialog-error" data-category-dialog-error role="alert" aria-live="polite"></p></div>
+      <div>
+        <label class="admin-field"><span>Name</span><input name="category_name" required maxlength="80" autocomplete="off" placeholder="Web exploitation"></label>
+        <p>Categories organize the challenge board and can be reused by future challenges. Choose a built-in logo, upload a custom one, or keep the name marker later from <a href="{{ url_for('web.admin_categories') }}" target="_blank" rel="noopener">Categories</a>.</p><p class="challenge-category-dialog-error" data-category-dialog-error role="alert" aria-live="polite"></p>
+      </div>
       <footer><button class="quiet-button" type="button" data-close-category-dialog>Cancel</button><button class="button" type="submit">Create category</button></footer>
     </form>
   </dialog>

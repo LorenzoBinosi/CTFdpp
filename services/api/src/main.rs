@@ -186,9 +186,53 @@ async fn readiness(State(state): State<AppState>) -> Response {
             to_regclass('ctfzone.challenges') IS NOT NULL
                 AND to_regclass('ctfzone.flags') IS NOT NULL
                 AND to_regclass('ctfzone.challenge_categories') IS NOT NULL
+                AND (
+                    SELECT count(*) = 3
+                    FROM information_schema.columns
+                    WHERE table_schema='ctfzone'
+                      AND table_name='challenge_categories'
+                      AND column_name IN ('logo_key','logo_color','icon_object_id')
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='challenge_categories_logo_key_check'
+                      AND conrelid='ctfzone.challenge_categories'::regclass
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='challenge_categories_logo_color_check'
+                      AND conrelid='ctfzone.challenge_categories'::regclass
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='challenge_categories_icon_object_id_fkey'
+                      AND conrelid='ctfzone.challenge_categories'::regclass
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname='challenge_categories_validate_icon'
+                      AND tgrelid='ctfzone.challenge_categories'::regclass
+                      AND NOT tgisinternal
+                )
                 AND to_regclass('ctfzone.user_challenge_flags') IS NOT NULL
                 AND to_regclass('ctfzone.flag_sharing_events') IS NOT NULL
-                AND to_regclass('ctfzone.admin_create_idempotency') IS NOT NULL,
+                AND to_regclass('ctfzone.admin_create_idempotency') IS NOT NULL
+                AND to_regclass('ctfzone.pages') IS NOT NULL
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='pages_system_identity_check'
+                      AND conrelid='ctfzone.pages'::regclass
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='pages_visibility_check'
+                      AND conrelid='ctfzone.pages'::regclass
+                )
+                AND (
+                    SELECT count(*) = 3
+                    FROM ctfzone.pages
+                    WHERE system_key IN ('home','challenges','scoreboard')
+                ),
             to_regclass('ctfzone.runtime_settings') IS NOT NULL
                 AND to_regclass('ctfzone.challenge_runtime_configs') IS NOT NULL
                 AND to_regclass('ctfzone.remote_servers') IS NOT NULL
@@ -197,7 +241,31 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 AND to_regclass('ctfzone.runtime_instance_events') IS NOT NULL,
             to_regclass('ctfzone.user_mode_transitions') IS NOT NULL,
             to_regclass('ctfzone.email_verification_tokens') IS NOT NULL,
-            to_regclass('ctfzone.stored_objects') IS NOT NULL,
+            to_regclass('ctfzone.stored_objects') IS NOT NULL
+                AND (
+                    SELECT count(*) = 2
+                    FROM information_schema.columns
+                    WHERE table_schema='ctfzone'
+                      AND table_name='stored_objects'
+                      AND column_name IN ('category_id','metadata')
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname='stored_objects_category_icon_ready_check'
+                      AND conrelid='ctfzone.stored_objects'::regclass
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname='challenge_categories_schedule_stored_object_deletion'
+                      AND tgrelid='ctfzone.challenge_categories'::regclass
+                      AND NOT tgisinternal
+                )
+                AND EXISTS(
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname='stored_objects_validate_attached_category_icon'
+                      AND tgrelid='ctfzone.stored_objects'::regclass
+                      AND NOT tgisinternal
+                ),
             to_regclass('ctfzone.object_operations') IS NOT NULL,
             to_regclass('ctfzone.ssh_hosts') IS NOT NULL
                 AND to_regclass('ctfzone.ssh_host_events') IS NOT NULL

@@ -1,7 +1,7 @@
 # Jeopardy challenge authoring
 
 Status: Implemented 1.0.0 baseline
-Last updated: 2026-08-17
+Last updated: 2026-08-19
 
 This page is the operator contract for **Administration -> Challenges -> New
 challenge**. The 1.0 wizard creates Jeopardy challenges only. **Attack / Defense
@@ -10,10 +10,27 @@ formats**; they cannot be selected or created through this contract.
 
 ## Before authoring
 
-Every challenge must reference a category that already exists. The category
-selector shows reusable categories. **Create category** first creates a durable
-category and then selects it in the form; it is not an uncommitted text value
-inside the challenge request.
+Every challenge must reference a category that already exists. Manage the
+catalog under **Competition -> Categories**. A category always has a name and
+may use one of the semantic logo keys `web`, `pwn`, `crypto`, `rev`, `misc`,
+`coding`, or `forensics`. Each player frontend supplies its own visual design
+for those meanings, and the administrator chooses the built-in logo color.
+Choose **Name only** when the written category name should be the compact
+marker; this mode does not require or validate an image file.
+
+Administrators may instead attach a custom exact 128 by 128 pixel PNG or a
+square SVG, with a 256 KiB maximum. SVG is parsed and admitted only from a small
+static drawing allowlist; scripts, event handlers, CSS, links, external
+references, DTD/entities, text, metadata, animation, and unsupported elements
+or attributes are rejected before the object becomes public. Challenge
+authoring also offers **Create category** as a name-only shortcut; choose a
+built-in logo/color or upload a custom one later from the Categories page.
+
+Selecting a category stores its stable ID on the challenge. The challenge
+therefore inherits later name, built-in-logo, and custom-logo changes
+automatically. A category cannot be deleted while any challenge uses it;
+reassign those challenges first. Filters and administrator selectors always
+show the category name even when its compact marker is a logo.
 
 For a private challenge, provision at least one eligible runtime host and its
 restricted remote helper before expecting launches to succeed. See the

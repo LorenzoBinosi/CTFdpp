@@ -30,6 +30,7 @@ pub(super) struct ChallengeListQuery {
     max_attempts: Option<i32>,
     value: Option<i32>,
     category: Option<String>,
+    category_id: Option<i32>,
     #[serde(rename = "type")]
     challenge_type: Option<String>,
     state: Option<String>,
@@ -56,6 +57,9 @@ struct ChallengeListRow {
     value: Option<i32>,
     category: Option<String>,
     category_id: i32,
+    category_logo_key: Option<String>,
+    category_logo_color: Option<String>,
+    category_icon_object_id: Option<Uuid>,
     challenge_kind: String,
     exposure: String,
     connection_info: Option<String>,
@@ -91,6 +95,9 @@ struct ChallengeDetailRow {
     value: Option<i32>,
     category: Option<String>,
     category_id: i32,
+    category_logo_key: Option<String>,
+    category_logo_color: Option<String>,
+    category_icon_object_id: Option<Uuid>,
     challenge_kind: String,
     exposure: String,
     #[serde(rename = "type")]
@@ -103,6 +110,14 @@ struct ChallengeDetailRow {
     position: i32,
     function: Option<String>,
     requirements: Option<Value>,
+}
+
+#[derive(FromRow)]
+struct ChallengeCategoryMetadata {
+    name: String,
+    logo_key: Option<String>,
+    logo_color: Option<String>,
+    icon_object_id: Option<Uuid>,
 }
 
 struct ChallengeAccessContext {
@@ -226,6 +241,9 @@ pub(super) async fn list_data(
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
         SELECT c.id, c.name, c.value, c.category, c.category_id,
+               category.logo_key AS category_logo_key,
+               category.logo_color AS category_logo_color,
+               category.icon_object_id AS category_icon_object_id,
                c.challenge_type AS challenge_kind,c.exposure,c.connection_info,
                c.type AS challenge_type,
                c.position, c.requirements,
@@ -233,6 +251,7 @@ pub(super) async fn list_data(
                    AND COALESCE(runtime_config.enabled, false)
                    AND runtime_config.runtime_mode = 'managed' AS runtime_available
         FROM ctfzone.challenges c
+        JOIN ctfzone.challenge_categories category ON category.id=c.category_id
         LEFT JOIN ctfzone.challenge_runtime_configs runtime_config
                ON runtime_config.challenge_id = c.id
         LEFT JOIN ctfzone.runtime_settings runtime_setting
@@ -254,6 +273,9 @@ pub(super) async fn list_data(
     }
     if let Some(value) = query.category {
         builder.push(" AND c.category = ").push_bind(value);
+    }
+    if let Some(value) = query.category_id {
+        builder.push(" AND c.category_id = ").push_bind(value);
     }
     if let Some(value) = query.challenge_type {
         builder.push(" AND c.type = ").push_bind(value);
@@ -307,6 +329,10 @@ pub(super) async fn list_data(
                     "solves": Value::Null,
                     "solved_by_me": false,
                     "category": if preview { row.category } else { Some("???".to_owned()) },
+                    "category_id": if preview { Some(row.category_id) } else { None },
+                    "category_logo_key": if preview { row.category_logo_key } else { None },
+                    "category_logo_color": if preview { row.category_logo_color } else { None },
+                    "category_icon_object_id": if preview { row.category_icon_object_id } else { None },
                     "tags": if preview { json!(tags) } else { json!([]) },
                     "runtime_available": false,
                 }));
@@ -327,6 +353,9 @@ pub(super) async fn list_data(
             "solved_by_me": solved.contains(&row.id),
             "category": row.category,
             "category_id": row.category_id,
+            "category_logo_key": row.category_logo_key,
+            "category_logo_color": row.category_logo_color,
+            "category_icon_object_id": row.category_icon_object_id,
             "challenge_type": row.challenge_kind,
             "exposure": row.exposure,
             "connection_info": row.connection_info,
@@ -652,8 +681,8 @@ pub(super) async fn create(
         transaction.commit().await.map_err(ApiError::database)?;
         return Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response());
     }
-    let category = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
+    let category = sqlx::query_as::<_, ChallengeCategoryMetadata>(
+        "SELECT name,logo_key,logo_color,icon_object_id FROM ctfzone.challenge_categories WHERE id=$1 FOR KEY SHARE",
     )
     .bind(category_id)
     .fetch_optional(&mut *transaction)
@@ -698,7 +727,7 @@ pub(super) async fn create(
     .bind(optional_i32(object, "next_id")?)
     .bind(max_attempts)
     .bind(value)
-    .bind(&category)
+    .bind(&category.name)
     .bind(category_id)
     .bind(&challenge_kind)
     .bind(&exposure)
@@ -750,8 +779,11 @@ pub(super) async fn create(
         "attribution": attribution,
         "connection_info": connection_info,
         "next_id": optional_i32(object, "next_id")?,
-        "category": category,
+        "category": category.name,
         "category_id": category_id,
+        "category_logo_key": category.logo_key,
+        "category_logo_color": category.logo_color,
+        "category_icon_object_id": category.icon_object_id,
         "challenge_type": challenge_kind,
         "exposure": exposure,
         "state": state_value,
@@ -804,6 +836,10 @@ pub(super) async fn detail_data(
             "solved_by_me": false,
             "solution_id": Value::Null,
             "category": if preview { challenge.category } else { Some("???".to_owned()) },
+            "category_id": if preview { Some(challenge.category_id) } else { None },
+            "category_logo_key": if preview { challenge.category_logo_key } else { None },
+            "category_logo_color": if preview { challenge.category_logo_color } else { None },
+            "category_icon_object_id": if preview { challenge.category_icon_object_id } else { None },
             "tags": [],
         }));
     }
@@ -1779,13 +1815,17 @@ async fn challenge_detail_by_id_on(
     sqlx::query_as::<_, ChallengeDetailRow>(
         r#"
         SELECT c.id,c.name,c.description,c.attribution,c.connection_info,c.next_id,c.max_attempts,
-               c.value,c.category,c.category_id,c.challenge_type AS challenge_kind,
+               c.value,c.category,c.category_id,category.logo_key AS category_logo_key,
+               category.logo_color AS category_logo_color,
+               category.icon_object_id AS category_icon_object_id,
+               c.challenge_type AS challenge_kind,
                c.exposure,c.type AS challenge_type,c.state,c.logic,
                COALESCE(dc.dynamic_initial,c.initial) AS initial,
                COALESCE(dc.dynamic_minimum,c.minimum) AS minimum,
                COALESCE(dc.dynamic_decay,c.decay) AS decay,
                c.position,COALESCE(dc.dynamic_function,c.function) AS function,c.requirements
         FROM ctfzone.challenges c
+        JOIN ctfzone.challenge_categories category ON category.id=c.category_id
         LEFT JOIN ctfzone.dynamic_challenge dc ON dc.id=c.id
         WHERE c.id=$1
         "#,
@@ -1804,13 +1844,17 @@ async fn challenge_detail_by_id_for_update(
     sqlx::query_as::<_, ChallengeDetailRow>(
         r#"
         SELECT c.id,c.name,c.description,c.attribution,c.connection_info,c.next_id,c.max_attempts,
-               c.value,c.category,c.category_id,c.challenge_type AS challenge_kind,
+               c.value,c.category,c.category_id,category.logo_key AS category_logo_key,
+               category.logo_color AS category_logo_color,
+               category.icon_object_id AS category_icon_object_id,
+               c.challenge_type AS challenge_kind,
                c.exposure,c.type AS challenge_type,c.state,c.logic,
                COALESCE(dc.dynamic_initial,c.initial) AS initial,
                COALESCE(dc.dynamic_minimum,c.minimum) AS minimum,
                COALESCE(dc.dynamic_decay,c.decay) AS decay,
                c.position,COALESCE(dc.dynamic_function,c.function) AS function,c.requirements
         FROM ctfzone.challenges c
+        JOIN ctfzone.challenge_categories category ON category.id=c.category_id
         LEFT JOIN ctfzone.dynamic_challenge dc ON dc.id=c.id
         WHERE c.id=$1
         FOR UPDATE OF c
@@ -1860,6 +1904,9 @@ fn challenge_read_json(challenge: &ChallengeDetailRow) -> Value {
         "next_id": challenge.next_id,
         "category": challenge.category,
         "category_id": challenge.category_id,
+        "category_logo_key": challenge.category_logo_key,
+        "category_logo_color": challenge.category_logo_color,
+        "category_icon_object_id": challenge.category_icon_object_id,
         "challenge_type": challenge.challenge_kind,
         "exposure": challenge.exposure,
         "state": challenge.state,
@@ -3051,6 +3098,24 @@ mod tests {
     }
 
     #[test]
+    fn challenge_reads_expose_stable_category_identity_and_logo_choices() {
+        let mut challenge = access_test_challenge("visible", None);
+        challenge.category = Some("Hardware".to_owned());
+        challenge.category_id = 42;
+        challenge.category_logo_key = Some("forensics".to_owned());
+        challenge.category_logo_color = Some("#123abc".to_owned());
+        let icon_object_id = Uuid::new_v4();
+        challenge.category_icon_object_id = Some(icon_object_id);
+
+        let value = challenge_read_json(&challenge);
+        assert_eq!(value["category"], "Hardware");
+        assert_eq!(value["category_id"], 42);
+        assert_eq!(value["category_logo_key"], "forensics");
+        assert_eq!(value["category_logo_color"], "#123abc");
+        assert_eq!(value["category_icon_object_id"], icon_object_id.to_string());
+    }
+
+    #[test]
     fn optional_authoring_text_is_typed_bounded_and_allows_multiline_commands() {
         let valid = json!({
             "connection_info": "nc challenge.example 31337\n# or open the link in the description",
@@ -3105,6 +3170,9 @@ mod tests {
             value: Some(100),
             category: Some("test".to_owned()),
             category_id: 1,
+            category_logo_key: None,
+            category_logo_color: None,
+            category_icon_object_id: None,
             challenge_kind: "jeopardy".to_owned(),
             exposure: "public".to_owned(),
             challenge_type: Some("standard".to_owned()),

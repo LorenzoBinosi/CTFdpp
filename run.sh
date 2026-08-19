@@ -48,7 +48,11 @@ echo "Pulling external images and rebuilding every application image without cac
 compose pull --policy always --ignore-buildable
 compose build --pull --no-cache
 
-echo "Recreating production containers while preserving every named data volume..."
+echo "Resetting the pre-release production project, including every named volume..."
+echo "WARNING: this deletes PostgreSQL data, stored objects, journals, certificates, and SSH identities."
+compose down --volumes --remove-orphans
+
+echo "Starting fresh production containers..."
 compose up \
     --detach \
     --force-recreate \
@@ -59,4 +63,4 @@ compose up \
 
 compose ps
 echo "CTFZone production containers are ready at the CADDY_SITE_ADDRESS configured in .env."
-echo "Named production volumes were preserved. This command does not migrate an older database schema."
+echo "Every future ./run.sh invocation recreates the database and all other named volumes from zero."

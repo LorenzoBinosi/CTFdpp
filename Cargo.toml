@@ -13,12 +13,14 @@ anyhow = "1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = "1.4"
 csv = "1"
 encoding_rs = "0.8"
 hex = "0.4"
 hmac = "0.12"
 ipnet = "2"
 portable-pty = "0.9"
+png = "0.17"
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
@@ -34,4 +36,5 @@ tower-http = { version = "0.6", features = ["request-id", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+xmlparser = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -34,6 +34,15 @@ pub(super) struct BootstrapData {
     authenticated: bool,
     user: Option<BootstrapUser>,
     site: SiteConfig,
+    navigation: Vec<NavigationPage>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub(super) struct NavigationPage {
+    id: i32,
+    label: String,
+    endpoint: String,
+    system_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -112,6 +121,7 @@ pub(super) async fn data(
     )
     .to_owned();
     let authenticated = user.is_some();
+    let navigation = navigation_pages(state, user.as_ref()).await?;
     let user = if let Some(user) = user {
         let score = current_score(state, score_account(&user_mode, user.id, user.team_id)).await?;
         Some(BootstrapUser {
@@ -132,6 +142,7 @@ pub(super) async fn data(
         setup_required,
         authenticated,
         user,
+        navigation,
         site: SiteConfig {
             name: config(&configs, "ctf_name", crate::browser_auth::DEFAULT_CTF_NAME),
             description: config(&configs, "ctf_description", ""),
@@ -154,6 +165,26 @@ pub(super) async fn data(
             registration_access_mode,
         },
     })
+}
+
+async fn navigation_pages(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+) -> Result<Vec<NavigationPage>, ApiError> {
+    sqlx::query_as::<_, NavigationPage>(
+        r#"
+        SELECT id,label,endpoint,system_key
+        FROM ctfzone.pages
+        WHERE page_type <> 'home'
+          AND visibility <> 'invisible'
+          AND (visibility = 'public' OR ($1 AND visibility = 'private'))
+        ORDER BY navigation_order,lower(label),id
+        "#,
+    )
+    .bind(user.is_some())
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::database)
 }
 
 fn score_account(user_mode: &str, user_id: i32, team_id: Option<i32>) -> Option<ScoreAccount> {
@@ -245,6 +276,12 @@ mod contract_tests {
                 score: 42,
                 place: None,
             }),
+            navigation: vec![NavigationPage {
+                id: 2,
+                label: "Challenges".to_owned(),
+                endpoint: "challenges".to_owned(),
+                system_key: Some("challenges".to_owned()),
+            }],
             site: SiteConfig {
                 name: "CTFZone".to_owned(),
                 description: String::new(),
@@ -267,6 +304,7 @@ mod contract_tests {
         assert!(value.get("csrf_token").is_none());
         assert_eq!(value["user"]["score"], 42);
         assert!(value["user"]["place"].is_null());
+        assert_eq!(value["navigation"][0]["endpoint"], "challenges");
         assert_eq!(value["site"]["player_frontend"], "terminal");
         assert_eq!(value["site"]["registration_access_mode"], "access_code");
         assert_eq!(value["site"]["team_creation"], true);

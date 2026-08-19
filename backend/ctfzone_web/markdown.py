@@ -57,6 +57,23 @@ _ALLOWED_HTML_TAGS = frozenset(
     }
 )
 _VOID_HTML_TAGS = frozenset({"br", "hr"})
+_ALLOWED_PAGE_LAYOUT_CLASSES = frozenset(
+    {
+        "align-items-center",
+        "align-items-end",
+        "align-items-start",
+        "col",
+        "display-1",
+        "lead",
+        "page-actions",
+        "page-section",
+        "row",
+        "text-center",
+        "text-end",
+        "text-start",
+    }
+)
+_ALLOWED_PAGE_GRID_CLASS = re.compile(r"^(?:col-md-(?:[1-9]|1[0-2])|offset-md-(?:[0-9]|1[01]))$")
 _BLOCK_HTML = re.compile(
     r"^</?(?:blockquote|details|div|h[1-4]|hr|ol|p|pre|summary|table|tbody|td|th|thead|tr|ul)(?:\s|/?>)",
     re.IGNORECASE,
@@ -73,10 +90,11 @@ def _safe_href(value: str) -> str | None:
 
 
 class _HtmlTokenParser(HTMLParser):
-    def __init__(self, tokens: dict[str, str]) -> None:
+    def __init__(self, tokens: dict[str, str], *, allow_page_layout: bool = False) -> None:
         super().__init__(convert_charrefs=True)
         self.tokens = tokens
         self.output: list[str] = []
+        self.allow_page_layout = allow_page_layout
 
     def _token(self, html: str) -> None:
         token = f"\x00HTML{len(self.tokens)}\x00"
@@ -88,19 +106,30 @@ class _HtmlTokenParser(HTMLParser):
         if tag not in _ALLOWED_HTML_TAGS:
             self.output.append(escape(self.get_starttag_text() or f"<{tag}>", quote=True))
             return
+        values = {name.casefold(): value for name, value in attrs if value is not None}
+        attributes = ""
+        if self.allow_page_layout:
+            safe_classes = [
+                value
+                for value in values.get("class", "").split()
+                if value in _ALLOWED_PAGE_LAYOUT_CLASSES
+                or _ALLOWED_PAGE_GRID_CLASS.fullmatch(value)
+            ]
+            if safe_classes:
+                attributes += f' class="{escape(" ".join(safe_classes), quote=True)}"'
         if tag == "a":
-            values = {name.casefold(): value for name, value in attrs if value is not None}
             href = _safe_href(values.get("href", ""))
             title = values.get("title")
-            attributes = ""
             if href is not None:
                 attributes += f' href="{escape(href, quote=True)}"'
-                attributes += ' target="_blank" rel="noopener noreferrer"'
+                parsed_href = urlsplit(href)
+                if parsed_href.scheme in {"http", "https"} and parsed_href.netloc:
+                    attributes += ' target="_blank" rel="noopener noreferrer"'
             if title:
                 attributes += f' title="{escape(title, quote=True)}"'
             self._token(f"<a{attributes}>")
             return
-        self._token(f"<{tag}>")
+        self._token(f"<{tag}{attributes}>")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -127,8 +156,10 @@ class _HtmlTokenParser(HTMLParser):
         self.output.append(escape(f"<?{data}>", quote=True))
 
 
-def _escape_with_safe_html(raw: str, tokens: dict[str, str]) -> str:
-    parser = _HtmlTokenParser(tokens)
+def _escape_with_safe_html(
+    raw: str, tokens: dict[str, str], *, allow_page_layout: bool = False
+) -> str:
+    parser = _HtmlTokenParser(tokens, allow_page_layout=allow_page_layout)
     parser.feed(raw)
     parser.close()
     return "".join(parser.output)
@@ -160,6 +191,17 @@ def _inline(raw: str) -> str:
     for token, html in tokens.items():
         value = value.replace(token, html)
     return value
+
+
+def render_html(raw: object) -> Markup:
+    """Render the deliberately small, script-free custom-page HTML subset."""
+
+    text = "" if raw is None else str(raw).replace("\r\n", "\n").replace("\r", "\n")
+    tokens: dict[str, str] = {}
+    value = _escape_with_safe_html(text, tokens, allow_page_layout=True)
+    for token, html in tokens.items():
+        value = value.replace(token, html)
+    return Markup(value)
 
 
 def render_markdown(raw: object) -> Markup:

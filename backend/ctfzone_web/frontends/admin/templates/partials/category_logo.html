@@ -1,0 +1,37 @@
+{% macro render(key, color='#34689c', class_name='category-built-in-logo') -%}
+  {% if key == 'web' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="web"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 2.5 4.5 5.5 4.5 9S15 18.5 12 21M12 3c-3 2.5-4.5 5.5-4.5 9S9 18.5 12 21"/></svg>
+  {% elif key == 'pwn' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="pwn"><path d="M6 10a6 6 0 0 1 12 0v4l-2 2v3h-3v-2h-2v2H8v-3l-2-2z"/><circle cx="9.5" cy="11" r="1"/><circle cx="14.5" cy="11" r="1"/><path d="m12 13-1 2h2zM8 4 6 2m10 2 2-2"/></svg>
+  {% elif key == 'crypto' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="crypto"><circle cx="8" cy="12" r="4"/><path d="M12 12h9m-3 0v3m-3-3v2M6.5 12h.01"/></svg>
+  {% elif key == 'rev' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="rev"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 3v3m3-3v3m3-3v3M9 18v3m3-3v3m3-3v3M3 9h3m-3 3h3m-3 3h3m12-6h3m-3 3h3m-3 3h3M9 12h6m-2.5-2.5L15 12l-2.5 2.5"/></svg>
+  {% elif key == 'misc' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="misc"><path d="M4 6h6a2 2 0 1 1 4 0h6v5a2 2 0 1 0 0 4v5h-6a2 2 0 1 0-4 0H4v-5a2 2 0 1 0 0-4z"/></svg>
+  {% elif key == 'coding' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="coding"><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-2-13-4 16"/></svg>
+  {% elif key == 'forensics' %}
+    <svg class="{{ class_name }}" viewBox="0 0 24 24" stroke="{{ color }}" aria-hidden="true" focusable="false" data-category-logo="forensics"><circle cx="10" cy="10" r="6"/><path d="m14.5 14.5 6 6M8 8.5c1.5-1.4 4-.3 4 1.7 0 1.5-.7 2.8-1.8 3.8M7.2 11.5c.2 1.2.8 2.3 1.7 3.1M10 6.8c2.4 0 4.2 1.8 4.2 4.1"/></svg>
+  {% endif %}
+{%- endmacro %}
+
+{% set options = [('web', 'Web'), ('pwn', 'Pwn'), ('crypto', 'Crypto'), ('rev', 'Rev'), ('misc', 'Misc'), ('coding', 'Coding'), ('forensics', 'Forensics')] %}
+
+{% macro fallback(name, selected_key, color='#34689c') -%}
+  <span data-category-icon-fallback>
+    <strong data-category-preview-name{% if selected_key %} hidden{% endif %}>{{ name }}</strong>
+    {% for key, label in options %}<span data-category-builtin-logo="{{ key }}"{% if key != selected_key %} hidden{% endif %}>{{ render(key, color) }}</span>{% endfor %}
+  </span>
+{%- endmacro %}
+
+{% macro picker(selected_key, custom_selected=false, color='#34689c', storage_enabled=true) -%}
+  <fieldset class="category-logo-picker" data-category-logo-picker>
+    <legend>Category marker <small>Choose exactly one presentation</small></legend>
+    <div>
+      <label class="category-logo-choice"><input type="radio" name="marker_mode" value="name"{% if not selected_key and not custom_selected %} checked{% endif %}><span class="category-logo-choice-preview"><strong>Aa</strong></span><span><strong>Name only</strong><small>No image required</small></span></label>
+      {% for key, label in options %}<label class="category-logo-choice"><input type="radio" name="marker_mode" value="{{ key }}"{% if key == selected_key and not custom_selected %} checked{% endif %}><span class="category-logo-choice-preview">{{ render(key, color) }}</span><span><strong>{{ label }}</strong><small>{{ key }}</small></span></label>{% endfor %}
+      <label class="category-logo-choice"><input type="radio" name="marker_mode" value="custom"{% if custom_selected %} checked{% endif %}{% if not storage_enabled and not custom_selected %} disabled{% endif %}><span class="category-logo-choice-preview"><strong>↑</strong></span><span><strong>Custom</strong><small>PNG or safe SVG</small></span></label>
+    </div>
+  </fieldset>
+{%- endmacro %}

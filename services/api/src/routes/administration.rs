@@ -10,6 +10,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
+use uuid::Uuid;
 
 use crate::{
     AppState,
@@ -81,31 +82,24 @@ pub(super) struct FieldPatch {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PageInput {
-    title: String,
-    route: String,
+    label: String,
+    endpoint: String,
     content: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    auth_required: bool,
-    #[serde(default = "default_markdown")]
-    format: String,
-    link_target: Option<String>,
+    visibility: String,
+    navigation_order: i32,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PagePatch {
-    title: Option<String>,
-    route: Option<String>,
+    label: Option<String>,
+    endpoint: Option<String>,
     content: Option<String>,
-    draft: Option<bool>,
-    hidden: Option<bool>,
-    auth_required: Option<bool>,
-    format: Option<String>,
-    link_target: Option<String>,
+    visibility: Option<String>,
+    navigation_order: Option<i32>,
+    revision: i64,
 }
 
 #[derive(Deserialize)]
@@ -117,8 +111,21 @@ pub(super) struct BracketInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChallengeCategoryInput {
     name: String,
+    #[serde(default)]
+    logo_key: Option<String>,
+    #[serde(default)]
+    logo_color: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChallengeCategoryPatch {
+    name: Option<Value>,
+    logo_key: Option<Value>,
+    logo_color: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -213,25 +220,27 @@ struct FieldView {
 #[derive(FromRow, Serialize)]
 struct PageView {
     id: i32,
-    title: Option<String>,
-    route: Option<String>,
-    content: Option<String>,
-    draft: Option<bool>,
-    hidden: Option<bool>,
-    auth_required: Option<bool>,
-    format: Option<String>,
-    link_target: Option<String>,
+    label: String,
+    endpoint: String,
+    content: String,
+    page_type: String,
+    system_key: Option<String>,
+    visibility: String,
+    navigation_order: i32,
+    revision: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(FromRow, Serialize)]
 struct PublicPageView {
     id: i32,
-    title: Option<String>,
-    route: String,
+    label: String,
+    endpoint: String,
     content: String,
-    format: String,
-    link_target: Option<String>,
-    auth_required: bool,
+    page_type: String,
+    system_key: Option<String>,
+    visibility: String,
 }
 
 #[derive(FromRow, Serialize)]
@@ -247,6 +256,10 @@ struct BracketView {
 struct ChallengeCategoryView {
     id: i32,
     name: String,
+    logo_key: Option<String>,
+    logo_color: Option<String>,
+    icon_object_id: Option<Uuid>,
+    challenge_count: i64,
 }
 
 #[derive(FromRow, Serialize)]
@@ -791,11 +804,19 @@ pub(super) async fn list_pages(
     user: CurrentUser,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let pages = sqlx::query_as::<_, PageView>(&page_select("ORDER BY id"))
-        .fetch_all(&state.database)
-        .await
-        .map_err(ApiError::database)?;
+    let pages =
+        sqlx::query_as::<_, PageView>(&page_select("ORDER BY navigation_order, lower(label), id"))
+            .fetch_all(&state.database)
+            .await
+            .map_err(ApiError::database)?;
     Ok(Json(Success::new(pages)).into_response())
+}
+
+pub(super) async fn get_root_page(
+    State(state): State<AppState>,
+    OptionalCurrentUser(user): OptionalCurrentUser,
+) -> Result<Response, ApiError> {
+    public_page_response(&state, user.as_ref(), "").await
 }
 
 pub(super) async fn get_page_by_route(
@@ -803,25 +824,34 @@ pub(super) async fn get_page_by_route(
     OptionalCurrentUser(user): OptionalCurrentUser,
     Path(route): Path<String>,
 ) -> Result<Response, ApiError> {
-    let route = validate_public_page_route(&route)?;
+    let route = validate_custom_page_endpoint(&route)?;
+    public_page_response(&state, user.as_ref(), &route).await
+}
+
+async fn public_page_response(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    endpoint: &str,
+) -> Result<Response, ApiError> {
     let page = sqlx::query_as::<_, PublicPageView>(
         r#"
-        SELECT id,title,route,COALESCE(content,'') AS content,
-               COALESCE(format,'markdown') AS format,link_target,
-               COALESCE(auth_required,false) AS auth_required
+        SELECT id,label,endpoint,content,page_type,system_key,visibility
         FROM ctfzone.pages
-        WHERE route=$1
-          AND NOT COALESCE(draft,false)
-          AND NOT COALESCE(hidden,false)
+        WHERE endpoint=$1
         "#,
     )
-    .bind(route)
+    .bind(endpoint)
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::not_found("Page not found"))?;
-    if page.auth_required && user.is_none() {
-        return Err(ApiError::forbidden("Authentication required"));
+    match page.visibility.as_str() {
+        "public" => {}
+        "private" if user.is_some() => {}
+        "private" => return Err(ApiError::forbidden("Authentication required")),
+        "invisible" if user.is_some_and(CurrentUser::is_admin) => {}
+        "invisible" => return Err(ApiError::not_found("Page not found")),
+        _ => return Err(ApiError::not_found("Page not found")),
     }
     Ok(Json(Success::new(page)).into_response())
 }
@@ -838,30 +868,58 @@ pub(super) async fn get_page(
 pub(super) async fn create_page(
     State(state): State<AppState>,
     user: CurrentUser,
+    headers: HeaderMap,
     Json(request): Json<PageInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    validate_page(&request.route, &request.format)?;
+    let label = validate_page_label(&request.label)?;
+    let endpoint = validate_custom_page_endpoint(&request.endpoint)?;
+    let content = validate_page_content(&request.content)?;
+    let visibility = validate_page_visibility(&request.visibility)?;
+    let navigation_order = validate_page_navigation_order(request.navigation_order, false)?;
+    let request_data = json!({
+        "label": &label,
+        "endpoint": &endpoint,
+        "content": &content,
+        "visibility": &visibility,
+        "navigation_order": navigation_order,
+    });
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let (idempotency, replay) = super::create_idempotency::CreateRequest::lock_and_replay(
+        &mut transaction,
+        &headers,
+        user.id,
+        super::create_idempotency::PAGE_CREATE,
+        &request_data,
+    )
+    .await?;
+    if let Some(response_data) = replay {
+        transaction.commit().await.map_err(ApiError::database)?;
+        return Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response());
+    }
     let page = sqlx::query_as::<_, PageView>(
         r#"
         INSERT INTO ctfzone.pages
-            (title,route,content,draft,hidden,auth_required,format,link_target)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        RETURNING id,title,route,content,draft,hidden,auth_required,format,link_target
+            (label,endpoint,content,page_type,system_key,visibility,navigation_order)
+        VALUES ($1,$2,$3,'custom',NULL,$4,$5)
+        RETURNING id,label,endpoint,content,page_type,system_key,visibility,
+                  navigation_order,revision,created_at,updated_at
         "#,
     )
-    .bind(request.title)
-    .bind(normalize_route(&request.route))
-    .bind(request.content)
-    .bind(request.draft)
-    .bind(request.hidden)
-    .bind(request.auth_required)
-    .bind(request.format)
-    .bind(request.link_target)
-    .fetch_one(&state.database)
+    .bind(label)
+    .bind(endpoint)
+    .bind(content)
+    .bind(visibility)
+    .bind(navigation_order)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(map_admin_database_error)?;
-    Ok((StatusCode::CREATED, Json(Success::new(page))).into_response())
+    let response_data = json!(&page);
+    idempotency
+        .complete(&mut transaction, page.id, &response_data)
+        .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response())
 }
 
 pub(super) async fn update_page(
@@ -871,39 +929,98 @@ pub(super) async fn update_page(
     Json(request): Json<PagePatch>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    if let Some(route) = request.route.as_deref() {
-        validate_page(route, request.format.as_deref().unwrap_or("markdown"))?;
+    if request.revision < 1 {
+        return Err(ApiError::bad_request("Page revision is invalid"));
     }
-    if request
-        .format
-        .as_deref()
-        .is_some_and(|format| !matches!(format, "markdown" | "html"))
+    if request.label.is_none()
+        && request.endpoint.is_none()
+        && request.content.is_none()
+        && request.visibility.is_none()
+        && request.navigation_order.is_none()
     {
-        return Err(ApiError::bad_request("Unsupported page format"));
+        return Err(ApiError::bad_request("No page changes were supplied"));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let current = sqlx::query_as::<_, PageView>(&page_select("WHERE id=$1 FOR UPDATE"))
+        .bind(page_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("Page not found"))?;
+    if current.revision != request.revision {
+        return Err(ApiError::conflict(
+            "This page changed since it was loaded; refresh before saving",
+        ));
+    }
+    match current.page_type.as_str() {
+        "home" => {
+            if request.endpoint.is_some()
+                || request.visibility.is_some()
+                || request.navigation_order.is_some()
+            {
+                return Err(ApiError::bad_request(
+                    "The root endpoint, visibility, and order are fixed",
+                ));
+            }
+        }
+        "system" => {
+            if request.label.is_some() || request.endpoint.is_some() || request.content.is_some() {
+                return Err(ApiError::bad_request(
+                    "System page labels, endpoints, and content cannot be changed",
+                ));
+            }
+        }
+        "custom" => {}
+        _ => return Err(ApiError::conflict("Page type is invalid")),
+    }
+
+    let label = match request.label {
+        Some(value) => validate_page_label(&value)?,
+        None => current.label.clone(),
+    };
+    let endpoint = match request.endpoint {
+        Some(value) if current.page_type == "custom" => validate_custom_page_endpoint(&value)?,
+        Some(_) => return Err(ApiError::bad_request("Page endpoint cannot be changed")),
+        None => current.endpoint.clone(),
+    };
+    let content = match request.content {
+        Some(value) => validate_page_content(&value)?,
+        None => current.content.clone(),
+    };
+    let visibility = match request.visibility {
+        Some(value) => validate_page_visibility(&value)?,
+        None => current.visibility.clone(),
+    };
+    let navigation_order = validate_page_navigation_order(
+        request.navigation_order.unwrap_or(current.navigation_order),
+        current.page_type == "home",
+    )?;
+
     let page = sqlx::query_as::<_, PageView>(
         r#"
-        UPDATE ctfzone.pages SET title=COALESCE($1,title),route=COALESCE($2,route),
-            content=COALESCE($3,content),draft=COALESCE($4,draft),hidden=COALESCE($5,hidden),
-            auth_required=COALESCE($6,auth_required),format=COALESCE($7,format),
-            link_target=COALESCE($8,link_target)
-        WHERE id=$9
-        RETURNING id,title,route,content,draft,hidden,auth_required,format,link_target
+        UPDATE ctfzone.pages
+        SET label=$1,endpoint=$2,content=$3,visibility=$4,navigation_order=$5,
+            revision=revision+1,updated_at=now()
+        WHERE id=$6 AND revision=$7
+        RETURNING id,label,endpoint,content,page_type,system_key,visibility,
+                  navigation_order,revision,created_at,updated_at
         "#,
     )
-    .bind(request.title)
-    .bind(request.route.map(|route| normalize_route(&route)))
-    .bind(request.content)
-    .bind(request.draft)
-    .bind(request.hidden)
-    .bind(request.auth_required)
-    .bind(request.format)
-    .bind(request.link_target)
+    .bind(label)
+    .bind(endpoint)
+    .bind(content)
+    .bind(&visibility)
+    .bind(navigation_order)
     .bind(page_id)
-    .fetch_optional(&state.database)
+    .bind(current.revision)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(map_admin_database_error)?
-    .ok_or_else(|| ApiError::not_found("Page not found"))?;
+    .ok_or_else(|| ApiError::conflict("Page revision changed while saving"))?;
+    if let Some(system_key) = page.system_key.as_deref() {
+        sync_system_page_visibility(&mut transaction, system_key, &visibility).await?;
+    }
+    transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(Success::new(page)).into_response())
 }
 
@@ -913,7 +1030,29 @@ pub(super) async fn delete_page(
     Path(page_id): Path<i32>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    delete_integer_id(&state, &user, "pages", page_id).await
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let page = sqlx::query_as::<_, PageView>(&page_select("WHERE id=$1 FOR UPDATE"))
+        .bind(page_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("Page not found"))?;
+    if page.page_type != "custom" {
+        return Err(ApiError::conflict("Built-in pages cannot be deleted"));
+    }
+    sqlx::query("DELETE FROM ctfzone.pages WHERE id=$1")
+        .bind(page_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    super::create_idempotency::forget_resource(
+        &mut transaction,
+        super::create_idempotency::PAGE_CREATE,
+        page_id,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 pub(super) async fn list_brackets(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -930,12 +1069,29 @@ pub(super) async fn list_challenge_categories(
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
     let rows = sqlx::query_as::<_, ChallengeCategoryView>(
-        "SELECT id,name FROM ctfzone.challenge_categories ORDER BY lower(name),id",
+        r#"
+        SELECT category.id,category.name,category.logo_key,category.logo_color,category.icon_object_id,
+               COUNT(challenge.id)::bigint AS challenge_count
+        FROM ctfzone.challenge_categories category
+        LEFT JOIN ctfzone.challenges challenge ON challenge.category_id=category.id
+        GROUP BY category.id
+        ORDER BY lower(category.name),category.id
+        "#,
     )
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::database)?;
     Ok(Json(Success::new(rows)).into_response())
+}
+
+pub(super) async fn get_challenge_category(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(category_id): Path<i32>,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let row = load_challenge_category(&state, category_id).await?;
+    Ok(Json(Success::new(row)).into_response())
 }
 
 pub(super) async fn create_challenge_category(
@@ -945,11 +1101,11 @@ pub(super) async fn create_challenge_category(
     Json(request): Json<ChallengeCategoryInput>,
 ) -> Result<Response, ApiError> {
     require_admin(&user)?;
-    let name = validate_short_text(&request.name, "Category")?;
-    if name.len() > 80 {
-        return Err(ApiError::bad_request("Category value is invalid"));
-    }
-    let request_data = json!({"name": &name});
+    let name = validate_challenge_category_name(&request.name)?;
+    let logo_key = validate_challenge_category_logo_key(request.logo_key.as_deref())?;
+    let logo_color =
+        validate_challenge_category_logo_color(request.logo_color.as_deref(), logo_key.as_deref())?;
+    let request_data = json!({"name": &name, "logo_key": &logo_key, "logo_color": &logo_color});
     let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
     let (idempotency, replay) = super::create_idempotency::CreateRequest::lock_and_replay(
         &mut transaction,
@@ -964,18 +1120,114 @@ pub(super) async fn create_challenge_category(
         return Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response());
     }
     let row = sqlx::query_as::<_, ChallengeCategoryView>(
-        "INSERT INTO ctfzone.challenge_categories (name) VALUES ($1) RETURNING id,name",
+        r#"
+        INSERT INTO ctfzone.challenge_categories (name,logo_key,logo_color)
+        VALUES ($1,$2,$3)
+        RETURNING id,name,logo_key,logo_color,icon_object_id,0::bigint AS challenge_count
+        "#,
     )
     .bind(name)
+    .bind(logo_key)
+    .bind(logo_color)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|error| ApiError::conflict_or_database(error, "Challenge category already exists"))?;
-    let response_data = json!({"id": row.id, "name": row.name});
+    let response_data = json!({
+        "id": row.id,
+        "name": row.name,
+        "logo_key": row.logo_key,
+        "logo_color": row.logo_color,
+        "icon_object_id": row.icon_object_id,
+        "challenge_count": row.challenge_count,
+    });
     idempotency
         .complete(&mut transaction, row.id, &response_data)
         .await?;
     transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(Success::new(response_data))).into_response())
+}
+
+pub(super) async fn update_challenge_category(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(category_id): Path<i32>,
+    Json(request): Json<ChallengeCategoryPatch>,
+) -> Result<Response, ApiError> {
+    require_admin(&user)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::database)?;
+    let current = sqlx::query_as::<_, ChallengeCategoryView>(
+        r#"
+        SELECT category.id,category.name,category.logo_key,category.logo_color,category.icon_object_id,
+               (SELECT COUNT(*)::bigint FROM ctfzone.challenges challenge
+                WHERE challenge.category_id=category.id) AS challenge_count
+        FROM ctfzone.challenge_categories category
+        WHERE category.id=$1
+        FOR UPDATE OF category
+        "#,
+    )
+    .bind(category_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge category not found"))?;
+
+    let name = match request.name.as_ref() {
+        None => current.name,
+        Some(Value::String(value)) => validate_challenge_category_name(value)?,
+        Some(_) => return Err(ApiError::bad_request("Category name must be a string")),
+    };
+    let logo_key = match request.logo_key.as_ref() {
+        None => current.logo_key,
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => validate_challenge_category_logo_key(Some(value))?,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "Category logo_key must be a string or null",
+            ));
+        }
+    };
+    let requested_logo_color = match request.logo_color.as_ref() {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(value)) => Some(Some(value.as_str())),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "Category logo_color must be a string or null",
+            ));
+        }
+    };
+    let logo_color = if logo_key.is_none() {
+        if requested_logo_color.is_some_and(|value| value.is_some()) {
+            return Err(ApiError::bad_request(
+                "Category logo_color requires a built-in logo",
+            ));
+        }
+        None
+    } else {
+        let requested = match requested_logo_color {
+            None => current.logo_color.as_deref(),
+            Some(value) => value,
+        };
+        validate_challenge_category_logo_color(requested, logo_key.as_deref())?
+    };
+    let row = sqlx::query_as::<_, ChallengeCategoryView>(
+        r#"
+        UPDATE ctfzone.challenge_categories
+        SET name=$1,logo_key=$2,logo_color=$3
+        WHERE id=$4
+        RETURNING id,name,logo_key,logo_color,icon_object_id,$5::bigint AS challenge_count
+        "#,
+    )
+    .bind(name)
+    .bind(logo_key)
+    .bind(logo_color)
+    .bind(category_id)
+    .bind(current.challenge_count)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| ApiError::conflict_or_database(error, "Challenge category already exists"))?;
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(Json(Success::new(row)).into_response())
 }
 
 pub(super) async fn delete_challenge_category(
@@ -1991,6 +2243,26 @@ async fn load_page(state: &AppState, id: i32) -> Result<PageView, ApiError> {
         .ok_or_else(|| ApiError::not_found("Page not found"))
 }
 
+async fn load_challenge_category(
+    state: &AppState,
+    category_id: i32,
+) -> Result<ChallengeCategoryView, ApiError> {
+    sqlx::query_as::<_, ChallengeCategoryView>(
+        r#"
+        SELECT category.id,category.name,category.logo_key,category.logo_color,category.icon_object_id,
+               (SELECT COUNT(*)::bigint FROM ctfzone.challenges challenge
+                WHERE challenge.category_id=category.id) AS challenge_count
+        FROM ctfzone.challenge_categories category
+        WHERE category.id=$1
+        "#,
+    )
+    .bind(category_id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(|| ApiError::not_found("Challenge category not found"))
+}
+
 async fn load_flag(state: &AppState, id: i32) -> Result<FlagView, ApiError> {
     sqlx::query_as::<_, FlagView>(
         "SELECT id,challenge_id,type AS flag_type,content,data,revision FROM ctfzone.flags WHERE id=$1",
@@ -2114,7 +2386,7 @@ fn field_select(suffix: &str) -> String {
 
 fn page_select(suffix: &str) -> String {
     format!(
-        "SELECT id,title,route,content,draft,hidden,auth_required,format,link_target FROM ctfzone.pages {suffix}"
+        "SELECT id,label,endpoint,content,page_type,system_key,visibility,navigation_order,revision,created_at,updated_at FROM ctfzone.pages {suffix}"
     )
 }
 
@@ -2158,38 +2430,120 @@ fn validate_field(owner_type: &str, field_type: &str, name: &str) -> Result<(), 
     Ok(())
 }
 
-fn validate_page(route: &str, format: &str) -> Result<(), ApiError> {
-    let route = normalize_route(route);
-    if route.is_empty()
-        || route.len() > 128
-        || route.contains("..")
-        || !route
+fn validate_page_label(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || value
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "/_-".contains(character))
-        || !matches!(format, "markdown" | "html")
+            .any(|character| character.is_control() || is_bidi_control(character))
     {
-        return Err(ApiError::bad_request("Page route or format is invalid"));
+        return Err(ApiError::bad_request("Page label is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_page_content(value: &str) -> Result<String, ApiError> {
+    let value = value.replace("\r\n", "\n").replace('\r', "\n");
+    if value.len() > 262_144 || value.contains('\0') {
+        return Err(ApiError::bad_request(
+            "Page HTML must be no larger than 256 KiB and cannot contain NUL bytes",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_custom_page_endpoint(value: &str) -> Result<String, ApiError> {
+    let endpoint = value.trim().trim_matches('/').to_ascii_lowercase();
+    let valid = !endpoint.is_empty()
+        && endpoint.len() <= 128
+        && !endpoint.contains("..")
+        && endpoint.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+                })
+        });
+    let first = endpoint.split('/').next().unwrap_or_default();
+    let reserved = matches!(
+        first,
+        "admin"
+            | "api"
+            | "assets"
+            | "bff"
+            | "category-icons"
+            | "challenges"
+            | "confirm"
+            | "downloads"
+            | "healthz"
+            | "login"
+            | "logout"
+            | "profile"
+            | "register"
+            | "scoreboard"
+            | "settings"
+            | "setup"
+            | "team"
+            | "teams"
+            | "users"
+    );
+    if !valid || reserved {
+        return Err(ApiError::bad_request(
+            "Page endpoint is invalid or reserved",
+        ));
+    }
+    Ok(endpoint)
+}
+
+fn validate_page_visibility(value: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "public" | "private" | "invisible") {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("Page visibility is invalid"))
+    }
+}
+
+fn validate_page_navigation_order(value: i32, home: bool) -> Result<i32, ApiError> {
+    if (home && value == 0) || (!home && (1..=10_000).contains(&value)) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("Page navigation order is invalid"))
+    }
+}
+
+async fn sync_system_page_visibility(
+    transaction: &mut Transaction<'_, Postgres>,
+    system_key: &str,
+    visibility: &str,
+) -> Result<(), ApiError> {
+    let config_key = match system_key {
+        "challenges" => "challenge_visibility",
+        "scoreboard" => "score_visibility",
+        "home" => return Ok(()),
+        _ => return Err(ApiError::conflict("System page key is invalid")),
+    };
+    let config_value = if visibility == "invisible" {
+        "admins"
+    } else {
+        visibility
+    };
+    let result = sqlx::query("UPDATE ctfzone.config SET value=$1 WHERE key=$2")
+        .bind(config_value)
+        .bind(config_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::database)?;
+    if result.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "System visibility configuration is unavailable",
+        ));
     }
     Ok(())
-}
-
-fn normalize_route(route: &str) -> String {
-    route.trim().trim_start_matches('/').to_owned()
-}
-
-fn validate_public_page_route(route: &str) -> Result<String, ApiError> {
-    let route = normalize_route(route);
-    if route.is_empty()
-        || route.len() > 128
-        || route.contains("..")
-        || route.contains('/')
-        || !route
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
-    {
-        return Err(ApiError::bad_request("Page route is invalid"));
-    }
-    Ok(route)
 }
 
 fn validate_bracket(request: &BracketInput) -> Result<(), ApiError> {
@@ -2198,6 +2552,74 @@ fn validate_bracket(request: &BracketInput) -> Result<(), ApiError> {
         return Err(ApiError::bad_request("Bracket definition is invalid"));
     }
     Ok(())
+}
+
+fn validate_challenge_category_name(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || value
+            .chars()
+            .any(|character| character.is_control() || is_bidi_control(character))
+    {
+        return Err(ApiError::bad_request("Category value is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_challenge_category_logo_key(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(
+        value,
+        "web" | "pwn" | "crypto" | "rev" | "misc" | "coding" | "forensics"
+    ) {
+        Ok(Some(value.to_owned()))
+    } else {
+        Err(ApiError::bad_request("Category logo_key is not supported"))
+    }
+}
+
+const DEFAULT_CATEGORY_LOGO_COLOR: &str = "#34689c";
+
+fn validate_challenge_category_logo_color(
+    value: Option<&str>,
+    logo_key: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if logo_key.is_none() {
+        return if value.is_none() {
+            Ok(None)
+        } else {
+            Err(ApiError::bad_request(
+                "Category logo_color requires a built-in logo",
+            ))
+        };
+    }
+    let value = value
+        .unwrap_or(DEFAULT_CATEGORY_LOGO_COLOR)
+        .to_ascii_lowercase();
+    if value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        Ok(Some(value))
+    } else {
+        Err(ApiError::bad_request(
+            "Category logo_color must be a six-digit hexadecimal color",
+        ))
+    }
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 async fn challenge_has_active_runtime(
@@ -2247,10 +2669,6 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn default_markdown() -> String {
-    "markdown".to_owned()
-}
-
 fn map_admin_database_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(database_error) = &error {
         if database_error.is_unique_violation() {
@@ -2293,21 +2711,75 @@ mod tests {
     }
 
     #[test]
-    fn validates_public_page_slugs() {
-        assert_eq!(validate_public_page_route(" rules ").unwrap(), "rules");
+    fn validates_custom_page_contract() {
+        assert_eq!(validate_custom_page_endpoint(" /rules/ ").unwrap(), "rules");
         assert_eq!(
-            validate_public_page_route("event_rules-2026").unwrap(),
+            validate_custom_page_endpoint("event_rules-2026").unwrap(),
             "event_rules-2026"
         );
-        assert!(validate_public_page_route("").is_err());
-        assert!(validate_public_page_route("../rules").is_err());
-        assert!(validate_public_page_route("nested/rules").is_err());
-        assert!(validate_public_page_route("https://example.test").is_err());
+        assert_eq!(
+            validate_custom_page_endpoint("guides/beginners").unwrap(),
+            "guides/beginners"
+        );
+        assert!(validate_custom_page_endpoint("").is_err());
+        assert!(validate_custom_page_endpoint("../rules").is_err());
+        assert!(validate_custom_page_endpoint("challenges").is_err());
+        assert!(validate_custom_page_endpoint("admin/preview").is_err());
+        assert!(validate_custom_page_endpoint("team").is_err());
+        assert!(validate_custom_page_endpoint("downloads/example").is_err());
+        assert!(validate_custom_page_endpoint("https://example.test").is_err());
+        assert_eq!(validate_page_visibility(" PRIVATE ").unwrap(), "private");
+        assert!(validate_page_visibility("hidden").is_err());
+        assert_eq!(validate_page_navigation_order(1, false).unwrap(), 1);
+        assert!(validate_page_navigation_order(0, false).is_err());
+        assert_eq!(validate_page_navigation_order(0, true).unwrap(), 0);
+        assert!(validate_page_content(&"x".repeat(262_145)).is_err());
+        assert!(validate_page_content("<p>ok</p>\0").is_err());
     }
 
     #[test]
     fn escapes_allowlist_search_wildcards_as_literals() {
         assert_eq!(escape_like("100%_\\example"), "100\\%\\_\\\\example");
+    }
+
+    #[test]
+    fn challenge_category_names_are_bounded_and_safe() {
+        assert_eq!(
+            validate_challenge_category_name(" Hardware ").unwrap(),
+            "Hardware"
+        );
+        assert!(validate_challenge_category_name("").is_err());
+        assert!(validate_challenge_category_name(&"x".repeat(81)).is_err());
+        assert!(validate_challenge_category_name(&"🦕".repeat(20)).is_ok());
+        assert!(validate_challenge_category_name(&"🦕".repeat(21)).is_err());
+        assert!(validate_challenge_category_name("safe\u{202e}txt").is_err());
+        assert!(validate_challenge_category_name("safe\u{2066}txt").is_err());
+        assert!(validate_challenge_category_name("safe\u{0007}txt").is_err());
+        assert!(validate_challenge_category_name("safe\u{0085}txt").is_err());
+    }
+
+    #[test]
+    fn challenge_category_logos_are_semantic_and_bounded() {
+        for key in ["web", "pwn", "crypto", "rev", "misc", "coding", "forensics"] {
+            assert_eq!(
+                validate_challenge_category_logo_key(Some(key)).unwrap(),
+                Some(key.to_owned())
+            );
+        }
+        assert_eq!(validate_challenge_category_logo_key(None).unwrap(), None);
+        assert!(validate_challenge_category_logo_key(Some("dinosaur")).is_err());
+        assert!(validate_challenge_category_logo_key(Some("WEB")).is_err());
+        assert!(validate_challenge_category_logo_key(Some("")).is_err());
+        assert_eq!(
+            validate_challenge_category_logo_color(None, Some("web")).unwrap(),
+            Some(DEFAULT_CATEGORY_LOGO_COLOR.to_owned())
+        );
+        assert_eq!(
+            validate_challenge_category_logo_color(Some("#A1B2C3"), Some("web")).unwrap(),
+            Some("#a1b2c3".to_owned())
+        );
+        assert!(validate_challenge_category_logo_color(Some("red"), Some("web")).is_err());
+        assert!(validate_challenge_category_logo_color(Some("#123abc"), None).is_err());
     }
 
     #[test]

@@ -1,0 +1,108 @@
+{% extends "admin/base.html" %}
+{% import "admin/partials/category_logo.html" as category_logos %}
+{% block description %}<p>Define reusable challenge categories and choose a built-in logo, upload your own, or display the category name.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel category-create-panel" data-category-catalog>
+    <header class="admin-panel-heading">
+      <div>
+        <span class="eyebrow">NEW CATEGORY</span>
+        <h2>Create category</h2>
+        <p>A category must exist before it can be selected by a challenge.</p>
+      </div>
+    </header>
+    <form class="category-editor category-create-form" data-category-form data-category-mode="create">
+      <div class="category-editor-fields">
+        <label class="admin-field">
+          <span>Name</span>
+          <input name="name" required maxlength="80" autocomplete="off" placeholder="Web exploitation" data-category-name>
+        </label>
+        {{ category_logos.picker(none, false, '#34689c', storage_origin) }}
+        <label class="admin-field category-logo-color-field" data-category-logo-color-fields hidden>
+          <span>Logo color <small>Built-in logos only</small></span>
+          <input name="logo_color" type="color" value="#34689c" data-category-logo-color>
+        </label>
+        <label class="admin-field admin-file-picker" data-category-custom-logo-fields hidden>
+          <span>Custom logo <small>{{ 'PNG (128 × 128) or sanitized square SVG · 256 KiB maximum' if storage_origin else 'Upload unavailable' }}</small></span>
+          <input name="icon" type="file" accept="image/png,image/svg+xml,.svg" data-category-icon-file data-storage-enabled="{{ 'true' if storage_origin else 'false' }}" disabled{% if not storage_origin %} title="Configure the public object-storage origin to upload category icons"{% endif %}>
+          {% if not storage_origin %}<small class="category-storage-note">Icon uploads are unavailable until the public object-storage origin is configured. You can still create a name-only category.</small>{% endif %}
+        </label>
+        <div class="category-preview-field">
+          <span>Compact marker preview</span>
+          <div class="category-marker-preview" data-category-preview role="img" aria-label="Category marker preview">
+            {{ category_logos.fallback('Category name', none, '#34689c') }}
+            <img width="24" height="24" alt="" hidden data-category-upload-preview>
+          </div>
+        </div>
+      </div>
+      <div class="category-editor-actions">
+        <p>Name only requires no file. Custom logos accept a 128 × 128 PNG or a strictly sanitized square SVG. Filters and selectors always keep the name visible.</p>
+        <p class="category-form-error" data-category-form-error role="alert" aria-live="polite"></p>
+        <button class="button" type="submit">Create category</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="category-inventory" aria-labelledby="category-inventory-heading">
+    <header class="category-inventory-heading">
+      <div><span class="eyebrow">COMPETITION CATALOG</span><h2 id="category-inventory-heading">Configured categories</h2></div>
+      <span class="muted mono">{{ categories | length }} total</span>
+    </header>
+    <div class="category-card-grid">
+      {% for category in categories %}
+        <article class="admin-panel category-card" data-category-card="{{ category.id }}">
+          <header class="category-card-heading">
+            <div class="category-card-identity">
+              <span class="category-card-icon category-image-marker" role="img" aria-label="Category: {{ category.name }}">
+                {{ category_logos.fallback(category.name, category.logo_key, category.logo_color or '#34689c') }}
+                {% if category.icon_url %}<img src="{{ category.icon_url }}" width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-icon-image>{% endif %}
+              </span>
+              <div><h3>{{ category.name }}</h3><p>{{ category.challenge_count }} attached challenge{{ '' if category.challenge_count == 1 else 's' }}</p></div>
+            </div>
+            <span class="status-pill">{{ 'Custom logo' if category.icon_object_id else ('Built-in logo' if category.logo_key else 'Name marker') }}</span>
+          </header>
+          <form class="category-editor" data-category-form data-category-mode="edit" data-category-id="{{ category.id }}" data-category-icon-object-id="{{ category.icon_object_id or '' }}">
+            <div class="category-editor-fields">
+              <label class="admin-field">
+                <span>Name</span>
+                <input name="name" required maxlength="80" autocomplete="off" value="{{ category.name }}" data-category-name>
+              </label>
+              {{ category_logos.picker(category.logo_key, category.icon_object_id, category.logo_color or '#34689c', storage_origin) }}
+              <label class="admin-field category-logo-color-field" data-category-logo-color-fields{% if not category.logo_key or category.icon_object_id %} hidden{% endif %}>
+                <span>Logo color <small>Built-in logos only</small></span>
+                <input name="logo_color" type="color" value="{{ category.logo_color or '#34689c' }}" data-category-logo-color{% if not category.logo_key or category.icon_object_id %} disabled{% endif %}>
+              </label>
+              <label class="admin-field admin-file-picker" data-category-custom-logo-fields{% if not category.icon_object_id %} hidden{% endif %}>
+                <span>{{ 'Replace custom logo' if category.icon_object_id else 'Add custom logo' }} <small>{{ 'PNG (128 × 128) or sanitized square SVG · 256 KiB maximum' if storage_origin else 'Upload unavailable' }}</small></span>
+                <input name="icon" type="file" accept="image/png,image/svg+xml,.svg" data-category-icon-file data-storage-enabled="{{ 'true' if storage_origin else 'false' }}"{% if not storage_origin or not category.icon_object_id %} disabled{% endif %}{% if not storage_origin %} title="Configure the public object-storage origin to upload category icons"{% endif %}>
+                {% if not storage_origin %}<small class="category-storage-note">Icon uploads are unavailable until the public object-storage origin is configured. Renaming and removal remain available.</small>{% endif %}
+              </label>
+              <div class="category-preview-field">
+                <span>Compact marker preview</span>
+                <div class="category-marker-preview category-image-marker" data-category-preview role="img" aria-label="Category marker preview for {{ category.name }}">
+                  {{ category_logos.fallback(category.name, category.logo_key, category.logo_color or '#34689c') }}
+                  {% if category.icon_url %}<img src="{{ category.icon_url }}" width="24" height="24" alt="" hidden referrerpolicy="no-referrer" data-category-icon-image>{% endif %}
+                  <img width="24" height="24" alt="" hidden data-category-upload-preview>
+                </div>
+              </div>
+            </div>
+            <footer class="category-card-actions">
+              <div>
+                {% if category.challenge_count %}<p>Reassign {{ category.challenge_count }} attached challenge{{ '' if category.challenge_count == 1 else 's' }} before deleting this category.</p>{% else %}<p>This unused category can be deleted.</p>{% endif %}
+                <p class="category-form-error" data-category-form-error role="alert" aria-live="polite"></p>
+              </div>
+              <button class="secondary-button button-small" type="button" data-remove-category-icon data-category-icon-object-id="{{ category.icon_object_id or '' }}"{% if not category.icon_object_id %} disabled title="This category has no custom logo"{% endif %}>Remove custom logo</button>
+              <button class="danger-button button-small" type="button" data-delete-category{% if category.challenge_count %} disabled title="Reassign attached challenges before deleting"{% endif %}>Delete</button>
+              <button class="button button-small" type="submit">Save changes</button>
+            </footer>
+          </form>
+        </article>
+      {% else %}
+        <article class="admin-panel admin-empty-card category-empty-card">
+          <span class="empty-glyph" aria-hidden="true">◇</span>
+          <h2>No categories yet</h2>
+          <p>Create the first category above, then select it while authoring a challenge.</p>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

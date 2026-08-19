@@ -96,11 +96,27 @@ cannot appear as selectable and then fail with missing CSS or JavaScript.
 `GET /` consults bootstrap state. A fresh installation is sent to `/setup`,
 which is rendered by the neutral administration frontend. Setup records the
 event name, selected player frontend, and first administrator in one database
-transaction, then opens `/admin`.
+transaction, then opens `/admin`. After setup, `/` renders the permanent public
+home page and the event logo always links back to it.
 
 The configured `ctf_name` is the visible event name in the top-left corner of
 both surfaces. `CTFZone` remains the platform/product name, not a hard-coded
 replacement for an organizer's event identity.
+
+## Page and navigation contract
+
+Player navigation is returned by the Rust bootstrap endpoint in administrator-
+defined order. Challenges and Scoreboard are protected system routes: their
+endpoint, label, implementation, and deletion behavior are fixed, while their
+visibility and order are editable. Custom pages have an administrator-defined
+label, nested lowercase endpoint, order, visibility, and HTML body. Public pages
+are available before login, private pages require a current session, and
+invisible pages are omitted from navigation and return 404 to non-admins.
+
+Custom HTML is data, not frontend code. Python reconstructs only a reviewed
+structural tag and link allowlist before marking it renderable; scripts, style,
+event attributes, frames, media, and unsafe URL schemes remain escaped. A page
+therefore cannot add JavaScript or extend the player frontend's privileges.
 
 ## Adding another player frontend
 
@@ -127,9 +143,20 @@ challenges.html
 scoreboard.html
 team.html
 profile.html
-rules.html
+page.html
+partials/category_logo.html
 partials/challenge_panel.html
 ```
+
+`partials/category_logo.html` owns that frontend's visual language for the
+semantic category keys `web`, `pwn`, `crypto`, `rev`, `misc`, `coding`, and
+`forensics`. It must export a `render(key, color, class_name)` macro, apply the
+validated six-digit color, and treat an unknown key as empty. The API stores
+only the semantic key and color, never frontend SVG or CSS, so every frontend
+can draw an original but equivalent logo safely. Category names remain visible
+in filters and accessible labels. A custom marker may be an exact 128 by 128
+PNG or a server-validated square SVG; name-only categories require no image and
+do not call the logo macro.
 
 Player templates receive three frontend-specific helpers/values:
 

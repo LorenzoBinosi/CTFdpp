@@ -18,6 +18,27 @@ let countdownTimer = null;
 // while still covering the common controller transition window.
 const transitionRefreshDelays = [1500, 5000];
 
+function hydrateCategoryIcons(root = document) {
+  for (const image of root.querySelectorAll("[data-category-icon-image]:not([data-category-icon-hydrated])")) {
+    image.dataset.categoryIconHydrated = "true";
+    const marker = image.closest(".category-image-marker");
+    const fallback = marker?.querySelector("[data-category-icon-fallback]");
+    const reveal = () => {
+      if (image.naturalWidth < 1 || image.naturalHeight < 1) return;
+      image.hidden = false;
+      if (fallback) fallback.hidden = true;
+      marker?.classList.add("icon-loaded");
+    };
+    image.addEventListener("load", reveal, { once: true });
+    image.addEventListener("error", () => {
+      image.hidden = true;
+      if (fallback) fallback.hidden = false;
+      marker?.classList.remove("icon-loaded");
+    }, { once: true });
+    if (image.complete && image.naturalWidth) reveal();
+  }
+}
+
 function challengeRows() {
   return [...document.querySelectorAll("[data-challenge-id]")];
 }
@@ -27,7 +48,7 @@ function applyFilters() {
   let count = 0;
   for (const row of challengeRows()) {
     const categoryMatch = activeCategory === "all" || row.dataset.category === activeCategory;
-    const searchMatch = !term || `${row.dataset.name} ${row.dataset.category} ${row.dataset.tags}`.includes(term);
+    const searchMatch = !term || `${row.dataset.name} ${row.dataset.categoryName} ${row.dataset.tags}`.includes(term);
     const unsolvedMatch = !activeFilters.has("unsolved") || row.dataset.solved !== "true";
     const instanceMatch = !activeFilters.has("instance") || row.dataset.instance === "true";
     const easyMatch = !activeFilters.has("easy") || row.dataset.tags.split(" ").includes("easy");
@@ -272,6 +293,7 @@ panel?.addEventListener("submit", event => {
 });
 
 function hydratePanel() {
+  hydrateCategoryIcons(panel);
   startCountdown();
 }
 
@@ -285,5 +307,6 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) startCountdown();
 });
 
+hydrateCategoryIcons();
 hydratePanel();
 applyFilters();

@@ -188,8 +188,9 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             "/api/v1/pages",
             get(administration::list_pages).post(administration::create_page),
         )
+        .route("/api/v1/pages/root", get(administration::get_root_page))
         .route(
-            "/api/v1/pages/by-route/{route}",
+            "/api/v1/pages/by-route/{*route}",
             get(administration::get_page_by_route),
         )
         .route(
@@ -214,7 +215,17 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/challenge-categories/{category_id}",
-            axum::routing::delete(administration::delete_challenge_category),
+            get(administration::get_challenge_category)
+                .patch(administration::update_challenge_category)
+                .delete(administration::delete_challenge_category),
+        )
+        .route(
+            "/api/v1/admin/challenge-categories/{category_id}/icon/{object_id}",
+            axum::routing::delete(objects::delete_category_icon),
+        )
+        .route(
+            "/api/v1/challenge-categories/{category_id}/icon/{object_id}",
+            get(objects::category_icon_grant),
         )
         .route(
             "/api/v1/flags",

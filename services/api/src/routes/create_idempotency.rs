@@ -7,6 +7,7 @@ use crate::error::ApiError;
 
 pub(super) const CATEGORY_CREATE: &str = "challenge-category.create";
 pub(super) const CHALLENGE_CREATE: &str = "challenge.create";
+pub(super) const PAGE_CREATE: &str = "page.create";
 
 pub(super) struct CreateRequest {
     actor_user_id: i32,
@@ -229,9 +230,17 @@ mod tests {
             .split_once("pub(super) async fn detail(")
             .unwrap()
             .0;
+        let page = categories
+            .split_once("pub(super) async fn create_page(")
+            .unwrap()
+            .1
+            .split_once("pub(super) async fn update_page(")
+            .unwrap()
+            .0;
         for (segment, write) in [
             (category, "INSERT INTO ctfzone.challenge_categories"),
             (challenge, "INSERT INTO ctfzone.challenges"),
+            (page, "INSERT INTO ctfzone.pages"),
         ] {
             let replay = segment.find("lock_and_replay").unwrap();
             let write = segment.find(write).unwrap();

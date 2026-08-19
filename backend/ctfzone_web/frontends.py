@@ -31,8 +31,9 @@ _REQUIRED_PLAYER_TEMPLATES = (
     "scoreboard.html",
     "team.html",
     "profile.html",
-    "rules.html",
+    "page.html",
     "partials/challenge_panel.html",
+    "partials/category_logo.html",
 )
 _REQUIRED_ADMIN_TEMPLATES = (
     "base.html",
@@ -40,6 +41,8 @@ _REQUIRED_ADMIN_TEMPLATES = (
     "forbidden.html",
     "overview.html",
     "challenges.html",
+    "categories.html",
+    "pages.html",
     "challenge_form.html",
     "users.html",
     "user_form.html",
@@ -47,6 +50,7 @@ _REQUIRED_ADMIN_TEMPLATES = (
     "machines.html",
     "records.html",
     "sessions.html",
+    "partials/category_logo.html",
 )
 _REQUIRED_ADMIN_ASSETS = (
     "css/admin.css",

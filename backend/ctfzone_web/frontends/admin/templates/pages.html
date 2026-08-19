@@ -1,0 +1,113 @@
+{% extends "admin/base.html" %}
+{% block description %}<p>Control the permanent home page, protected competition routes, and ordered custom HTML pages.</p>{% endblock %}
+{% block admin_content %}
+  <section class="admin-panel page-create-panel" data-page-catalog>
+    <header class="admin-panel-heading">
+      <div>
+        <span class="eyebrow">NEW CUSTOM PAGE</span>
+        <h2>Add a navigation page</h2>
+        <p>Custom pages use a safe HTML subset and a responsive 12-column layout. Scripts, event handlers, styles, and embedded active content are not allowed.</p>
+      </div>
+    </header>
+    <form class="page-editor" data-page-form data-page-mode="create" data-page-type="custom">
+      <div class="page-editor-grid">
+        <label class="admin-field">
+          <span>Navigation label</span>
+          <input name="label" required maxlength="80" autocomplete="off" placeholder="Rules">
+        </label>
+        <label class="admin-field">
+          <span>Endpoint</span>
+          <span class="page-endpoint-input"><b>/</b><input name="endpoint" required maxlength="128" autocomplete="off" placeholder="rules" pattern="[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*"></span>
+        </label>
+        <label class="admin-field">
+          <span>Visibility</span>
+          <select name="visibility" required>
+            <option value="public">Public · anyone can view</option>
+            <option value="private">Private · sign-in required</option>
+            <option value="invisible">Invisible · administrators only</option>
+          </select>
+        </label>
+        <label class="admin-field">
+          <span>Navigation order</span>
+          <input name="navigation_order" type="number" min="1" max="10000" step="1" value="100" required>
+        </label>
+        <label class="admin-field page-html-field">
+          <span>Page HTML <small>256 KiB maximum · no JavaScript</small></span>
+          <textarea name="content" rows="12" spellcheck="false" placeholder="&lt;h2&gt;Competition rules&lt;/h2&gt;&#10;&lt;p&gt;Be excellent to each other.&lt;/p&gt;" data-page-html></textarea>
+          <small>Layout classes: row, col-md-1…12, offset-md-0…11, text-center, alignment, page-section, display-1, lead, and page-actions.</small>
+        </label>
+      </div>
+      <footer class="page-editor-actions">
+        <p class="page-form-error" data-page-form-error role="alert" aria-live="polite"></p>
+        <button class="button" type="submit">Create page</button>
+      </footer>
+    </form>
+  </section>
+
+  <section class="page-inventory" aria-labelledby="page-inventory-heading">
+    <header class="page-inventory-heading">
+      <div><span class="eyebrow">PLAYER NAVIGATION</span><h2 id="page-inventory-heading">Configured pages</h2></div>
+      <span class="muted mono">{{ pages | length }} total</span>
+    </header>
+    <div class="page-card-list">
+      {% for content_page in pages %}
+        <article class="admin-panel page-card" data-page-card="{{ content_page.id }}">
+          <header class="page-card-heading">
+            <div>
+              <span class="eyebrow">{{ content_page.page_type | upper }}</span>
+              <h3>{{ content_page.label }}</h3>
+              <a href="{{ content_page.href }}" target="_blank" rel="noopener">{{ content_page.href }} ↗</a>
+            </div>
+            <span class="status-pill status-{{ content_page.visibility }}">{{ content_page.visibility | title }}</span>
+          </header>
+          <form class="page-editor" data-page-form data-page-mode="edit" data-page-id="{{ content_page.id }}" data-page-type="{{ content_page.page_type }}" data-page-revision="{{ content_page.revision }}">
+            <div class="page-editor-grid">
+              <label class="admin-field">
+                <span>Navigation label</span>
+                <input name="label" required maxlength="80" value="{{ content_page.label }}"{% if content_page.page_type == 'system' %} disabled title="System labels are fixed"{% endif %}>
+              </label>
+              <label class="admin-field">
+                <span>Endpoint</span>
+                <span class="page-endpoint-input"><b>/</b><input name="endpoint" required maxlength="128" value="{{ content_page.endpoint }}" pattern="[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*"{% if content_page.page_type != 'custom' %} disabled title="Built-in endpoints are fixed"{% endif %}></span>
+              </label>
+              <label class="admin-field">
+                <span>Visibility</span>
+                <select name="visibility" required{% if content_page.page_type == 'home' %} disabled title="Home is always public"{% endif %}>
+                  <option value="public"{% if content_page.visibility == 'public' %} selected{% endif %}>Public · anyone can view</option>
+                  <option value="private"{% if content_page.visibility == 'private' %} selected{% endif %}>Private · sign-in required</option>
+                  <option value="invisible"{% if content_page.visibility == 'invisible' %} selected{% endif %}>Invisible · administrators only</option>
+                </select>
+              </label>
+              <label class="admin-field">
+                <span>Navigation order</span>
+                <input name="navigation_order" type="number" min="1" max="10000" step="1" value="{{ content_page.navigation_order }}" required{% if content_page.page_type == 'home' %} disabled title="Home is reached through the logo"{% endif %}>
+              </label>
+              {% if content_page.page_type != 'system' %}
+                <label class="admin-field page-html-field">
+                  <span>Page HTML <small>256 KiB maximum · no JavaScript</small></span>
+                  <textarea name="content" rows="12" spellcheck="false" data-page-html>{{ content_page.content }}</textarea>
+                  <small>Layout classes: row, col-md-1…12, offset-md-0…11, text-center, alignment, page-section, display-1, lead, and page-actions.</small>
+                </label>
+              {% else %}
+                <div class="page-system-note">
+                  <strong>Protected system page</strong>
+                  <p>Its endpoint, label, and implementation are fixed. You can change only who may see it and where it appears in navigation.</p>
+                </div>
+              {% endif %}
+            </div>
+            <footer class="page-editor-actions">
+              <div>
+                <p class="page-form-error" data-page-form-error role="alert" aria-live="polite"></p>
+                {% if content_page.page_type == 'home' %}<small>Home is permanent and always opens from the top-left logo.</small>{% elif content_page.page_type == 'system' %}<small>This protected route cannot be renamed or deleted.</small>{% else %}<small>Deleting this page also retires any page assets attached to it.</small>{% endif %}
+              </div>
+              {% if content_page.page_type == 'custom' %}<button class="danger-button button-small" type="button" data-delete-page>Delete page</button>{% endif %}
+              <button class="button button-small" type="submit">Save changes</button>
+            </footer>
+          </form>
+        </article>
+      {% else %}
+        <article class="admin-panel admin-empty-card"><h2>Page catalog unavailable</h2><p>The permanent system pages were not returned by the API.</p></article>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

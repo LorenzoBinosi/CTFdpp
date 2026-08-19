@@ -155,10 +155,9 @@ to stop the other project automatically.
    PostgreSQL connection URI. Leave `POSTGRES_USER` and `POSTGRES_DB` at their
    defaults or keep custom values URL-safe for the same reason.
 4. Configure the browser SSH destination allowlists and gateway service secret.
-5. Validate the rendered configuration, then back up PostgreSQL, the object
-   bucket, `controller_journal`, the controller SSH identity/known-hosts
-   directory, and `ssh_gateway_identities` as one recovery set before
-   maintenance.
+5. Treat this as a pre-release environment. Starting it with `run.sh` deletes
+   and recreates PostgreSQL, object storage, journals, Caddy data, and both SSH
+   identity volumes.
 
 Start CTFZone with:
 
@@ -166,10 +165,10 @@ Start CTFZone with:
 ./run.sh
 ```
 
-`run.sh` pulls and rebuilds images without cache and force-recreates every
-container, but deliberately preserves production PostgreSQL, object, journal,
-Caddy, and SSH-identity volumes. It is not an in-place schema migration tool.
-Use `./stop.sh` to stop the deployment while preserving those volumes.
+`run.sh` pulls and rebuilds images without cache, removes every named project
+volume, and starts from the current `db/init` schema. Use `./stop.sh` to stop
+the deployment without deleting its current volumes; the next `./run.sh`
+invocation still resets them.
 
 Only ports 80/443 are public. Ports 8000, 8080, 8090, 8091, 8333, and 5432 are
 internal and must not be published by an override or firewall rule.
@@ -212,6 +211,7 @@ Additional project documentation:
 
 - [Configuration](docs/CONFIGURATION.md)
 - [Jeopardy challenge authoring](docs/JEOPARDY_AUTHORING.md)
+- [Pages and player navigation](docs/PAGES.md)
 - [Private-instance controller](docs/INSTANCE_CONTROLLER_ARCHITECTURE.md)
 - [Remote runtime helper](remote-helper/README.md)
 - [Frontend architecture](docs/FRONTEND_ARCHITECTURE.md)
@@ -219,7 +219,6 @@ Additional project documentation:
 - [Possible improvements](docs/POSSIBLE_IMPROVEMENTS.md)
 - [Security policy](docs/SECURITY.md)
 - [Contributing](docs/CONTRIBUTING.md)
-- [Changelog](docs/CHANGELOG.md)
 
 ## Health and metadata
 

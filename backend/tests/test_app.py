@@ -48,6 +48,11 @@ BOOTSTRAP = {
             "registration_visibility": "public",
             "player_frontend": "terminal",
         },
+        "navigation": [
+            {"id": 2, "label": "Challenges", "endpoint": "challenges", "system_key": "challenges"},
+            {"id": 3, "label": "Scoreboard", "endpoint": "scoreboard", "system_key": "scoreboard"},
+            {"id": 4, "label": "Rules", "endpoint": "rules", "system_key": None},
+        ],
     },
 }
 
@@ -57,6 +62,9 @@ CHALLENGE_LIST = [
         "name": "Cookie Jar",
         "value": 150,
         "category": "web",
+        "category_id": 2,
+        "category_logo_key": None,
+        "category_icon_object_id": None,
         "solves": 4,
         "solved_by_me": False,
         "state": "visible",
@@ -73,6 +81,8 @@ CHALLENGE_DETAIL = {
     "value": 150,
     "category": "web",
     "category_id": 2,
+    "category_logo_key": None,
+    "category_icon_object_id": None,
     "challenge_type": "jeopardy",
     "exposure": "private",
     "attribution": "Alice and Bob",
@@ -127,6 +137,21 @@ class FakeApi:
         }
         self.responses = {
             "/api/v1/bootstrap": (200, self.bootstrap),
+            "/api/v1/pages/root": (
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "id": 1,
+                        "label": "Home",
+                        "endpoint": "",
+                        "content": "<h1>Welcome</h1><p>Start here.</p>",
+                        "page_type": "home",
+                        "system_key": "home",
+                        "visibility": "public",
+                    },
+                },
+            ),
             "/api/v1/views/challenges": (200, challenge_view),
             "/api/v1/views/challenges?selected=7": (200, challenge_view),
             "/api/v1/views/admin/overview": (200, admin_overview),
@@ -148,6 +173,20 @@ class FakeApi:
                     },
                 },
             ),
+            f"/api/v1/challenge-categories/1/icon/{OBJECT_ID}": (
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "method": "GET",
+                        "url": (
+                            "https://files.example.test/ctfzone/category-icon/"
+                            f"{OBJECT_ID}/icon.png?X-Amz-Signature=test"
+                        ),
+                        "expires_at": "2026-08-11T11:00:00Z",
+                    },
+                },
+            ),
             "/api/v1/challenges?view=admin": (
                 200,
                 {"success": True, "data": copy.deepcopy(CHALLENGE_LIST)},
@@ -157,8 +196,22 @@ class FakeApi:
                 {
                     "success": True,
                     "data": [
-                        {"id": 1, "name": "Crypto"},
-                        {"id": 2, "name": "Web"},
+                        {
+                            "id": 1,
+                            "name": "Crypto",
+                            "logo_key": "crypto",
+                            "logo_color": "#7c3aed",
+                            "icon_object_id": OBJECT_ID,
+                            "challenge_count": 0,
+                        },
+                        {
+                            "id": 2,
+                            "name": "Web",
+                            "logo_key": "web",
+                            "logo_color": "#0284c7",
+                            "icon_object_id": None,
+                            "challenge_count": 1,
+                        },
                     ],
                 },
             ),
@@ -276,7 +329,32 @@ class FakeApi:
             ),
             "/api/v1/scoreboard": (200, {"success": True, "data": []}),
             "/api/v1/teams/me": (404, {"message": "No team"}),
-            "/api/v1/pages/by-route/rules": (404, {"message": "Not found"}),
+            "/api/v1/pages/by-route/rules": (
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "id": 4,
+                        "label": "Rules",
+                        "endpoint": "rules",
+                        "content": "<h1>Rules</h1><p>No attacking the platform.</p>",
+                        "page_type": "custom",
+                        "system_key": None,
+                        "visibility": "public",
+                    },
+                },
+            ),
+            "/api/v1/pages": (
+                200,
+                {
+                    "success": True,
+                    "data": [
+                        {"id": 1, "label": "Home", "endpoint": "", "content": "<h1>Welcome</h1>", "page_type": "home", "system_key": "home", "visibility": "public", "navigation_order": 0, "revision": 1},
+                        {"id": 2, "label": "Challenges", "endpoint": "challenges", "content": "", "page_type": "system", "system_key": "challenges", "visibility": "private", "navigation_order": 10, "revision": 1},
+                        {"id": 3, "label": "Scoreboard", "endpoint": "scoreboard", "content": "", "page_type": "system", "system_key": "scoreboard", "visibility": "public", "navigation_order": 20, "revision": 1},
+                    ],
+                },
+            ),
         }
         if responses:
             self.responses.update(copy.deepcopy(responses))
@@ -361,7 +439,8 @@ PLAYER_TEMPLATE_NAMES = (
     "scoreboard.html",
     "team.html",
     "profile.html",
-    "rules.html",
+    "page.html",
+    "partials/category_logo.html",
     "partials/challenge_panel.html",
 )
 ADMIN_TEMPLATE_NAMES = (
@@ -370,6 +449,8 @@ ADMIN_TEMPLATE_NAMES = (
     "forbidden.html",
     "overview.html",
     "challenges.html",
+    "categories.html",
+    "pages.html",
     "challenge_form.html",
     "users.html",
     "user_form.html",
@@ -377,6 +458,7 @@ ADMIN_TEMPLATE_NAMES = (
     "machines.html",
     "records.html",
     "sessions.html",
+    "partials/category_logo.html",
 )
 
 
@@ -384,7 +466,9 @@ def make_frontend_tree(root: Path, *identifiers: str) -> Path:
     frontend_root = root / "frontends"
     (frontend_root / "admin" / "templates").mkdir(parents=True)
     for template in ADMIN_TEMPLATE_NAMES:
-        (frontend_root / "admin" / "templates" / template).write_text(
+        target = frontend_root / "admin" / "templates" / template
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
             f"admin={template}", encoding="utf-8"
         )
     for asset in (
@@ -470,8 +554,8 @@ class FrontendRegistryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = make_frontend_tree(Path(temporary), "terminal")
-            (root / "player" / "terminal" / "templates" / "rules.html").unlink()
-            with self.assertRaisesRegex(FrontendConfigurationError, "rules.html"):
+            (root / "player" / "terminal" / "templates" / "page.html").unlink()
+            with self.assertRaisesRegex(FrontendConfigurationError, "page.html"):
                 FrontendRegistry.discover(root)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -559,12 +643,163 @@ class AppTests(unittest.TestCase):
 
         self.api.calls.clear()
         response = self.client.get("/")
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(urlsplit(response.headers["Location"]).path, "/challenges")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Welcome", response.get_data(as_text=True))
+        self.assertIn("page-content-shell", response.get_data(as_text=True))
+        self.assertIn("page-content-canvas markdown", response.get_data(as_text=True))
+        self.assertNotIn("<h1>Home</h1>", response.get_data(as_text=True))
+        self.assertNotIn("feature-card", response.get_data(as_text=True))
+        player_styles = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends/player/terminal/static/css/player.css"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            ".content-shell { width: calc(100% - 48px); max-width: none;",
+            player_styles,
+        )
+        self.assertNotIn(".page-content-shell { max-width: 900px; }", player_styles)
+        self.assertNotIn(".profile-shell { width: min(900px", player_styles)
+        self.assertIn(".page-content-canvas .col-md-6", player_styles)
+        self.assertIn(".page-content-canvas .offset-md-3", player_styles)
         self.assertEqual(
             self.api.calls,
-            [("GET", "/api/v1/bootstrap", SESSION_ID)],
+            [
+                ("GET", "/api/v1/bootstrap", SESSION_ID),
+                ("GET", "/api/v1/pages/root", SESSION_ID),
+            ],
         )
+
+    def test_logo_and_primary_navigation_are_ordered_from_bootstrap_pages(self):
+        body = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('class="brand" href="/"', body)
+        challenges = body.index('href="/challenges"')
+        scoreboard = body.index('href="/scoreboard"')
+        rules = body.index('href="/rules"')
+        self.assertLess(challenges, scoreboard)
+        self.assertLess(scoreboard, rules)
+
+    def test_player_and_admin_typography_use_the_readable_baseline(self):
+        frontend_root = Path(ctfzone_web.__file__).parent / "frontends"
+        player_styles = (
+            frontend_root / "player/terminal/static/css/player.css"
+        ).read_text(encoding="utf-8")
+        admin_styles = (frontend_root / "admin/static/css/admin.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("font-size: 18px;", player_styles)
+        self.assertIn("font: 16px/1.5 var(--font-ui);", admin_styles)
+        self.assertIn(".markdown { color: #cbd4de; font-size: 17px;", player_styles)
+        self.assertIn(".admin-table { width: 100%; border-collapse: collapse; font-size: 14px;", admin_styles)
+        self.assertIn("font-size: clamp(34px, calc(5.2vw + 2px), 50px);", player_styles)
+        self.assertIn(".account-nav { display: flex; min-width: 0; align-items: center;", player_styles)
+        self.assertIn(".account-nav form { display: flex; align-items: center;", player_styles)
+        self.assertNotIn(".account-summary", player_styles)
+        self.assertNotIn(".account-name", player_styles)
+        self.assertIn(".topbar-action svg { width: 16px; height: 16px;", player_styles)
+        self.assertIn('.topbar-action[aria-disabled="true"] { cursor: not-allowed;', player_styles)
+        self.assertIn(".topbar-action-label { display: none; }", player_styles)
+
+    def test_custom_page_html_is_allowlisted_and_javascript_stays_inert(self):
+        api = FakeApi(
+            responses={
+                "/api/v1/pages/by-route/about/team": (
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "id": 8,
+                            "label": "About",
+                            "endpoint": "about/team",
+                            "content": (
+                                '<h2 onclick="steal()">Hello</h2>'
+                                '<a href="javascript:steal()">bad</a>'
+                                '<script>steal()</script>'
+                            ),
+                            "page_type": "custom",
+                            "system_key": None,
+                            "visibility": "public",
+                        },
+                    },
+                )
+            }
+        )
+        client = make_app(api).test_client()
+
+        body = client.get("/about/team").get_data(as_text=True)
+
+        self.assertIn("<h2>Hello</h2>", body)
+        self.assertIn("<a>bad</a>", body)
+        self.assertIn("&lt;script&gt;steal()&lt;/script&gt;", body)
+        self.assertNotIn("onclick=", body)
+        self.assertNotIn("javascript:", body)
+        self.assertNotIn("feature-card", body)
+        self.assertNotIn("<h1>About</h1>", body)
+
+    def test_home_page_internal_links_remain_in_the_current_tab(self):
+        api = FakeApi(
+            responses={
+                "/api/v1/pages/root": (
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "id": 1,
+                            "label": "Home",
+                            "endpoint": "",
+                            "content": '<p><a href="/challenges">Browse challenges</a></p>',
+                            "page_type": "home",
+                            "system_key": "home",
+                            "visibility": "public",
+                        },
+                    },
+                )
+            }
+        )
+        client = make_app(api).test_client()
+
+        body = client.get("/").get_data(as_text=True)
+
+        self.assertIn('<a href="/challenges">Browse challenges</a>', body)
+        self.assertNotIn('href="/challenges" target="_blank"', body)
+
+    def test_private_and_invisible_custom_pages_fail_closed(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["authenticated"] = False
+        bootstrap["data"]["user"] = None
+        bootstrap["data"]["navigation"] = []
+        private_api = FakeApi(
+            bootstrap=bootstrap,
+            responses={"/api/v1/pages/by-route/members": (403, {"message": "Authentication required"})},
+        )
+        private_client = make_app(private_api).test_client()
+        response = private_client.get("/members")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(urlsplit(response.headers["Location"]).path, "/login")
+        self.assertEqual(
+            parse_qs(urlsplit(response.headers["Location"]).query)["next"],
+            ["/members"],
+        )
+
+        invisible_api = FakeApi(
+            responses={"/api/v1/pages/by-route/staff": (404, {"message": "Page not found"})}
+        )
+        invisible_client = make_app(invisible_api).test_client()
+        seed_browser_session(invisible_client)
+        self.assertEqual(invisible_client.get("/staff").status_code, 404)
+
+    def test_admin_pages_exposes_fixed_system_controls_and_custom_crud(self):
+        client = self.client_for_role("admin")
+        body = client.get("/admin/pages").get_data(as_text=True)
+
+        self.assertIn("Add a navigation page", body)
+        self.assertIn('data-page-type="home"', body)
+        self.assertIn('data-page-type="system"', body)
+        self.assertIn('data-page-type="custom"', body)
+        self.assertIn("Home is permanent", body)
+        self.assertIn("Protected system page", body)
+        self.assertIn("/api/v1/pages", (Path(__file__).parents[1] / "ctfzone_web/frontends/admin/static/js/admin.js").read_text(encoding="utf-8"))
 
     def test_player_frontend_selection_uses_registry_and_falls_back_safely(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -667,6 +902,58 @@ class AppTests(unittest.TestCase):
         )
         self.assertNotIn('/assets/player/terminal/', admin)
 
+        self.assertIn('data-nav-links', player)
+        self.assertIn('data-nav-item', player)
+        self.assertIn('data-nav-overflow-toggle', player)
+        self.assertIn('aria-label="More pages"', player)
+        self.assertIn('id="nav-overflow-menu"', player)
+
+    def test_player_navigation_moves_only_overflowing_pages_into_more_menu(self):
+        frontend_root = Path(ctfzone_web.__file__).parent / "frontends/player/terminal"
+        script = (frontend_root / "static/js/app.js").read_text(encoding="utf-8")
+        styles = (frontend_root / "static/css/player.css").read_text(encoding="utf-8")
+
+        self.assertIn('new ResizeObserver(scheduleNavOverflow).observe(mainNav)', script)
+        self.assertIn('window.matchMedia("(max-width: 860px)")', script)
+        self.assertIn('const availableWidth = navLinks.clientWidth;', script)
+        self.assertIn('for (let index = navItems.length - 1;', script)
+        self.assertIn('const menuItem = item.cloneNode(true);', script)
+        self.assertIn('item.hidden = true;', script)
+        self.assertIn('navOverflow.hidden = !hasItems;', script)
+        self.assertIn('.main-nav { display: grid; min-width: 0;', styles)
+        self.assertIn('grid-template-columns: minmax(0, 1fr) auto;', styles)
+        self.assertIn('.main-nav-links { display: flex; min-width: 0;', styles)
+        self.assertIn('.nav-overflow-menu { position: absolute;', styles)
+
+    def test_profile_action_does_not_expose_or_reserve_username_width(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        longest_name = "x" * 128
+        bootstrap["data"]["user"]["name"] = longest_name
+        client = make_app(FakeApi(bootstrap=bootstrap)).test_client()
+        seed_browser_session(client)
+
+        body = client.get("/challenges").get_data(as_text=True)
+
+        self.assertIn('href="/profile" aria-label="Profile"', body)
+        header_start = body.index('<header class="topbar">')
+        header_end = body.index("</header>", header_start)
+        self.assertNotIn(longest_name, body[header_start:header_end])
+
+    def test_account_actions_use_theme_icons_and_notifications_are_todo(self):
+        client = self.client_for_role("admin")
+        body = client.get("/challenges").get_data(as_text=True)
+        header = body[body.index('<header class="topbar">'):body.index("</header>")]
+
+        self.assertIn('<use href="#icon-admin"></use>', header)
+        self.assertIn('<use href="#icon-bell"></use>', header)
+        self.assertIn('<use href="#icon-user"></use>', header)
+        self.assertIn('<use href="#icon-log-out"></use>', header)
+        self.assertIn('aria-disabled="true" aria-label="Notifications, coming soon"', header)
+        self.assertIn('title="Notifications are coming soon"', header)
+        self.assertNotIn('href="/notifications"', header)
+        self.assertLess(header.index("Admin</span>"), header.index("Notifications</span>"))
+        self.assertLess(header.index("Notifications</span>"), header.index("Profile</span>"))
+
     def test_admin_shell_uses_task_grouped_svg_navigation_and_contextual_header(self):
         client = self.client_for_role("admin")
 
@@ -690,6 +977,7 @@ class AppTests(unittest.TestCase):
             "check",
             "clock",
             "flag",
+            "category",
             "user",
             "team",
             "machine",
@@ -708,8 +996,9 @@ class AppTests(unittest.TestCase):
             '<a class="active" href="/admin/challenges" aria-current="page">',
             body,
         )
+        self.assertIn('href="/admin/categories"', body)
         self.assertIn('href="/admin/session-management"', body)
-        self.assertIn('href="/challenges">View portal', body)
+        self.assertIn('href="/">View portal', body)
         self.assertIn(
             'aria-label="Toggle administration navigation" aria-expanded="false" '
             'data-admin-menu',
@@ -790,6 +1079,10 @@ class AppTests(unittest.TestCase):
         self.assertIn(f'content="{CSRF_TOKEN}"', body)
         self.assertIn("data-flag-form", body)
         self.assertIn('data-instance="true"', body)
+        self.assertIn('data-category="id:2"', body)
+        self.assertIn('aria-label="Category: web"', body)
+        self.assertIn('<span data-category-icon-fallback>web</span>', body)
+        self.assertNotIn('src="/category-icons/2"', body)
         self.assertNotIn("data-runtime-action", body)
         self.assertLessEqual(len(self.api.calls), 2)
         self.assertEqual(self.api.calls[0][1], "/api/v1/views/challenges")
@@ -896,6 +1189,70 @@ class AppTests(unittest.TestCase):
         response = client.get(f"/downloads/{OBJECT_ID}")
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("Location", response.headers)
+
+    def test_category_icon_authorization_rejects_untrusted_redirects(self):
+        path = f"/api/v1/challenge-categories/1/icon/{OBJECT_ID}"
+        self.api.responses[path] = (
+            200,
+            {
+                "success": True,
+                "data": {
+                    "method": "GET",
+                    "url": "https://files.example.test.evil/icon.png?signature=stolen",
+                },
+            },
+        )
+
+        response = self.client.get(f"/category-icons/1/{OBJECT_ID}")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("Location", response.headers)
+
+        self.api.responses[path] = (
+            200,
+            {
+                "success": True,
+                "data": {
+                    "method": "POST",
+                    "url": "https://files.example.test/icon.png?signature=test",
+                },
+            },
+        )
+        response = self.client.get(f"/category-icons/1/{OBJECT_ID}")
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("Location", response.headers)
+
+    def test_category_icon_grant_is_bound_to_the_disclosed_object_id(self):
+        api = FakeApi()
+        client = make_app(api).test_client()
+
+        response = client.get(f"/category-icons/1/{OBJECT_ID}")
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("/category-icon/", response.headers["Location"])
+        self.assertEqual(
+            api.calls[-1],
+            (
+                "GET",
+                f"/api/v1/challenge-categories/1/icon/{OBJECT_ID}",
+                None,
+            ),
+        )
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(client.get("/category-icons/1").status_code, 404)
+
+        undisclosed_object_id = "22222222-2222-4222-8222-222222222222"
+        missing = client.get(f"/category-icons/1/{undisclosed_object_id}")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(
+            api.calls[-1],
+            (
+                "GET",
+                f"/api/v1/challenge-categories/1/icon/{undisclosed_object_id}",
+                None,
+            ),
+        )
 
     def test_legacy_bff_file_streaming_route_is_gone(self):
         self.assertEqual(self.client.get("/bff/files/starter.zip").status_code, 404)
@@ -2315,6 +2672,235 @@ class AppTests(unittest.TestCase):
         self.assertNotIn('startsWith("x-amz-")', source)
         self.assertNotIn("FormData", source)
 
+    def test_admin_categories_manage_board_markers_through_the_catalog_api(self):
+        client = self.client_for_role("admin")
+        client.fake_api.calls.clear()
+
+        response = client.get("/admin/categories")
+        body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<a class="active" href="/admin/categories" aria-current="page">', body)
+        self.assertIn('data-category-mode="create"', body)
+        self.assertIn('placeholder="Web exploitation"', body)
+        self.assertIn('name="icon" type="file" accept="image/png,image/svg+xml,.svg"', body)
+        self.assertIn('<input type="radio" name="marker_mode" value="name" checked>', body)
+        self.assertIn('<input type="radio" name="marker_mode" value="custom"', body)
+        self.assertIn("<small>No image required</small>", body)
+        self.assertIn('data-category-custom-logo-fields hidden', body)
+        self.assertIn('<circle cx="12" cy="12" r="9"/>', body)
+        for logo_key in ("web", "pwn", "crypto", "rev", "misc", "coding", "forensics"):
+            with self.subTest(logo_key=logo_key):
+                self.assertIn(f'name="marker_mode" value="{logo_key}"', body)
+                self.assertIn(f'data-category-logo="{logo_key}"', body)
+        self.assertIn('name="logo_color" type="color"', body)
+        self.assertIn('value="#34689c" data-category-logo-color', body)
+        self.assertIn("sanitized square SVG", body)
+        self.assertIn("256 KiB maximum", body)
+        self.assertNotIn('name="display_mode"', body)
+        self.assertIn(f'src="/category-icons/1/{OBJECT_ID}"', body)
+        self.assertIn(f'data-category-icon-object-id="{OBJECT_ID}"', body)
+        self.assertIn('referrerpolicy="no-referrer" data-category-icon-image', body)
+        self.assertIn('data-category-id="2"', body)
+        self.assertIn("1 attached challenge", body)
+        self.assertIn("Reassign 1 attached challenge before deleting", body)
+        self.assertIn('data-delete-category disabled', body)
+        self.assertIn('data-category-icon-object-id="" disabled', body)
+        self.assertEqual(
+            [call[1] for call in client.fake_api.calls],
+            ["/api/v1/bootstrap", "/api/v1/admin/challenge-categories"],
+        )
+
+        source = (
+            Path(ctfzone_web.__file__).parent
+            / "frontends"
+            / "admin"
+            / "static"
+            / "js"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn('file.type !== "image/png" && file.type !== "image/svg+xml"', source)
+        self.assertIn("file.size > 256 * 1024", source)
+        self.assertIn("globalThis.createImageBitmap(file)", source)
+        self.assertIn("bitmap.width !== 128 || bitmap.height !== 128", source)
+        self.assertIn('new DOMParser().parseFromString(await file.text(), "image/svg+xml")', source)
+        self.assertIn("new FileReader()", source)
+        self.assertIn("reader.readAsDataURL(file)", source)
+        self.assertNotIn("URL.createObjectURL", source)
+        self.assertNotIn("URL.revokeObjectURL", source)
+        self.assertIn('purpose: "category_icon"', source)
+        self.assertIn("category_id: savedCategoryId", source)
+        self.assertIn('method: mode === "create" ? "POST" : "PATCH"', source)
+        self.assertIn('`/api/v1/admin/challenge-categories/${categoryId}`', source)
+        self.assertIn(
+            '`/api/v1/admin/challenge-categories/${categoryId}/icon/${iconObjectId}`',
+            source,
+        )
+        self.assertIn("error.status === 409", source)
+        self.assertIn("changed since the page loaded", source)
+        self.assertIn('"web", "pwn", "crypto", "rev", "misc", "coding", "forensics"', source)
+        self.assertIn("logo_key: logoKey || null", source)
+        self.assertIn("logo_color: logoKey", source)
+        self.assertIn('method: "DELETE"', source)
+
+    def test_category_icon_uploads_are_disabled_without_object_storage(self):
+        bootstrap = copy.deepcopy(BOOTSTRAP)
+        bootstrap["data"]["user"]["type"] = "admin"
+        api = FakeApi(bootstrap=bootstrap)
+        app = make_app(api, OBJECT_STORAGE_PUBLIC_URL="")
+        client = app.test_client()
+        seed_browser_session(client)
+
+        body = client.get("/admin/categories").get_data(as_text=True)
+
+        self.assertIn(
+            "Icon uploads are unavailable until the public object-storage "
+            "origin is configured. You can still create a name-only category.",
+            body,
+        )
+        self.assertEqual(body.count('data-storage-enabled="false" disabled'), 3)
+        self.assertIn(
+            'data-category-icon-file data-storage-enabled="false" disabled title="Configure the public '
+            'object-storage origin to upload category icons"',
+            body,
+        )
+        self.assertIn('name="name" required maxlength="80"', body)
+        self.assertNotIn('name="name" required maxlength="80" disabled', body)
+        crypto_card = body.split('data-category-card="1"', 1)[1].split(
+            'data-category-card="2"', 1
+        )[0]
+        self.assertIn("Custom logo", crypto_card)
+        self.assertIn(
+            f'data-remove-category-icon data-category-icon-object-id="{OBJECT_ID}">',
+            crypto_card,
+        )
+        self.assertNotIn(
+            f'data-category-icon-object-id="{OBJECT_ID}" disabled',
+            crypto_card,
+        )
+
+    def test_custom_category_uses_stable_id_filter_and_icon_marker(self):
+        challenge = copy.deepcopy(CHALLENGE_LIST[0])
+        challenge.update(
+            category="Hardware",
+            category_id=14,
+            category_logo_key=None,
+            category_icon_object_id=OBJECT_ID,
+        )
+        detail = copy.deepcopy(CHALLENGE_DETAIL)
+        detail.update(
+            category="Hardware",
+            category_id=14,
+            category_logo_key=None,
+            category_icon_object_id=OBJECT_ID,
+        )
+        view = {
+            "success": True,
+            "data": {
+                "bootstrap": copy.deepcopy(BOOTSTRAP["data"]),
+                "challenges": [challenge],
+                "selected": detail,
+            },
+        }
+        api = FakeApi(
+            responses={
+                "/api/v1/views/challenges?selected=7": (200, view),
+                "/api/v1/challenges/7": (200, {"success": True, "data": detail}),
+                f"/api/v1/challenge-categories/14/icon/{OBJECT_ID}": (
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "method": "GET",
+                            "url": "https://files.example.test/icon.png?signature=test",
+                            "expires_at": "2026-08-11T11:00:00Z",
+                        },
+                    },
+                ),
+            }
+        )
+        client = make_app(api).test_client()
+        seed_browser_session(client)
+
+        body = client.get("/challenges?challenge=7").get_data(as_text=True)
+        self.assertNotIn('<span class="challenge-icon', body)
+        self.assertNotIn('id="icon-puzzle"', body)
+        self.assertNotIn("<span>CAT</span>", body)
+        self.assertIn('data-category="id:14"', body)
+        self.assertIn('data-category-name="hardware"', body)
+        self.assertIn('role="img" aria-label="Category: Hardware"', body)
+        self.assertIn('<span data-category-icon-fallback>Hardware</span>', body)
+        self.assertIn(
+            f'src="/category-icons/14/{OBJECT_ID}" width="24" height="24"',
+            body,
+        )
+        self.assertIn('hidden referrerpolicy="no-referrer" data-category-icon-image', body)
+        self.assertIn(
+            '<span class="category-filter-icon category-image-marker" aria-hidden="true">',
+            body,
+        )
+        self.assertIn('<span>Hardware</span><strong>1</strong>', body)
+
+        fragment = client.get("/bff/fragments/challenges/7").get_data(as_text=True)
+        self.assertIn('detail-category-marker detail-category-name category-image-marker', fragment)
+        self.assertIn('role="img" aria-label="Category: Hardware"', fragment)
+        self.assertIn(f'src="/category-icons/14/{OBJECT_ID}"', fragment)
+
+        icon = client.get(f"/category-icons/14/{OBJECT_ID}")
+        self.assertEqual(icon.status_code, 303)
+        self.assertEqual(
+            icon.headers["Location"],
+            "https://files.example.test/icon.png?signature=test",
+        )
+
+    def test_semantic_category_logo_is_rendered_by_the_player_frontend(self):
+        challenge = copy.deepcopy(CHALLENGE_LIST[0])
+        challenge.update(
+            category="Forensics",
+            category_id=15,
+            category_logo_key="forensics",
+            category_logo_color="#c026d3",
+            category_icon_object_id=None,
+        )
+        detail = copy.deepcopy(CHALLENGE_DETAIL)
+        detail.update(
+            category="Forensics",
+            category_id=15,
+            category_logo_key="forensics",
+            category_logo_color="#c026d3",
+            category_icon_object_id=None,
+        )
+        view = {
+            "success": True,
+            "data": {
+                "bootstrap": copy.deepcopy(BOOTSTRAP["data"]),
+                "challenges": [challenge],
+                "selected": detail,
+            },
+        }
+        client = make_app(
+            FakeApi(
+                responses={
+                    "/api/v1/views/challenges?selected=7": (200, view),
+                    "/api/v1/challenges/7": (
+                        200,
+                        {"success": True, "data": detail},
+                    ),
+                }
+            )
+        ).test_client()
+        seed_browser_session(client)
+
+        body = client.get("/challenges?challenge=7").get_data(as_text=True)
+        self.assertIn('data-category="id:15"', body)
+        self.assertIn('data-category-logo="forensics"', body)
+        self.assertIn('stroke="#c026d3"', body)
+        self.assertIn('<span>Forensics</span><strong>1</strong>', body)
+        self.assertNotIn('/category-icons/15/', body)
+
+        fragment = client.get("/bff/fragments/challenges/7").get_data(as_text=True)
+        self.assertIn('data-category-logo="forensics"', fragment)
+
     def test_admin_new_challenge_is_an_accessible_five_step_jeopardy_wizard(self):
         client = self.client_for_role("admin")
         client.fake_api.calls.clear()
@@ -2354,7 +2940,10 @@ class AppTests(unittest.TestCase):
         self.assertIn('name="accept_other_users" type="checkbox" disabled', body)
         self.assertIn('maxlength="512"', body)
         self.assertIn('name="category_id" required data-category-select', body)
-        self.assertIn('<option value="2">Web</option>', body)
+        self.assertIn(
+            '<option value="2" data-category-icon-url="" data-category-logo-key="web" data-category-logo-color="#0284c7">Web</option>',
+            body,
+        )
         self.assertIn("data-category-dialog", body)
         self.assertEqual(
             [call[1] for call in client.fake_api.calls],
@@ -2394,6 +2983,9 @@ class AppTests(unittest.TestCase):
         self.assertIn("challengeCreateStorageKey", source)
         self.assertIn("headers: mode === \"create\" ? challengeCreateHeaders", source)
         self.assertIn("categoryCreateHeaders.get(categoryKey)", source)
+        self.assertIn("body: { name: categoryName }", source)
+        self.assertNotIn("categoryDialogForm.elements.category_icon", source)
+        self.assertNotIn("categoryDialogForm.elements.category_display_mode", source)
         self.assertIn('payload.logic = "any"', source)
         self.assertNotIn('logic: "any",', source)
         self.assertIn('payload.state = "hidden"', source)
@@ -2459,7 +3051,10 @@ class AppTests(unittest.TestCase):
         client = self.client_for_role("admin")
         body = client.get("/admin/challenges/7").get_data(as_text=True)
         self.assertIn('name="category_id" required data-category-select', body)
-        self.assertIn('<option value="2" selected>Web</option>', body)
+        self.assertIn(
+            '<option value="2" data-category-icon-url="" data-category-logo-key="web" data-category-logo-color="#0284c7" selected>Web</option>',
+            body,
+        )
         self.assertNotIn('name="category"', body)
         self.assertEqual(body.count('name="name"'), 1)
         self.assertIn('name="attribution"', body)
@@ -2555,6 +3150,7 @@ class AppTests(unittest.TestCase):
     def test_admin_modules_have_a_renderable_minimum_surface(self):
         client = self.client_for_role("admin")
         for path in (
+            "/admin/categories",
             "/admin/challenges/new",
             "/admin/challenges/7",
             "/admin/config",
@@ -3111,7 +3707,7 @@ class AppTests(unittest.TestCase):
 
     def test_team_navigation_and_onboarding_follow_the_public_team_policy(self):
         individual_body = self.client.get("/challenges").get_data(as_text=True)
-        self.assertNotIn('href="/team">Team</a>', individual_body)
+        self.assertNotIn('href="/team" data-nav-item>Team</a>', individual_body)
 
         bootstrap = copy.deepcopy(BOOTSTRAP)
         bootstrap["data"]["site"].update(user_mode="teams", team_creation=True)
@@ -3120,7 +3716,7 @@ class AppTests(unittest.TestCase):
         seed_browser_session(client)
         body = client.get("/team").get_data(as_text=True)
 
-        self.assertIn('href="/team">Team</a>', body)
+        self.assertIn('href="/team" data-nav-item>Team</a>', body)
         self.assertIn("data-team-create", body)
         self.assertIn("data-team-join", body)
         self.assertIn("/assets/player/terminal/js/team.js", body)
@@ -3280,6 +3876,11 @@ class AppTests(unittest.TestCase):
             },
         )
         policy = response.headers["Content-Security-Policy"]
+        self.assertIn(
+            "img-src 'self' data: https://files.example.test",
+            policy,
+        )
+        self.assertNotIn("blob:", policy)
         self.assertIn(
             "connect-src 'self' wss://admin.example.test:8443 https://files.example.test",
             policy,
